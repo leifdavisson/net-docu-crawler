@@ -18,8 +18,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # MikroTik RouterOS Driver Specification
 
-[Open mikrotik.md](mikrotik.md)
-
 * **Driver Class**: [`MikroTikDriver`](../../net_docu_crawler/drivers/mikrotik.py)
 * **Supported Platforms**: RouterOS v6, RouterOS v7, Cloud Hosted Router (CHR), RouterBOARD
 * **Upstream Netmiko Device Type**: `mikrotik_routeros`

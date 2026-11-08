@@ -18,8 +18,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # FRRouting (FRR) Driver Specification
 
-[Open frr.md](frr.md)
-
 * **Driver Class**: [`FRRDriver`](../../net_docu_crawler/drivers/frr.py)
 * **Supported Platforms**: FRRouting 7.x, 8.x, 9.x, 10.x running on Linux (Debian, Ubuntu, Alpine)
 * **Upstream Netmiko Device Type**: `linux`

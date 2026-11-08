@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Cisco Systems Driver Specification
 
-[Open cisco.md](cisco.md)
-
 * **Driver Class**: [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py)
 * **Supported Platforms**: Cisco Catalyst (IOS/IOS-XE), Nexus (NX-OS), Service Provider (IOS-XR)
 * **Upstream Netmiko Device Types**: `cisco_ios`, `cisco_nxos`, `cisco_xr`

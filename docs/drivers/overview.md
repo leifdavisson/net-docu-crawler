@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Net-Docu-Crawler: Multi-Vendor Driver Architecture Overview
 
-[Open overview.md](overview.md)
-
 Welcome to the **Net-Docu-Crawler** driver subsystem. This document outlines the unified multi-vendor driver model, pre-authentication fingerprinting cascade, device personas, and pagination safety mechanics.
 
 ---

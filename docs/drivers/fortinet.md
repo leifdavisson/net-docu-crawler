@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Fortinet FortiOS Driver Specification
 
-[Open fortinet.md](fortinet.md)
-
 * **Driver Class**: [`FortinetDriver`](../../net_docu_crawler/drivers/fortinet.py)
 * **Supported Platforms**: FortiGate Firewalls (FortiGate 40F through 3000F, VM)
 * **Upstream Netmiko Device Type**: `fortinet`

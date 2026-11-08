@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Aruba Networks / HPE Driver Specification
 
-[Open aruba.md](aruba.md)
-
 * **Driver Class**: [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py)
 * **Supported Platforms**: Aruba Instant AP (IAP clusters), Mobility Controllers, ArubaOS-CX switches, legacy ProCurve switches
 * **Upstream Netmiko Device Types**: `aruba_os` (IAP/Controllers), `aruba_osswitch` (CX/ProCurve)

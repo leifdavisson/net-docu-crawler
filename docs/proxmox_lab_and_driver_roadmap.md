@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Net-Docu-Crawler: Hardware Coverage Roadmap, Driver Specification & Proxmox Test Lab
 
-[Open proxmox_lab_and_driver_roadmap.md](proxmox_lab_and_driver_roadmap.md)
-
 This specification defines the multi-vendor hardware coverage strategy, the engineering checklist for authoring new vendor drivers, and a blueprint for building an automated Proxmox VE network testing laboratory.
 
 ---

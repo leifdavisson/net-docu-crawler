@@ -18,8 +18,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Arista Networks Driver Specification
 
-[Open arista.md](arista.md)
-
 * **Driver Class**: [`AristaDriver`](../../net_docu_crawler/drivers/arista.py)
 * **Supported Platforms**: Arista 7000-Series, vEOS, cEOS, Fixed & Modular Spine/Leaf Switches
 * **Upstream Netmiko Device Type**: `arista_eos`

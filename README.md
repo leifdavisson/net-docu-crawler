@@ -5,8 +5,6 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 # Net-Docu-Crawler
 
-[Open README.md](README.md)
-
 <p align="center">
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-AGPL%20v3-blue.svg" alt="License: AGPL v3" />
@@ -27,10 +25,16 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 ```mermaid
 flowchart LR
-    Targets["Target IPs / Routed CIDRs<br/>(e.g. 192.168.1.0/24, 172.16.1.0/24)"] --> Cascade["4-Tier Zero-Blast-Radius Cascade<br/>1. Offline ARP OUI (VM MAC Bypass)<br/>2. TCP 22 SSH Banner<br/>3. Post-Auth Prompt<br/>4. Version Probe"]
-    Cascade --> Drivers["10 Multi-Vendor Read-Only Drivers<br/>(Netmiko CLI + Paramiko Exec)"]
-    Drivers --> Registry["DeviceRegistry<br/>• SVI / VM / Hypervisor MAC Safe<br/>• Global ARP Neighbor Resolution<br/>• Bidirectional Link Stitching"]
-    Registry --> Reports["Deliverables (docs/net_docu_crawler/)<br/>• L2 & L3 Mermaid Topologies<br/>• Asset Inventory & Cabling CSVs<br/>• Health Audit & Config Translation"]
+    Targets["Target IPs / Routed Subnets<br>(192.168.1.0/24, 172.16.1.0/24)"]
+    Cascade["4-Tier Zero-Blast-Radius Cascade<br>1. Offline ARP OUI<br>2. TCP 22 SSH Banner<br>3. Post-Auth Prompt<br>4. Version Probe"]
+    Drivers["10 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
+    Registry["DeviceRegistry<br>- SVI and Hypervisor MAC Safe<br>- Global ARP Neighbor Resolution<br>- Bidirectional Link Stitching"]
+    Reports["Deliverables (docs/reports/)<br>- L2 and L3 Mermaid Topologies<br>- Asset Inventory and Cabling CSVs<br>- Health Audit and Migration Blueprint"]
+
+    Targets --> Cascade
+    Cascade --> Drivers
+    Drivers --> Registry
+    Registry --> Reports
 ```
 
 * **4-Tier Pre-Identification Cascade**: Resolves hardware vendors offline via [`oui_lookup.py`](oui_lookup.py), automatically bypasses hypervisor virtual NIC OUIs (`BC:24:11` [Proxmox VE](https://www.proxmox.com/), `52:54:00` QEMU/KVM, VMware, VirtualBox, Hyper-V, Xen) so virtual appliances and targets behind L3 gateways (`172.16.1.0/24`) identify cleanly via pre-auth SSH banners and prompts.
@@ -74,27 +78,41 @@ python3 net_crawler.py
 # Crawl specific hosts AND routed subnets across a gateway (TCP 22 pre-filtered)
 python3 net_crawler.py --targets 192.168.1.1 192.168.1.3 172.16.1.0/24
 
+# Organized run: creates timestamped directory docs/reports/<subnet>_<timestamp>_<domain>/
+python3 net_crawler.py --targets 192.168.1.0/24 --organize
+
 # Custom output directory
 python3 net_crawler.py --targets 10.10.20.0/24 --output-dir deliverables/site_a
 ```
 
 ---
 
-## Generated Deliverables (`docs/net_docu_crawler/`)
+## Generated Deliverables
 
-1. **`asset_inventory.csv`**: Normalized inventory (Hostname, IP, MAC, Vendor, Persona, Model, Firmware, Serial).
-2. **`migration_cabling_matrix.csv`**: Physical port-by-port patching matrix with link speeds, duplex, and LLDP/CDP neighbor mapping.
-3. **`L2_network_diagrams.md`**: Interactive Mermaid physical switching diagram + Wireless Access Point overlay table.
-4. **`L3_network_diagrams.md`**: Authoritative VLAN, CIDR subnet ([netaddr](https://netaddr.readthedocs.io/)), and SVI routing topology diagram.
-5. **`net_docu_crawler_live_report.md`**: Layered L1–L7 network health analysis (interface utilization, STP root/blocking audit, CIDR conflict check, DNS/NTP/AAA posture).
-6. **`cisco_to_target_translation.md`**: Cross-vendor configuration translation reference.
+When executed with `--organize` (or into `docs/net_docu_crawler/`), the crawler automatically builds an engineer-ready deliverable bundle:
+
+1. **`Network_Analysis.md`**: Complete Network Migration Blueprint tailored for network engineers (chassis migration, VLAN mappings, cabling schedules, routing and default gateway requirements, risk matrix).
+2. **`asset_inventory.csv`**: Normalized inventory (Hostname, IP, MAC, Vendor, Persona, Model, Firmware, Serial).
+3. **`migration_cabling_matrix.csv`**: Physical port-by-port patching matrix with link speeds, duplex, and LLDP/CDP neighbor mapping.
+4. **`L2_network_diagrams.md`**: Interactive Mermaid physical switching diagram + Wireless Access Point overlay table.
+5. **`L3_network_diagrams.md`**: Authoritative VLAN, CIDR subnet ([netaddr](https://netaddr.readthedocs.io/)), and SVI routing topology diagram.
+6. **`net_docu_crawler_live_report.md`**: Layered L1–L7 network health analysis (interface utilization, STP root/blocking audit, CIDR conflict check, DNS/NTP/AAA posture).
+7. **`cisco_to_target_translation.md`**: Cross-vendor configuration translation reference.
+8. **`logs/`**: Complete operational and session audit logs capturing every driver decision and device interaction.
+
+---
+
+## Documentation & Guides
+
+* **[Junior Operator Playbook (Zero-Knowledge Beginner Guide)](docs/junior_operator_playbook.md)**: Beginner-friendly step-by-step walkthrough for technicians who only know basic IP concepts.
+* **[Agent & Contributor Architecture Guide](AGENTS.md)**: Operational guardrails, zero-blast-radius rules, and code architecture.
+* **[Driver Command Reference](docs/drivers/overview.md)**: Supported read-only CLI command matrices and transport notes for all 10 network operating systems.
+* **[Virtual Lab & Driver Roadmap](docs/proxmox_lab_and_driver_roadmap.md)**: Architecture and setup for virtualized multi-vendor Proxmox VE testbeds.
 
 ---
 
 ## Verification & Development
 
-* **Agent & Contributor Architecture Guide**: [Open AGENTS.md](AGENTS.md)
-* **Driver Command Reference**: [Open overview.md](docs/drivers/overview.md)
 * **Run Linter & Test Suite**:
   ```bash
   ruff check .

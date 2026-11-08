@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Palo Alto Networks Driver Specification
 
-[Open paloalto.md](paloalto.md)
-
 * **Driver Class**: [`PaloAltoDriver`](../../net_docu_crawler/drivers/paloalto.py)
 * **Supported Platforms**: PA-Series Firewalls (PA-220, PA-400, PA-800, PA-3200, PA-5200, VM-Series)
 * **Upstream Netmiko Device Type**: `paloalto_panos`

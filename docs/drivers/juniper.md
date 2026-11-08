@@ -17,8 +17,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Juniper Networks Driver Specification
 
-[Open juniper.md](juniper.md)
-
 * **Driver Class**: [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py)
 * **Supported Platforms**: Juniper EX Series (EX2200, EX3300, EX4300), QFX Series, MX Series, SRX Branch Gateways
 * **Upstream Netmiko Device Type**: `juniper_junos`
