@@ -1,0 +1,31 @@
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+venv/
+.venv/
+
+# Credentials, live network deliverables, & local OUI / lab artifacts
+credentials.json
+*.json
+!credentials.example.json
+docs/net_docu_crawler/
+docs/reports/
+deliverables/
+raw_logs/
+backups/
+scratch/
+oui.txt
+*.log
+*.cfg
+*.conf
+
+# OS / IDE files
+.DS_Store
+.idea/
+.vscode/

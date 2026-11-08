@@ -1,0 +1,25 @@
+# Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Normalize line endings across Windows and Linux
+* text=auto eol=lf
+
+# Explicitly ensure Unix LF for code, configs, and shell scripts
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Windows-specific scripts
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
