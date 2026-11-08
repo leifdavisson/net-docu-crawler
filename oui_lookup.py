@@ -380,6 +380,7 @@ COMMON_OUIS = {
     "D4:04:CD": "Juniper Networks",
     "FC:33:42": "Juniper Networks",
     # Ruckus Wireless / Brocade / CommScope
+    "00:13:92": "Ruckus Wireless",
     "00:1D:2E": "Ruckus Wireless",
     "00:24:82": "Ruckus Wireless",
     "2C:E6:CC": "Ruckus Wireless",
@@ -457,6 +458,7 @@ COMMON_OUIS = {
     "00:90:7F": "F5 Networks",
     # Netgear (Commercial / ProSAFE Managed)
     "00:09:5B": "Netgear",
+    "00:0F:B5": "Netgear",
     "00:14:6C": "Netgear",
     "00:1E:2A": "Netgear",
     "20:4E:7F": "Netgear",
@@ -465,6 +467,7 @@ COMMON_OUIS = {
     "00:31:92": "TP-Link",
     "14:EB:B6": "TP-Link",
     "50:C7:BF": "TP-Link",
+    "50:D4:F7": "TP-Link",
     "70:4F:57": "TP-Link",
     "E4:C3:2A": "TP-Link",
     # Allied Telesis
