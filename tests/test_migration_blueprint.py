@@ -33,11 +33,13 @@ from report_generator import (
 
 def test_compute_organized_output_dir():
     path = compute_organized_output_dir(targets=["192.168.1.0/24"], base_dir="docs/reports", domain="corp.internal")
-    assert "docs/reports/192.168.1.0-24_" in path
+    posix_path = path.replace("\\", "/")
+    assert "docs/reports/192.168.1.0-24_" in posix_path
     assert path.endswith("_corp.internal")
 
     p2p_path = compute_organized_output_dir(targets=["10.10.1.0/30"], domain="dmz")
-    assert "10.10.1.0-30_" in p2p_path
+    posix_p2p = p2p_path.replace("\\", "/")
+    assert "10.10.1.0-30_" in posix_p2p
     assert p2p_path.endswith("_dmz")
 
 
