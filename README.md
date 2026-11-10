@@ -64,6 +64,15 @@ flowchart LR
 
 ### 1. Install Dependencies
 
+**Windows (fresh machine):** run the assessor from PowerShell in the project folder. It checks Python 3.10-3.12, Git, PATH, the x64 [VC++ Redistributable](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist), and installs dependencies into `.venv`. Use `-Fix` to repair (uses [winget](https://learn.microsoft.com/windows/package-manager/winget/)).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1        # assess only
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 -Fix   # assess + fix
+```
+
+**Linux/macOS:**
+
 ```bash
 pip install -e ".[dev]"
 cp credentials.example.json credentials.json
