@@ -50,10 +50,12 @@ from net_docu_crawler.drivers import (
 )
 from net_docu_crawler.drivers.base import sanitize_raw_config
 from net_docu_crawler.drivers.detector import (
+    classify_non_network_appliance,
     detect_vendor_range,
     get_arp_table_entries,
     get_mac_from_system_arp,
     infer_vendor_from_http,
+    probe_appliance_ports,
     probe_http_fingerprint,
     probe_snmp_sysinfo,
     scan_subnet_ports,
@@ -457,6 +459,8 @@ def build_partial_device_record(
     port: int = 22,
     transport: str = "ssh",
     status: str = "unauthenticated",
+    device_type: str = "unknown",
+    model_override: str = "",
 ) -> dict:
     """
     Build a partial normalized `device_data` record for reachable hosts that
@@ -483,7 +487,16 @@ def build_partial_device_record(
         resolved_vendor = "Unknown"
 
     clean_banner = banner.strip().replace("\r", " ").replace("\n", " ") if banner else ""
-    if clean_banner:
+    if device_type == "unknown":
+        app_class = classify_non_network_appliance(vendor_oui=oui_vendor, banner=clean_banner)
+        if app_class:
+            device_type, auto_model = app_class
+            if not model_override:
+                model_override = auto_model
+
+    if model_override:
+        model = model_override
+    elif clean_banner:
         model = clean_banner[:60]
     elif resolved_vendor != "Unknown":
         model = f"{resolved_vendor} Device"
@@ -495,8 +508,8 @@ def build_partial_device_record(
         "status": status,
         "mgmt_method": mgmt_method,
         "vendor": resolved_vendor,
-        "device_type": "unknown",
-        "device_persona": "unknown",
+        "device_type": device_type,
+        "device_persona": "appliance" if device_type in ("av_control", "camera", "display") else "unknown",
         "hostname": ip,
         "model": model,
         "serial": "Unknown",
@@ -541,6 +554,7 @@ def crawl_target_with_ports(
     last_vendor = "unknown"
     last_banner = ""
     last_port, last_transport = ports_to_try[0]
+    last_app_class: tuple[str, str] | None = None
     saw_auth_failure = False
 
     for port, transport in ports_to_try:
@@ -560,8 +574,8 @@ def crawl_target_with_ports(
             break
         if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
             vendor_cand = hint_norm
-        elif vendor_cand == "unknown" and http_fingerprint:
-            http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
+        elif vendor_cand == "unknown":
+            http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5)) if http_fingerprint else None
             if http_fp:
                 _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {http_fp}")
             http_vendor = infer_vendor_from_http(http_fp)
@@ -571,6 +585,25 @@ def crawl_target_with_ports(
                     log_file,
                     f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand}",
                 )
+            else:
+                app_ports = probe_appliance_ports(ip, timeout=min(float(timeout), 0.3))
+                oui_v = oui_lookup.get_vendor(host_mac) if host_mac else ""
+                app_class = classify_non_network_appliance(
+                    vendor_oui=oui_v, banner=banner, http_fp=http_fp, open_app_ports=app_ports
+                )
+                if app_class:
+                    last_vendor, last_banner, last_port, last_transport = (
+                        "unsupported_appliance",
+                        banner,
+                        port,
+                        transport,
+                    )
+                    last_app_class = app_class
+                    _log_event(
+                        log_file,
+                        f"Target {ip}:{port} ({transport}) -> non-network appliance ({app_class[1]}, ports={app_ports}); skipping SSH/Telnet login.",
+                    )
+                    break
         last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
         _log_event(
             log_file,
@@ -723,6 +756,8 @@ def crawl_target_with_ports(
         port=last_port,
         transport=last_transport,
         status=status,
+        device_type=last_app_class[0] if last_app_class else "unknown",
+        model_override=last_app_class[1] if last_app_class else "",
     )
 
 
@@ -829,7 +864,35 @@ def crawl_network(
     try_all_creds: bool = False,
     save_baseline: str = "",
     compare_baseline: str = "",
+    retry_failed: str = "",
 ) -> list[dict]:
+    if retry_failed:
+        with open(retry_failed, encoding="utf-8") as f:
+            failed_entries = json.load(f)
+        retry_ips = []
+        skipped_unsupported = 0
+        for entry in failed_entries:
+            if isinstance(entry, str):
+                retry_ips.append(entry)
+            elif isinstance(entry, dict) and entry.get("ip"):
+                if entry.get("status") == "unsupported":
+                    skipped_unsupported += 1
+                    continue
+                retry_ips.append(entry["ip"])
+        if not retry_ips and isinstance(failed_entries, list):
+            retry_ips = [e["ip"] for e in failed_entries if isinstance(e, dict) and e.get("ip")]
+            skipped_unsupported = 0
+        if skipped_unsupported:
+            print(
+                f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed} (skipped {skipped_unsupported} unsupported)."
+            )
+        else:
+            print(f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed}.")
+        targets = retry_ips
+        if not targets:
+            print("[!] No retryable hosts found in failed_hosts.json.")
+            return []
+
     credentials, cred_warnings, cred_errors = load_and_validate_credentials(credentials_path)
     for w in cred_warnings:
         print(f"[!] Credential warning: {w}")
@@ -1088,6 +1151,26 @@ def crawl_network(
         json.dump(raw_devices, f, indent=2)
     print(f"[+] Saved crawl dataset to: {json_path}")
 
+    # Export failed / unauthenticated / unsupported hosts for targeted --retry-failed follow-ups
+    failed_hosts = [
+        {
+            "ip": dev.get("ip", ""),
+            "status": dev.get("status", "unknown"),
+            "vendor": dev.get("vendor", "Unknown"),
+            "device_type": dev.get("device_type", "unknown"),
+            "mgmt_method": dev.get("mgmt_method", ""),
+            "model": dev.get("model", ""),
+            "mac_address": dev.get("mac_address", ""),
+        }
+        for dev in raw_devices
+        if dev.get("status") in ("unauthenticated", "unsupported")
+    ]
+    failed_path = os.path.join(run_output_dir, "failed_hosts.json")
+    with open(failed_path, "w", encoding="utf-8") as f:
+        json.dump(failed_hosts, f, indent=2)
+    if failed_hosts:
+        print(f"[+] Saved {len(failed_hosts)} failed/partial host(s) to: {failed_path}")
+
     # Generate Reports using canonical device records
     devices_dict = {dev["ip"]: dev for dev in registry.devices.values()}
 
@@ -1344,6 +1427,11 @@ def main():
         help="Compare current crawl against a saved baseline JSON and generate migration_verification_report.md",
     )
     parser.add_argument(
+        "--retry-failed",
+        default="",
+        help="Path to failed_hosts.json from a prior run to retry unauthenticated hosts only",
+    )
+    parser.add_argument(
         "--validate-credentials",
         action="store_true",
         help="Validate --credentials JSON file(s) and exit without running a crawl",
@@ -1390,6 +1478,7 @@ def main():
             try_all_creds=args.try_all_creds,
             save_baseline=args.save_baseline,
             compare_baseline=args.compare_baseline,
+            retry_failed=args.retry_failed,
         )
     except ValueError:
         sys.exit(1)

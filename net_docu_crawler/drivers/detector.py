@@ -274,6 +274,66 @@ def infer_vendor_from_http(fp: dict | None) -> str:
     return "unknown"
 
 
+# Non-network appliance ports inspired by casting-diag (https://github.com/leifdavisson/casting-diag)
+APPLIANCE_PROBE_PORTS: tuple[int, ...] = (41794, 7236, 7000, 8008, 8000, 554)
+
+
+def probe_appliance_ports(ip: str, timeout: float = 0.25) -> list[int]:
+    """
+    Lightweight, read-only TCP connect probe for common AV/display/camera appliance ports:
+    41794 (Crestron CIP), 7236 (Miracast/Airtame), 7000 (AirPlay), 8008 (Google Cast),
+    8000 (Newline/Hikvision SDK), 554 (RTSP Camera).
+    """
+    open_ports: list[int] = []
+    for port in APPLIANCE_PROBE_PORTS:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            if sock.connect_ex((ip, port)) == 0:
+                open_ports.append(port)
+        except Exception:
+            pass
+        finally:
+            sock.close()
+    return open_ports
+
+
+def classify_non_network_appliance(
+    vendor_oui: str = "",
+    banner: str = "",
+    http_fp: dict | None = None,
+    open_app_ports: list[int] | None = None,
+) -> tuple[str, str] | None:
+    """
+    Classifies non-network appliances (AV controllers, wireless displays, IP cameras,
+    Windows hosts) from OUI, SSH/Telnet banner, HTTP fingerprint, and open appliance ports.
+    Returns (device_type, model_label) or None if no appliance signature matches.
+    """
+    oui_l = (vendor_oui or "").lower()
+    banner_l = (banner or "").lower()
+    server_l = str((http_fp or {}).get("server", "")).lower()
+    title_l = str((http_fp or {}).get("title", "")).lower()
+    ports = set(open_app_ports or [])
+
+    if "crestron" in banner_l or "crestron" in oui_l or 41794 in ports:
+        return ("av_control", "Crestron AV Controller")
+    if "hikvision" in oui_l or "app-webs" in server_l or ("webs" in server_l and (554 in ports or 8000 in ports)):
+        return ("camera", "Hikvision IP Camera")
+    if 7236 in ports:
+        return ("display", "Miracast / Airtame Display")
+    if 7000 in ports:
+        return ("display", "Apple AirPlay Display")
+    if 8008 in ports:
+        return ("display", "Google Cast Display")
+    if 554 in ports:
+        return ("camera", "RTSP IP Camera")
+    if "openssh_for_windows" in banner_l:
+        return ("server", "Windows Host (OpenSSH)")
+    if "axis" in oui_l or "axis" in title_l:
+        return ("camera", "Axis IP Camera")
+    return None
+
+
 def _ber_len(length: int) -> bytes:
     if length < 0x80:
         return bytes([length])

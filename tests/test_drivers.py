@@ -1438,3 +1438,51 @@ def test_detector_skips_windows_openssh_and_fortinet_ignores_auth_prompts():
     drv = FortinetDriver("10.29.25.34", "admin", "pass")
     ver = drv.get_version(mock_conn)
     assert ver["hostname"] == ""
+
+
+def test_non_network_appliance_classification_and_retry_failed(tmp_path):
+    """Verify casting-diag appliance classification and failed_hosts.json / --retry-failed filtering."""
+    from net_docu_crawler.crawler import build_partial_device_record, crawl_network
+    from net_docu_crawler.drivers.detector import classify_non_network_appliance
+
+    assert classify_non_network_appliance(open_app_ports=[7236]) == ("display", "Miracast / Airtame Display")
+    assert classify_non_network_appliance(open_app_ports=[7000]) == ("display", "Apple AirPlay Display")
+    assert classify_non_network_appliance(open_app_ports=[8008]) == ("display", "Google Cast Display")
+    assert classify_non_network_appliance(
+        vendor_oui="Hangzhou Hikvision Digital Technology Co.,Ltd.",
+        http_fp={"server": "App-webs/"},
+        open_app_ports=[554],
+    ) == ("camera", "Hikvision IP Camera")
+
+    rec = build_partial_device_record(
+        ip="10.29.0.131",
+        mac="00:10:7f:c2:e2:ec",
+        vendor="unsupported_appliance",
+        banner="SSH-2.0-CrestronSSH",
+        status="unsupported",
+    )
+    assert rec["device_type"] == "av_control"
+    assert rec["model"] == "Crestron AV Controller"
+
+    failed_file = tmp_path / "failed_hosts.json"
+    failed_file.write_text(
+        '[{"ip": "10.29.55.51", "status": "unauthenticated"}, {"ip": "10.29.0.131", "status": "unsupported"}]',
+        encoding="utf-8",
+    )
+    creds_file = tmp_path / "creds.json"
+    creds_file.write_text('[{"name": "admin", "username": "admin", "password": "pw"}]', encoding="utf-8")
+
+    with (
+        patch("net_docu_crawler.crawler.scan_subnet_ports", return_value={}) as mock_scan,
+        patch("net_docu_crawler.crawler.get_arp_table_entries", return_value={}),
+    ):
+        crawl_network(
+            targets=["10.29.0.1/23"],
+            credentials_path=[str(creds_file)],
+            output_dir=str(tmp_path / "out"),
+            organize=False,
+            retry_failed=str(failed_file),
+        )
+        mock_scan.assert_called_once()
+        assert mock_scan.call_args[0][0] == ["10.29.55.51"]
+        assert (tmp_path / "out" / "failed_hosts.json").exists()
