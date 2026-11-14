@@ -443,11 +443,7 @@ def crawl_target_with_ports(
 
         if vendor_cand and vendor_cand != "unknown":
             sorted_creds.sort(
-                key=lambda c: (
-                    0
-                    if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower())
-                    else 1
-                )
+                key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
             )
 
         for driver_cls in driver_classes:
@@ -475,8 +471,7 @@ def crawl_target_with_ports(
                     )
                     conn = driver.connect()
                     succ_msg = (
-                        f"Successfully connected to {ip}:{port} ({transport}) "
-                        f"with {driver_cls.__name__} (User: {user})"
+                        f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
                     )
                     print(f"[+] {succ_msg}")
                     _log_event(log_file, succ_msg)
@@ -642,9 +637,7 @@ def crawl_network(
     _log_event(crawler_log, f"Loaded {len(credentials)} credential profiles from {credentials_path}")
 
     # Expand any CIDR subnets and ip:port targets
-    expanded_targets, explicit_ports = parse_target_specs(
-        targets, ssh_ports=ssh_ports, telnet_ports=telnet_ports
-    )
+    expanded_targets, explicit_ports = parse_target_specs(targets, ssh_ports=ssh_ports, telnet_ports=telnet_ports)
     eff_ssh_ports = ssh_ports if ssh_ports is not None else [22, 2222]
     eff_telnet_ports = telnet_ports if telnet_ports is not None else [23]
 
@@ -657,9 +650,7 @@ def crawl_network(
         if not batch_ips:
             return
         scanned_ip_set.update(batch_ips)
-        print(
-            f"[+] Pre-scanning {len(batch_ips)} target(s) for SSH {eff_ssh_ports} / Telnet {eff_telnet_ports}..."
-        )
+        print(f"[+] Pre-scanning {len(batch_ips)} target(s) for SSH {eff_ssh_ports} / Telnet {eff_telnet_ports}...")
         _log_event(crawler_log, f"Pre-scanning {len(batch_ips)} targets: {batch_ips}")
 
         scan_ips = [ip for ip in batch_ips if ip not in batch_explicit]
@@ -768,8 +759,7 @@ def crawl_network(
     if http_fingerprint and partial_devs:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(partial_devs))) as pool:
             http_futs = {
-                pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d
-                for d in partial_devs
+                pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d for d in partial_devs
             }
             for fut in as_completed(http_futs):
                 dev = http_futs[fut]

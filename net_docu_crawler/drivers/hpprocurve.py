@@ -202,7 +202,9 @@ class HPProCurveDriver(BaseDriver):
         try:
             raw_lldp = conn.send_command("show lldp info remote-device")
             lines = raw_lldp.splitlines()
-            sep_line = next((line_item for line_item in lines if "+ ----" in line_item or "--------- +" in line_item), None)
+            sep_line = next(
+                (line_item for line_item in lines if "+ ----" in line_item or "--------- +" in line_item), None
+            )
             if sep_line and "+" in sep_line:
                 p_plus = sep_line.index("+")
                 parts = sep_line[p_plus + 1 :].split()

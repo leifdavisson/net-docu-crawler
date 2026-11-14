@@ -497,8 +497,6 @@ class BaseDriver(ABC):
         device_data["routing_peers"] = live_peers if live_peers else cfg_peers
         device_data["fhrp"] = live_fhrp if live_fhrp else cfg_fhrp
         device_data["dhcp"] = extract_dhcp_config(device_data["raw_config"], vendor=self.vendor_name)
-        device_data["security_policy"] = extract_firewall_nat_vpn(
-            device_data["raw_config"], vendor=self.vendor_name
-        )
+        device_data["security_policy"] = extract_firewall_nat_vpn(device_data["raw_config"], vendor=self.vendor_name)
 
         return device_data

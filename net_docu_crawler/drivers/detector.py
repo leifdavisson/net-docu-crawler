@@ -102,10 +102,7 @@ def scan_subnet_ports(
         return results
     workers = min(max_workers, max(1, len(ips)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {
-            executor.submit(scan_host_ports, ip, ssh_ports, telnet_ports, timeout): ip
-            for ip in ips
-        }
+        future_map = {executor.submit(scan_host_ports, ip, ssh_ports, telnet_ports, timeout): ip for ip in ips}
         for fut in as_completed(future_map):
             ip = future_map[fut]
             try:
@@ -467,7 +464,8 @@ def detect_vendor_range(
         if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
             candidate = "hpprocurve"
         elif any(
-            k in banner_lower for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business", "cisco_s300")
+            k in banner_lower
+            for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business", "cisco_s300")
         ):
             candidate = "ciscosmb"
         elif "cisco" in banner_lower or "user access verification" in banner_lower:

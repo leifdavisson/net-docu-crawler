@@ -2964,16 +2964,12 @@ def generate_target_migration_configs(
                 lines.append(f"set system name-server {dns}")
             for port, prof in list(port_profiles.items())[:48]:
                 if prof.get("mode") == "access" and prof.get("access_vlan"):
-                    lines.append(
-                        f"set interfaces {port} unit 0 family ethernet-switching interface-mode access"
-                    )
+                    lines.append(f"set interfaces {port} unit 0 family ethernet-switching interface-mode access")
                     lines.append(
                         f"set interfaces {port} unit 0 family ethernet-switching vlan members {prof['access_vlan']}"
                     )
                 elif prof.get("mode") == "trunk":
-                    lines.append(
-                        f"set interfaces {port} unit 0 family ethernet-switching interface-mode trunk"
-                    )
+                    lines.append(f"set interfaces {port} unit 0 family ethernet-switching interface-mode trunk")
                     if prof.get("trunk_allowed_vlans"):
                         lines.append(
                             f"set interfaces {port} unit 0 family ethernet-switching vlan members [{prof['trunk_allowed_vlans'].replace(',', ' ')}]"

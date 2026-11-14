@@ -806,7 +806,13 @@ def test_multi_credential_defaults_then_actual():
     assert any(c["password"] == "" for c in default_creds)
 
     actual_creds = [
-        {"name": "Actual-Cisco", "vendor": "cisco", "username": "netadmin", "password": "real-cisco-pw", "secret": "real"},
+        {
+            "name": "Actual-Cisco",
+            "vendor": "cisco",
+            "username": "netadmin",
+            "password": "real-cisco-pw",
+            "secret": "real",
+        },
         {"name": "Actual-HP", "vendor": "hpprocurve", "username": "admin", "password": "real-hp-pw"},
         {"name": "Actual-Juniper", "vendor": "juniper", "username": "root", "password": "real-junos-pw"},
         {"name": "Actual-FortiGate", "vendor": "fortinet", "username": "admin", "password": "real-forti-pw"},

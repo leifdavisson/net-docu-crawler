@@ -2,11 +2,38 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'feature/**' ]
   pull_request:
     branches: [ main ]
 
 jobs:
+  secrets:
+    name: Credential & Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Sensitive Files Are Not Tracked
+        run: |
+          if git ls-files --error-unmatch credentials.json 2>/dev/null; then
+            echo "ERROR: credentials.json must never be committed!"
+            exit 1
+          fi
+          tracked_logs=$(git ls-files '*.log' 'docs/reports/**' 'docs/net_docu_crawler/**')
+          if [ -n "$tracked_logs" ]; then
+            echo "ERROR: Sensitive log/report files are tracked:"
+            echo "$tracked_logs"
+            exit 1
+          fi
+
+      - name: Run Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   lint:
     name: Code Quality & Linting (Ruff & Pre-Commit)
     runs-on: ubuntu-latest
@@ -34,7 +61,7 @@ jobs:
 
   test:
     name: Cross-Platform Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
-    needs: lint
+    needs: [lint, secrets]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

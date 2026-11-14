@@ -271,8 +271,13 @@ def test_asset_inventory_partial_unauthenticated_and_custom_mgmt_method(tmp_path
 
     assert "SW-CUSTOM,192.168.1.10" in inv_txt
     assert "SSH:2222" in inv_txt
-    assert "192.168.1.50,192.168.1.50,aa:bb:cc:dd:ee:01,Unknown,Cisco Telnet Login,Unknown,Unknown,Unauthenticated,Telnet" in inv_txt
-    assert "192.168.1.60,192.168.1.60,aa:bb:cc:dd:ee:02,Unknown,Synology Device,Unknown,Unknown,Unsupported,SSH" in inv_txt
+    assert (
+        "192.168.1.50,192.168.1.50,aa:bb:cc:dd:ee:01,Unknown,Cisco Telnet Login,Unknown,Unknown,Unauthenticated,Telnet"
+        in inv_txt
+    )
+    assert (
+        "192.168.1.60,192.168.1.60,aa:bb:cc:dd:ee:02,Unknown,Synology Device,Unknown,Unknown,Unsupported,SSH" in inv_txt
+    )
     assert "Telnet" in rep_txt
 
 
