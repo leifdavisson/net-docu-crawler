@@ -214,8 +214,76 @@ class CiscoDriver(BaseDriver):
             pass
         return entries
 
+    @staticmethod
+    def _norm_port(port: str) -> str:
+        p = port.strip().lower()
+        for full, short in (
+            ("twentyfivegige", "twe"),
+            ("hundredgige", "hu"),
+            ("fortygige", "fo"),
+            ("tengigabitethernet", "te"),
+            ("gigabitethernet", "gi"),
+            ("fastethernet", "fa"),
+            ("ethernet", "eth"),
+        ):
+            if p.startswith(full):
+                return short + p[len(full) :]
+        return p
+
     def get_optics(self, conn) -> list[dict]:
-        optics = []
+        optics_by_norm: dict[str, dict] = {}
+
+        # 1. Pull transceiver type, PID, and serial numbers from `show inventory`
+        try:
+            inv_raw = conn.send_command("show inventory")
+            cur_name = ""
+            cur_descr = ""
+            for line in inv_raw.splitlines():
+                m_nd = re.search(r'NAME:\s*"([^"]+)",\s*DESCR:\s*"([^"]*)"', line)
+                if m_nd:
+                    cur_name = m_nd.group(1).strip()
+                    cur_descr = m_nd.group(2).strip()
+                    continue
+                if cur_name and "PID:" in line:
+                    m_pid = re.search(r"PID:\s*([^,\s]+)", line)
+                    m_sn = re.search(r"SN:\s*(\S+)", line)
+                    descr_l = cur_descr.lower()
+                    is_xcvr = any(
+                        k in descr_l
+                        for k in (
+                            "sfp",
+                            "qsfp",
+                            "xfp",
+                            "gbic",
+                            "1000base",
+                            "10gbase",
+                            "25gbase",
+                            "40gbase",
+                            "100gbase",
+                            "transceiver",
+                        )
+                    ) or bool(re.match(r"^(?:Gi|Te|Twe|Fo|Hu|Eth|GigabitEthernet|TenGigabitEthernet)\d", cur_name))
+                    if is_xcvr:
+                        pid = m_pid.group(1).strip() if m_pid else "Unknown"
+                        sn = m_sn.group(1).strip() if m_sn else "Unknown"
+                        norm = self._norm_port(cur_name)
+                        optics_by_norm[norm] = {
+                            "port": cur_name,
+                            "vendor": "Cisco",
+                            "part_number": pid,
+                            "serial": sn,
+                            "type": cur_descr or "SFP",
+                            "tx_power_dbm": None,
+                            "rx_power_dbm": None,
+                            "temperature_c": None,
+                            "voltage_v": None,
+                        }
+                    cur_name = ""
+                    cur_descr = ""
+        except Exception:
+            pass
+
+        # 2. Merge live DOM telemetry from `show interfaces transceiver`
         try:
             raw = conn.send_command("show interfaces transceiver")
             for line in raw.splitlines():
@@ -232,8 +300,14 @@ class CiscoDriver(BaseDriver):
                     volt = float(m.group(3)) if m.group(3) != "N/A" else None
                     tx = float(m.group(5)) if m.group(5) != "N/A" else None
                     rx = float(m.group(6)) if m.group(6) != "N/A" else None
-                    optics.append(
-                        {
+                    norm = self._norm_port(port)
+                    if norm in optics_by_norm:
+                        optics_by_norm[norm]["tx_power_dbm"] = tx
+                        optics_by_norm[norm]["rx_power_dbm"] = rx
+                        optics_by_norm[norm]["temperature_c"] = temp
+                        optics_by_norm[norm]["voltage_v"] = volt
+                    else:
+                        optics_by_norm[norm] = {
                             "port": port,
                             "vendor": "Cisco",
                             "part_number": "SFP-DOM",
@@ -244,10 +318,9 @@ class CiscoDriver(BaseDriver):
                             "temperature_c": temp,
                             "voltage_v": volt,
                         }
-                    )
         except Exception:
             pass
-        return optics
+        return list(optics_by_norm.values())
 
     def get_running_config(self, conn) -> str:
         try:

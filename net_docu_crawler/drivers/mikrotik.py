@@ -245,6 +245,54 @@ class MikroTikDriver(BaseDriver):
             pass
         return arp_entries
 
+    def get_optics(self, conn) -> list[dict]:
+        optics = []
+        try:
+            raw = conn.send_command('/interface ethernet monitor [find where name~"sfp"] once')
+            cur_name = ""
+            cur_entry: dict = {}
+            for line in raw.splitlines():
+                m_n = re.search(r"name:\s*(\S+)", line)
+                if m_n:
+                    if cur_entry and cur_entry.get("part_number") != "Unknown":
+                        optics.append(cur_entry)
+                    cur_name = _clean_ros_token(m_n.group(1))
+                    cur_entry = {
+                        "port": cur_name,
+                        "vendor": "MikroTik",
+                        "part_number": "Unknown",
+                        "serial": "Unknown",
+                        "type": "SFP",
+                        "tx_power_dbm": None,
+                        "rx_power_dbm": None,
+                        "temperature_c": None,
+                        "voltage_v": None,
+                    }
+                elif cur_entry:
+                    m_vn = re.search(r"sfp-vendor-name:\s*(\S+)", line)
+                    m_pn = re.search(r"sfp-vendor-part-number:\s*(\S+)", line)
+                    m_sn = re.search(r"sfp-vendor-serial:\s*(\S+)", line)
+                    m_tx = re.search(r"sfp-tx-power:\s*([-\d\.]+)", line)
+                    m_rx = re.search(r"sfp-rx-power:\s*([-\d\.]+)", line)
+                    m_temp = re.search(r"sfp-temperature:\s*([-\d\.]+)", line)
+                    if m_vn:
+                        cur_entry["vendor"] = _clean_ros_token(m_vn.group(1))
+                    if m_pn:
+                        cur_entry["part_number"] = _clean_ros_token(m_pn.group(1))
+                    if m_sn:
+                        cur_entry["serial"] = _clean_ros_token(m_sn.group(1))
+                    if m_tx:
+                        cur_entry["tx_power_dbm"] = float(m_tx.group(1))
+                    if m_rx:
+                        cur_entry["rx_power_dbm"] = float(m_rx.group(1))
+                    if m_temp:
+                        cur_entry["temperature_c"] = float(m_temp.group(1))
+            if cur_entry and cur_entry.get("part_number") != "Unknown":
+                optics.append(cur_entry)
+        except Exception:
+            pass
+        return optics
+
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("/export compact")

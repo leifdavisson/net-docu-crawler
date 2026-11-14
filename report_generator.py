@@ -951,12 +951,16 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         ints_detail = dev.get("interfaces_detail", {})
 
         for name, stats in ints_detail.items():
+            status_str = str(stats.get("status", "")).lower()
+            if "up" not in status_str:
+                continue
             desc = stats.get("description", "")
-            speed = stats.get("speed", "")
-            duplex = stats.get("duplex", "")
+            speed = str(stats.get("speed", ""))
+            duplex = str(stats.get("duplex", ""))
             in_err = stats.get("input_errors", 0)
             crc = stats.get("crc", 0)
             out_err = stats.get("output_errors", 0)
+            drops = stats.get("drops", 0)
 
             # Check half duplex (often a mismatch indicator on switchports)
             if duplex and "half" in duplex.lower():
@@ -964,15 +968,17 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
                     f"* **{hostname}** Interface `{name}` (`{desc}`): Operating at **{duplex}** / **{speed}** (Potential mismatch)."
                 )
 
-            # Speed constraints
-            if speed and "10Mb/s" in speed:
-                mismatches.append(f"* **{hostname}** Interface `{name}` (`{desc}`): Speed restricted to **10 Mbps**.")
+            # Speed constraints (10Mb/s or 100Mb/s down-shift on Gigabit+ ports)
+            is_gig_port = "gigabit" in name.lower() or name.lower().startswith(("gi", "ge-", "xe-", "te", "et-"))
+            if speed and ("10Mb/s" in speed or (is_gig_port and "100Mb/s" in speed)):
+                mismatches.append(f"* **{hostname}** Interface `{name}` (`{desc}`): Speed restricted to **{speed}**.")
 
-            # Errors
-            if in_err > 0 or crc > 0 or out_err > 0:
+            # Errors / Drops on UP links
+            if in_err > 0 or crc > 0 or out_err > 0 or drops > 0:
                 desc_str = f" (`{desc}`)" if desc else ""
+                drop_str = f", Drops: `{drops}`" if drops > 0 else ""
                 errors_found.append(
-                    f"* **{hostname}** Interface `{name}`{desc_str}: Input Errors: `{in_err}`, CRCs: `{crc}`, Output Errors: `{out_err}`."
+                    f"* **{hostname}** Interface `{name}`{desc_str}: Input Errors: `{in_err}`, CRCs: `{crc}`, Output Errors: `{out_err}`{drop_str}."
                 )
 
     if mismatches:
@@ -2258,8 +2264,8 @@ def generate_master_network_analysis_migration_blueprint(
             "### 2.3 Optical Transceiver & Digital Optical Monitoring (DOM) Telemetry",
             "Detailed physical telemetry for pluggable fiber/copper SFP, SFP+, and QSFP transceivers:",
             "",
-            "| Switch Hostname | Port | Transceiver Model / Part | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Switch Hostname | Port | Transceiver Model / Part | Serial Number | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
     )
     optics_found = 0
@@ -2269,6 +2275,7 @@ def generate_master_network_analysis_migration_blueprint(
             optics_found += 1
             port = opt.get("port", "")
             part = opt.get("part_number", "SFP-DOM")
+            serial = opt.get("serial", "Unknown")
             form = opt.get("type", "SFP+")
             tx = f"{opt['tx_power_dbm']:.2f} dBm" if opt.get("tx_power_dbm") is not None else "N/A"
             rx = f"{opt['rx_power_dbm']:.2f} dBm" if opt.get("rx_power_dbm") is not None else "N/A"
@@ -2287,12 +2294,12 @@ def generate_master_network_analysis_migration_blueprint(
                 health = "✓ Active Link"
 
             lines.append(
-                f"| **{hostname}** | `{port}` | `{part}` | `{form}` | {tx} | {rx} | {temp} | {volt} | {health} |"
+                f"| **{hostname}** | `{port}` | `{part}` | `{serial}` | `{form}` | {tx} | {rx} | {temp} | {volt} | {health} |"
             )
 
     if optics_found == 0:
         lines.append(
-            "| *All Switches* | *N/A* | *No pluggable SFP/DOM optics detected (All RJ-45 copper access)* | `1000BASE-T` | N/A | N/A | N/A | N/A | ✓ Healthy (Copper PHY) |"
+            "| *All Switches* | *N/A* | *No pluggable SFP/DOM optics detected (All RJ-45 copper access)* | *N/A* | `1000BASE-T` | N/A | N/A | N/A | N/A | ✓ Healthy (Copper PHY) |"
         )
 
     lines.extend(

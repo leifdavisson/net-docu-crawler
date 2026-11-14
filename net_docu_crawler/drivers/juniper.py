@@ -241,6 +241,25 @@ class JuniperDriver(BaseDriver):
                                 }
                             )
 
+        # Enrich up physical interfaces with input/output error counters (`show interfaces`)
+        try:
+            err_raw = conn.send_command("show interfaces")
+            cur_if = ""
+            for line in err_raw.splitlines():
+                m_if = re.match(r"^\s*Physical interface:\s*([A-Za-z0-9/\._-]+)", line)
+                if m_if:
+                    cur_if = m_if.group(1)
+                    continue
+                if cur_if and cur_if in interfaces_detail:
+                    m_in = re.search(r"Input errors:\s*(\d+)", line, re.IGNORECASE)
+                    m_out = re.search(r"Output errors:\s*(\d+)", line, re.IGNORECASE)
+                    if m_in:
+                        interfaces_detail[cur_if]["input_errors"] = int(m_in.group(1))
+                    if m_out:
+                        interfaces_detail[cur_if]["output_errors"] = int(m_out.group(1))
+        except Exception:
+            pass
+
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
@@ -596,7 +615,115 @@ class JuniperDriver(BaseDriver):
         return entries
 
     def get_optics(self, conn) -> list[dict]:
-        optics = []
+        optics_by_port: dict[str, dict] = {}
+
+        # 1. Extract inserted Xcvr part numbers & serials from `show chassis hardware` (JSON + Junos 9.x text fallback)
+        def _xcvr_port(fpc_idx: str, pic_idx: str, xcvr_idx: str, descr: str) -> str:
+            dl = descr.lower()
+            if "qsfp" in dl or "100g" in dl or "40g" in dl:
+                prefix = "et"
+            elif "sfp+" in dl or "10g" in dl or "xfp" in dl:
+                prefix = "xe"
+            else:
+                prefix = "ge"
+            return f"{prefix}-{fpc_idx}/{pic_idx}/{xcvr_idx}"
+
+        try:
+            raw_hw = conn.send_command("show chassis hardware | display json")
+            hw_data = json.loads(raw_hw)
+            chassis = hw_data.get("chassis-inventory", [{}])[0].get("chassis", [{}])[0]
+            for mod in chassis.get("chassis-module", []):
+                m_name = mod.get("name", [{}])[0].get("data", "")
+                m_fpc = re.match(r"FPC\s+(\d+)", m_name, re.IGNORECASE)
+                if not m_fpc:
+                    continue
+                fpc_idx = m_fpc.group(1)
+                for sub in mod.get("chassis-sub-module", []):
+                    s_name = sub.get("name", [{}])[0].get("data", "")
+                    m_pic = re.match(r"PIC\s+(\d+)", s_name, re.IGNORECASE)
+                    if not m_pic:
+                        continue
+                    pic_idx = m_pic.group(1)
+                    for xcvr in sub.get("chassis-sub-sub-module", []):
+                        x_name = xcvr.get("name", [{}])[0].get("data", "")
+                        m_x = re.match(r"Xcvr\s+(\d+)", x_name, re.IGNORECASE)
+                        if not m_x:
+                            continue
+                        pn = xcvr.get("part-number", [{}])[0].get("data", "Unknown")
+                        sn = xcvr.get("serial-number", [{}])[0].get("data", "Unknown")
+                        desc = xcvr.get("description", [{}])[0].get("data", "SFP")
+                        port = _xcvr_port(fpc_idx, pic_idx, m_x.group(1), desc)
+                        optics_by_port[port] = {
+                            "port": port,
+                            "vendor": "Juniper Networks",
+                            "part_number": pn or "Unknown",
+                            "serial": sn or "Unknown",
+                            "type": desc or "SFP",
+                            "tx_power_dbm": None,
+                            "rx_power_dbm": None,
+                            "temperature_c": None,
+                            "voltage_v": None,
+                        }
+        except Exception:
+            try:
+                raw_hw_txt = conn.send_command("show chassis hardware")
+                fpc_idx, pic_idx = "0", "0"
+                for line in raw_hw_txt.splitlines():
+                    m_fpc = re.match(r"^FPC\s+(\d+)", line.strip())
+                    if m_fpc:
+                        fpc_idx = m_fpc.group(1)
+                        continue
+                    m_pic = re.match(r"^\s*PIC\s+(\d+)", line)
+                    if m_pic:
+                        pic_idx = m_pic.group(1)
+                        continue
+                    m_x = re.match(r"^\s*Xcvr\s+(\d+)\s+(?:REV\s+\S+\s+)?(\S+)\s+(\S+)\s+(.+)$", line)
+                    if m_x:
+                        pn, sn, desc = m_x.group(2), m_x.group(3), m_x.group(4).strip()
+                        port = _xcvr_port(fpc_idx, pic_idx, m_x.group(1), desc)
+                        optics_by_port[port] = {
+                            "port": port,
+                            "vendor": "Juniper Networks",
+                            "part_number": pn or "Unknown",
+                            "serial": sn or "Unknown",
+                            "type": desc or "SFP",
+                            "tx_power_dbm": None,
+                            "rx_power_dbm": None,
+                            "temperature_c": None,
+                            "voltage_v": None,
+                        }
+            except Exception:
+                pass
+
+        # 2. Merge live DOM telemetry from `show interfaces diagnostics optics`
+        def _merge_dom(port: str, tx, rx, temp, volt):
+            # Match exact port or fallback to same FPC/PIC/slot if speed prefix differed
+            target_key = port
+            if target_key not in optics_by_port:
+                suffix = port.split("-", 1)[-1] if "-" in port else port
+                for k in optics_by_port:
+                    if k.endswith("-" + suffix):
+                        target_key = k
+                        break
+            if target_key in optics_by_port:
+                optics_by_port[target_key]["port"] = port
+                optics_by_port[target_key]["tx_power_dbm"] = tx
+                optics_by_port[target_key]["rx_power_dbm"] = rx
+                optics_by_port[target_key]["temperature_c"] = temp
+                optics_by_port[target_key]["voltage_v"] = volt
+            else:
+                optics_by_port[port] = {
+                    "port": port,
+                    "vendor": "Juniper Networks",
+                    "part_number": "SFP-DOM",
+                    "serial": "Unknown",
+                    "type": "SFP+",
+                    "tx_power_dbm": tx,
+                    "rx_power_dbm": rx,
+                    "temperature_c": temp,
+                    "voltage_v": volt,
+                }
+
         try:
             raw = conn.send_command("show interfaces diagnostics optics | display json")
             data = json.loads(raw)
@@ -630,41 +757,31 @@ class JuniperDriver(BaseDriver):
                 temp = _extract_val(diag, "module-temperature")
                 volt = _extract_val(diag, "module-voltage")
                 if p_name:
-                    optics.append(
-                        {
-                            "port": p_name,
-                            "vendor": "Juniper Networks",
-                            "part_number": "SFP-DOM",
-                            "serial": "Unknown",
-                            "type": "SFP+",
-                            "tx_power_dbm": float(tx) if tx and tx != "N/A" else None,
-                            "rx_power_dbm": float(rx) if rx and rx != "N/A" else None,
-                            "temperature_c": float(temp) if temp and temp != "N/A" else None,
-                            "voltage_v": float(volt) if volt and volt != "N/A" else None,
-                        }
+                    _merge_dom(
+                        p_name,
+                        float(tx) if tx and tx != "N/A" else None,
+                        float(rx) if rx and rx != "N/A" else None,
+                        float(temp) if temp and temp != "N/A" else None,
+                        float(volt) if volt and volt != "N/A" else None,
                     )
         except Exception:
             try:
                 raw_txt = conn.send_command("show interfaces diagnostics optics")
                 current_port = ""
-                cur_data = {}
+                cur_data: dict = {}
                 for line in raw_txt.splitlines():
                     m_p = re.match(r"^Physical interface:\s*([A-Za-z0-9/\._-]+)", line)
                     if m_p:
                         if current_port and cur_data:
-                            optics.append(cur_data)
+                            _merge_dom(
+                                current_port,
+                                cur_data.get("tx_power_dbm"),
+                                cur_data.get("rx_power_dbm"),
+                                cur_data.get("temperature_c"),
+                                cur_data.get("voltage_v"),
+                            )
                         current_port = m_p.group(1)
-                        cur_data = {
-                            "port": current_port,
-                            "vendor": "Juniper Networks",
-                            "part_number": "SFP-DOM",
-                            "serial": "Unknown",
-                            "type": "SFP+",
-                            "tx_power_dbm": None,
-                            "rx_power_dbm": None,
-                            "temperature_c": None,
-                            "voltage_v": None,
-                        }
+                        cur_data = {}
                     elif current_port:
                         m_tx = re.search(r"Laser output power\s*:\s*.*?/\s*([-\d\.]+)\s*dBm", line)
                         m_rx = re.search(r"Laser rx optical power\s*:\s*.*?/\s*([-\d\.]+)\s*dBm", line)
@@ -679,10 +796,16 @@ class JuniperDriver(BaseDriver):
                         if m_volt:
                             cur_data["voltage_v"] = float(m_volt.group(1))
                 if current_port and cur_data:
-                    optics.append(cur_data)
+                    _merge_dom(
+                        current_port,
+                        cur_data.get("tx_power_dbm"),
+                        cur_data.get("rx_power_dbm"),
+                        cur_data.get("temperature_c"),
+                        cur_data.get("voltage_v"),
+                    )
             except Exception:
                 pass
-        return optics
+        return list(optics_by_port.values())
 
     def get_running_config(self, conn) -> str:
         try:

@@ -144,6 +144,45 @@ class ArubaDriver(BaseDriver):
             pass
         return arp_entries
 
+    def get_optics(self, conn) -> list[dict]:
+        optics = []
+        try:
+            raw = conn.send_command("show interface transceiver")
+            cur_port = ""
+            cur_entry: dict = {}
+            for line in raw.splitlines():
+                m_p = re.match(r"^(?:Transceiver in|Interface)\s+([A-Za-z0-9/\._-]+)", line.strip(), re.IGNORECASE)
+                if m_p:
+                    if cur_port and cur_entry:
+                        optics.append(cur_entry)
+                    cur_port = m_p.group(1)
+                    cur_entry = {
+                        "port": cur_port,
+                        "vendor": "Aruba",
+                        "part_number": "Unknown",
+                        "serial": "Unknown",
+                        "type": "SFP",
+                        "tx_power_dbm": None,
+                        "rx_power_dbm": None,
+                        "temperature_c": None,
+                        "voltage_v": None,
+                    }
+                elif cur_entry:
+                    m_type = re.search(r"Type\s*:\s*(.+)", line, re.IGNORECASE)
+                    m_pn = re.search(r"Part\s*Number\s*:\s*(\S+)", line, re.IGNORECASE)
+                    m_sn = re.search(r"Serial\s*Number\s*:\s*(\S+)", line, re.IGNORECASE)
+                    if m_type:
+                        cur_entry["type"] = m_type.group(1).strip()
+                    if m_pn:
+                        cur_entry["part_number"] = m_pn.group(1).strip()
+                    if m_sn:
+                        cur_entry["serial"] = m_sn.group(1).strip()
+            if cur_port and cur_entry:
+                optics.append(cur_entry)
+        except Exception:
+            pass
+        return optics
+
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("show configuration")

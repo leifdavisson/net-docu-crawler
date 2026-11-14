@@ -122,11 +122,16 @@ class AristaDriver(BaseDriver):
                         }
                     )
 
+                counters = intf_data.get("interfaceCounters", {})
                 interfaces_detail[intf_name] = {
                     "ip_address": full_ip,
                     "status": status,
                     "mac_address": norm_mac,
                     "description": intf_data.get("description", ""),
+                    "input_errors": int(counters.get("inErrors", 0) or 0),
+                    "crc": int(counters.get("fcsErrors", 0) or 0),
+                    "output_errors": int(counters.get("outErrors", 0) or 0),
+                    "drops": int(counters.get("inDiscards", 0) or 0) + int(counters.get("outDiscards", 0) or 0),
                 }
         except Exception:
             pass

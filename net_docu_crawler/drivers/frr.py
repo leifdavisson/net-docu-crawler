@@ -117,7 +117,7 @@ class FRRDriver(BaseDriver):
         l3_interfaces = []
         interfaces_detail = {}
         try:
-            link_raw = conn.send_command("ip -j link show")
+            link_raw = conn.send_command("ip -s -j link show")
             link_data = json.loads(link_raw)
             for link in link_data:
                 ifname = link.get("ifname", "")
@@ -127,10 +127,17 @@ class FRRDriver(BaseDriver):
                 status = "up" if oper == "up" else "down"
                 raw_mac = link.get("address", "")
                 mac = oui_lookup.normalize_mac(raw_mac).lower() if raw_mac else ""
+                stats64 = link.get("stats64", {})
+                rx_stats = stats64.get("rx", {})
+                tx_stats = stats64.get("tx", {})
                 interfaces_detail[ifname] = {
                     "ip_address": "",
                     "status": status,
                     "mac_address": mac,
+                    "input_errors": int(rx_stats.get("errors", 0) or 0),
+                    "crc": int(rx_stats.get("crc_errors", 0) or 0),
+                    "output_errors": int(tx_stats.get("errors", 0) or 0),
+                    "drops": int(rx_stats.get("dropped", 0) or 0) + int(tx_stats.get("dropped", 0) or 0),
                 }
         except Exception:
             pass

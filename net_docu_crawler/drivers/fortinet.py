@@ -230,6 +230,43 @@ class FortinetDriver(BaseDriver):
             pass
         return arp_entries
 
+    def get_optics(self, conn) -> list[dict]:
+        optics = []
+        try:
+            raw = conn.send_command("get system interface transceiver")
+            cur_entry: dict = {}
+            for line in raw.splitlines():
+                m_if = re.match(r"^Interface\s+([A-Za-z0-9_.-]+)\s+-", line.strip(), re.IGNORECASE)
+                if m_if:
+                    if cur_entry:
+                        optics.append(cur_entry)
+                    cur_entry = {
+                        "port": m_if.group(1),
+                        "vendor": "Fortinet",
+                        "part_number": "Unknown",
+                        "serial": "Unknown",
+                        "type": "SFP",
+                        "tx_power_dbm": None,
+                        "rx_power_dbm": None,
+                        "temperature_c": None,
+                        "voltage_v": None,
+                    }
+                elif cur_entry:
+                    m_vn = re.search(r"Vendor Name\s*:\s*(.+)", line, re.IGNORECASE)
+                    m_pn = re.search(r"Part No\.\s*:\s*(\S+)", line, re.IGNORECASE)
+                    m_sn = re.search(r"Serial No\.\s*:\s*(\S+)", line, re.IGNORECASE)
+                    if m_vn:
+                        cur_entry["vendor"] = m_vn.group(1).strip()
+                    if m_pn:
+                        cur_entry["part_number"] = m_pn.group(1).strip()
+                    if m_sn:
+                        cur_entry["serial"] = m_sn.group(1).strip()
+            if cur_entry:
+                optics.append(cur_entry)
+        except Exception:
+            pass
+        return optics
+
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("show full-configuration")

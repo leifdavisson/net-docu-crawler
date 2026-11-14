@@ -327,3 +327,60 @@ def test_generate_l2_diagram_colliding_hostnames(tmp_path):
         txt = f.read()
     assert 'sw_0["Unknown<br/>(SwitchA)"]' in txt
     assert 'sw_1["Unknown<br/>(SwitchB)"]' in txt
+
+
+def test_blueprint_up_only_link_errors_and_optic_serials(tmp_path):
+    """Verify link errors filter to UP ports only and optics table includes Serial Number."""
+    devices = {
+        "10.0.0.1": {
+            "hostname": "SW-EDGE-01",
+            "ip": "10.0.0.1",
+            "status": "success",
+            "vendor": "Cisco",
+            "device_type": "switch",
+            "model": "WS-C3750G-12S",
+            "interfaces_detail": {
+                "GigabitEthernet1/0/1": {
+                    "status": "up",
+                    "speed": "100Mb/s",
+                    "duplex": "Full",
+                    "input_errors": 12,
+                    "crc": 3,
+                    "output_errors": 0,
+                },
+                "GigabitEthernet1/0/2": {
+                    "status": "down",
+                    "speed": "Auto",
+                    "duplex": "Auto",
+                    "input_errors": 99,
+                    "crc": 50,
+                    "output_errors": 0,
+                },
+            },
+            "optics": [
+                {
+                    "port": "Gi1/0/12",
+                    "part_number": "GLC-SX-MMD",
+                    "serial": "FNS18120999",
+                    "type": "1000BASE-SX SFP",
+                    "tx_power_dbm": -4.5,
+                    "rx_power_dbm": -5.2,
+                    "temperature_c": 34.2,
+                    "voltage_v": 3.3,
+                }
+            ],
+        }
+    }
+    live_path = str(tmp_path / "live_report.md")
+    bp_path = str(tmp_path / "Network_Analysis.md")
+    report_generator.generate_network_analysis_report(devices, output_path=live_path)
+    report_generator.generate_master_network_analysis_migration_blueprint(devices, output_path=bp_path)
+    with open(live_path, encoding="utf-8") as f:
+        live_txt = f.read()
+    with open(bp_path, encoding="utf-8") as f:
+        bp_txt = f.read()
+    assert "GigabitEthernet1/0/1" in live_txt
+    assert "Speed restricted to **100Mb/s**" in live_txt
+    assert "Input Errors: `12`, CRCs: `3`" in live_txt
+    assert "GigabitEthernet1/0/2" not in live_txt
+    assert "| **SW-EDGE-01** | `Gi1/0/12` | `GLC-SX-MMD` | `FNS18120999` |" in bp_txt

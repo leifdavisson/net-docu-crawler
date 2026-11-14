@@ -1560,3 +1560,62 @@ def test_juniper_junos9_text_fallbacks():
     assert data["arp_table"][0]["ip"] == "10.10.10.50"
     assert data["poe"]["used_power_watts"] == 15.4
     assert data["services"]["dns_servers"] == ["10.10.10.2"]
+
+
+def test_transceiver_serials_and_link_errors_across_drivers():
+    """Verify transceiver type/part/serial extraction and link error counters across drivers."""
+    from net_docu_crawler.drivers.aruba import ArubaDriver
+    from net_docu_crawler.drivers.cisco import CiscoDriver
+    from net_docu_crawler.drivers.fortinet import FortinetDriver
+    from net_docu_crawler.drivers.juniper import JuniperDriver
+    from net_docu_crawler.drivers.mikrotik import MikroTikDriver
+
+    # Cisco: show inventory + show interfaces transceiver
+    cisco_conn = MagicMock()
+    cisco_conn.send_command.side_effect = [
+        'NAME: "Gi1/0/12", DESCR: "1000BASE-SX SFP"\nPID: GLC-SX-MMD        , VID: V01  , SN: FNS18120999\n',
+        "Port   Temp   Voltage   Current   Optical Tx Power   Optical Rx Power\nGi1/0/12  34.2   3.30      5.1       -4.50              -5.20\n",
+    ]
+    c_opt = CiscoDriver("10.0.0.1", "u", "p").get_optics(cisco_conn)
+    assert len(c_opt) == 1
+    assert c_opt[0]["part_number"] == "GLC-SX-MMD"
+    assert c_opt[0]["serial"] == "FNS18120999"
+    assert c_opt[0]["rx_power_dbm"] == -5.20
+
+    # Juniper: show chassis hardware (Xcvr) + show interfaces diagnostics optics + show interfaces errors
+    j_conn = MagicMock()
+    j_conn.send_command.side_effect = [
+        "syntax error\n",
+        "ge-0/0/0 up up\n",
+        "Physical interface: ge-0/0/0, Enabled, Physical link is Up\n  Input errors: 4, Output errors: 1\n",
+        "syntax error\n",
+        "FPC 0\n  PIC 0\n    Xcvr 0       REV 01   740-021308   FNS99887766       SFP+-10G-SR\n",
+        "syntax error\n",
+        "Physical interface: xe-0/0/0\n  Laser output power : 0.300 mW / -5.20 dBm\n  Laser rx optical power : 0.250 mW / -6.00 dBm\n",
+    ]
+    j_drv = JuniperDriver("10.0.0.2", "u", "p")
+    _, j_detail = j_drv.get_interfaces(j_conn)
+    assert j_detail["ge-0/0/0"]["input_errors"] == 4
+    assert j_detail["ge-0/0/0"]["output_errors"] == 1
+    j_opt = j_drv.get_optics(j_conn)
+    assert len(j_opt) == 1
+    assert j_opt[0]["part_number"] == "740-021308"
+    assert j_opt[0]["serial"] == "FNS99887766"
+    assert j_opt[0]["rx_power_dbm"] == -6.00
+
+    # Fortinet, MikroTik, Aruba optics
+    f_conn = MagicMock()
+    f_conn.send_command.return_value = (
+        "Interface port15 - SFP/SFP+\n  Vendor Name : FINISAR\n  Part No. : FTLX8574D3BCL\n  Serial No. : FNS112233\n"
+    )
+    assert FortinetDriver("10.0.0.3", "u", "p").get_optics(f_conn)[0]["serial"] == "FNS112233"
+
+    m_conn = MagicMock()
+    m_conn.send_command.return_value = "name: sfp-sfpplus1\n  sfp-vendor-name: MikroTik\n  sfp-vendor-part-number: S+85DLC03D\n  sfp-vendor-serial: MT123456\n  sfp-rx-power: -3.4\n"
+    assert MikroTikDriver("10.0.0.4", "u", "p").get_optics(m_conn)[0]["serial"] == "MT123456"
+
+    a_conn = MagicMock()
+    a_conn.send_command.return_value = (
+        "Transceiver in 1/1/49\n  Type : SFP+SR\n  Part Number : J9150D\n  Serial Number : AR998877\n"
+    )
+    assert ArubaDriver("10.0.0.5", "u", "p").get_optics(a_conn)[0]["serial"] == "AR998877"
