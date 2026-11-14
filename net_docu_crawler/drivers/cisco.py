@@ -20,8 +20,6 @@ Official Documentation: https://www.cisco.com/c/en/us/support/ios-nx-os-software
 
 import re
 
-from netmiko import ConnectHandler
-
 import oui_lookup
 import parser
 from net_docu_crawler.drivers.base import BaseDriver
@@ -46,7 +44,7 @@ class CiscoDriver(BaseDriver):
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        conn = ConnectHandler(**device)
+        conn = self.connect_netmiko(device)
         if self.secret:
             try:
                 conn.enable()

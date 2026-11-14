@@ -25,6 +25,7 @@ from net_docu_crawler.drivers import (
     CiscoDriver,
     FortinetDriver,
     FRRDriver,
+    HPProCurveDriver,
     JuniperDriver,
     MikroTikDriver,
     OpenWrtDriver,
@@ -528,6 +529,135 @@ def test_arista_driver_poe_mac_optics():
     assert optics[0]["rx_power_dbm"] == -3.4
 
 
+def test_hpprocurve_driver_parsing():
+    driver = HPProCurveDriver(ip="192.168.1.220")
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = lambda cmd: {
+        "show system": """
+ Status and Counters - General System Information
+
+  System Name        : SW-2920-24G
+  Software revision  : WB.16.10.0025        Base MAC Addr      : 3863bb-57ca40
+  ROM Version        : WB.16.03             Serial Number      : SG51FLXB59
+""",
+        "show modules": """
+ Status and Counters - Module Information
+
+  Chassis: 2920-24G-PoE+  J9727A         Serial Number:   SG51FLXB59
+""",
+        "show ip": """
+Internet (IP) Service
+
+                       |                                            Proxy ARP
+  VLAN                 | IP Config  IP Address      Subnet Mask     Std  Local
+  -------------------- + ---------- --------------- --------------- ----------
+  DEFAULT_VLAN         | Manual     192.168.1.220   255.255.255.0    No    No
+""",
+        "show interfaces brief": """
+ Status and Counters - Port Status
+
+                          | Intrusion                           MDI  Flow Bcast
+  Port         Type       | Alert     Enabled Status Mode       Mode Ctrl Limit
+  ------------ ---------- + --------- ------- ------ ---------- ---- ---- -----
+  1            100/1000T  | No        Yes     Down   1000FDx    Auto off  0
+  23           100/1000T  | No        Yes     Up     1000FDx    MDI  off  0
+""",
+        "show lldp info remote-device": """
+ LLDP Remote Devices Information
+
+  LocalPort | ChassisId          PortId             PortDescr SysName
+  --------- + ------------------ ------------------ --------- ------------------
+  23        | fc 33 42 e6 b5 99  522                ge-0/0/8  desktop-switch....
+  23        | MikroTik           ether1                       MikroTik
+""",
+        "show ip route": """
+IP Route Entries
+
+  Destination        Gateway         VLAN Type      Sub-Type   Metric     Dist.
+  ------------------ --------------- ---- --------- ---------- ---------- -----
+  0.0.0.0/0          192.168.1.1     1    static               1          1
+  192.168.1.0/24     DEFAULT_VLAN    1    connected            1          0
+""",
+        "show arp": """
+ IP ARP table
+
+  IP Address       MAC Address       Type    Port
+  ---------------  ----------------- ------- ----
+  192.168.1.1      bc2411-b4a982     dynamic 23
+""",
+        "show mac-address": """
+Status and Counters - Port Address Table
+
+  MAC Address   Port  VLAN
+  ------------- ----- ----
+  345a60-6191c7 23    1
+""",
+        "show spanning-tree": """
+Multiple Spanning Tree (MST) Information
+
+  STP Enabled   : No
+""",
+    }.get(cmd, "")
+
+    ver = driver.get_version(mock_conn)
+    assert ver["hostname"] == "SW-2920-24G"
+    assert ver["model"] == "HP 2920-24G-PoE+"
+    assert ver["serial"] == "SG51FLXB59"
+    assert ver["firmware"] == "WB.16.10.0025"
+    assert ver["mac_address"] == "38:63:bb:57:ca:40"
+
+    l3, details = driver.get_interfaces(mock_conn)
+    assert len(l3) == 1
+    assert l3[0]["ip_address"] == "192.168.1.220/24"
+    assert "23" in details
+    assert details["23"]["status"] == "up"
+    assert details["23"]["speed"] == "1Gb/s"
+
+    neighbors = driver.get_neighbors(mock_conn)
+    assert len(neighbors) == 2
+    assert neighbors[0]["local_port"] == "23"
+    assert neighbors[0]["remote_port"] == "ge-0/0/8"
+
+    routes = driver.get_routing_table(mock_conn)
+    assert len(routes) == 2
+    assert routes[0]["subnet"] == "0.0.0.0/0"
+    assert routes[0]["next_hop"] == "192.168.1.1"
+
+    arp = driver.get_arp_table(mock_conn)
+    assert len(arp) == 1
+    assert arp[0]["ip"] == "192.168.1.1"
+    assert arp[0]["mac"] == "bc:24:11:b4:a9:82"
+
+    macs = driver.get_mac_table(mock_conn)
+    assert len(macs) == 1
+    assert macs[0]["mac"] == "34:5a:60:61:91:c7"
+
+    stp = driver.get_stp(mock_conn)
+    assert stp["enabled"] is False
+
+
+def test_safe_netmiko_connect_fallback():
+    mock_connect = MagicMock()
+    # First call raises IncompatiblePeer / algorithm mismatch, second succeeds
+    mock_connect.side_effect = [
+        Exception("Incompatible ssh peer (no acceptable kex algorithm)"),
+        MagicMock(base_prompt="SW#"),
+    ]
+
+    with patch("netmiko.ConnectHandler", mock_connect):
+        from net_docu_crawler.drivers.base import BaseDriver
+
+        dev_params = {"device_type": "hp_procurve", "ip": "10.0.0.1"}
+        conn = BaseDriver.safe_netmiko_connect(dev_params)
+        assert conn.base_prompt == "SW#"
+        assert mock_connect.call_count == 2
+        # Verify fallback params were passed
+        fallback_call_args = mock_connect.call_args[1]
+        assert fallback_call_args["disabled_algorithms"] == {}
+        assert fallback_call_args["disable_sha2_fix"] is False
+        assert fallback_call_args["ssh_strict"] is False
+
+
 def test_all_10_drivers_session_log_and_interface():
     drivers = [
         CiscoDriver(ip="10.0.0.1", session_log="/tmp/test.log"),
@@ -540,8 +670,9 @@ def test_all_10_drivers_session_log_and_interface():
         OpenWrtDriver(ip="10.0.0.8", session_log="/tmp/test.log"),
         OPNsenseDriver(ip="10.0.0.9", session_log="/tmp/test.log"),
         FRRDriver(ip="10.0.0.10", session_log="/tmp/test.log"),
+        HPProCurveDriver(ip="10.0.0.11", session_log="/tmp/test.log"),
     ]
-    assert len(drivers) == 10
+    assert len(drivers) == 11
     for d in drivers:
         assert d.session_log == "/tmp/test.log"
         assert callable(d.connect)
@@ -549,3 +680,436 @@ def test_all_10_drivers_session_log_and_interface():
         assert callable(d.get_optics)
         assert callable(d.get_poe)
         assert callable(d.get_mac_table)
+
+
+def test_probe_tcp_port_and_scan_subnet_ports():
+    from net_docu_crawler.drivers.detector import probe_tcp_port, scan_subnet_ports
+
+    def fake_socket(*_args, **_kwargs):
+        sock = MagicMock()
+        sock.connect_ex.side_effect = lambda addr: 0 if addr in {("10.0.0.1", 2222), ("10.0.0.2", 23)} else 111
+        return sock
+
+    with patch("net_docu_crawler.drivers.detector.socket.socket", side_effect=fake_socket):
+        assert probe_tcp_port("10.0.0.1", 2222) is True
+        assert probe_tcp_port("10.0.0.1", 22) is False
+        res = scan_subnet_ports(
+            ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+            ssh_ports=[22, 2222],
+            telnet_ports=[23],
+            max_workers=4,
+        )
+        assert res["10.0.0.1"] == [(2222, "ssh")]
+        assert res["10.0.0.2"] == [(23, "telnet")]
+        assert "10.0.0.3" not in res
+
+
+def test_get_telnet_banner_strips_iac_and_detects_vendor():
+    from net_docu_crawler.drivers.detector import detect_vendor_range, get_telnet_banner
+
+    mock_sock = MagicMock()
+    mock_sock.recv.side_effect = [
+        b"\xff\xfd\x18\xff\xfd\x1f",
+        b"ProCurve Switch 2920-24G\r\nUsername: ",
+    ]
+
+    with patch("net_docu_crawler.drivers.detector.socket.socket", return_value=mock_sock):
+        banner = get_telnet_banner("10.0.0.50", port=23, timeout=1.0)
+        assert "ProCurve" in banner
+        assert "\xff" not in banner
+
+    with (
+        patch("net_docu_crawler.drivers.detector.get_telnet_banner", return_value="ProCurve Switch 2920-24G"),
+        patch("net_docu_crawler.drivers.detector.get_mac_from_system_arp", return_value=""),
+    ):
+        vendor, b = detect_vendor_range("10.0.0.50", port=23, transport="telnet")
+        assert vendor == "hpprocurve"
+        assert "ProCurve" in b
+
+
+def test_base_driver_connect_netmiko_custom_port_and_telnet():
+    mock_connect = MagicMock(return_value=MagicMock(base_prompt="SW#"))
+    with patch("netmiko.ConnectHandler", mock_connect):
+        drv_ssh = HPProCurveDriver(ip="10.0.0.1", username="admin", password="pw", port=2222, transport="ssh")
+        drv_ssh.connect_netmiko({"device_type": "hp_procurve", "ip": "10.0.0.1"})
+        assert mock_connect.call_args[1]["port"] == 2222
+        assert mock_connect.call_args[1]["device_type"] == "hp_procurve"
+
+        drv_telnet = HPProCurveDriver(ip="10.0.0.1", username="admin", password="pw", port=2323, transport="telnet")
+        drv_telnet.connect_netmiko({"device_type": "hp_procurve", "ip": "10.0.0.1"})
+        assert mock_connect.call_args[1]["port"] == 2323
+        assert mock_connect.call_args[1]["device_type"] == "hp_procurve_telnet"
+
+        # Fallback to generic_telnet when *_telnet is not in Netmiko CLASS_MAPPER
+        drv_gen = MikroTikDriver(ip="10.0.0.2", username="admin", password="pw", port=23, transport="telnet")
+        drv_gen.connect_netmiko({"device_type": "mikrotik_routeros", "ip": "10.0.0.2"})
+        assert mock_connect.call_args[1]["port"] == 23
+        assert mock_connect.call_args[1]["device_type"] == "generic_telnet"
+
+
+def test_crawler_parse_target_specs_and_partial_inventory():
+    from net_docu_crawler.crawler import (
+        build_partial_device_record,
+        crawl_target_with_ports,
+        parse_target_specs,
+    )
+
+    ips, explicit = parse_target_specs(["192.168.1.10:2222", "192.168.1.20:23", "192.168.1.30"])
+    assert ips == ["192.168.1.10", "192.168.1.20", "192.168.1.30"]
+    assert explicit["192.168.1.10"] == [(2222, "ssh")]
+    assert explicit["192.168.1.20"] == [(23, "telnet")]
+    assert "192.168.1.30" not in explicit
+
+    partial = build_partial_device_record(
+        ip="192.168.1.99",
+        mac="38:63:bb:57:ca:40",
+        vendor="unknown",
+        banner="Synology DSM SSH",
+        port=2222,
+        transport="ssh",
+        status="unsupported",
+    )
+    assert partial["status"] == "unsupported"
+    assert partial["mgmt_method"] == "SSH:2222"
+    assert partial["model"] == "Synology DSM SSH"
+
+    with (
+        patch("net_docu_crawler.crawler.detect_vendor_range", return_value=("cisco", "SSH-2.0-Cisco-1.25")),
+        patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value="aa:bb:cc:dd:ee:ff"),
+        patch.object(CiscoDriver, "connect", side_effect=Exception("Authentication failed")),
+    ):
+        rec = crawl_target_with_ports(
+            "192.168.1.55",
+            credentials=[{"username": "admin", "password": "wrong"}],
+            open_ports=[(22, "ssh")],
+        )
+        assert rec is not None
+        assert rec["status"] == "unauthenticated"
+        assert rec["vendor"] == "cisco"
+        assert rec["mgmt_method"] == "SSH"
+
+
+def test_multi_credential_defaults_then_actual():
+    import json
+    from pathlib import Path
+
+    from net_docu_crawler.crawler import crawl_target_with_ports
+
+    example_path = Path(__file__).resolve().parent.parent / "credentials.example.json"
+    default_creds = json.loads(example_path.read_text(encoding="utf-8"))
+
+    # Verify example file includes multiple defaults for common vendors (including empty-password defaults)
+    vendors_in_example = {c["vendor"] for c in default_creds}
+    assert {"cisco", "hpprocurve", "juniper", "fortinet", "mikrotik", "opnsense"}.issubset(vendors_in_example)
+    assert sum(1 for c in default_creds if c["vendor"] == "hpprocurve") >= 2
+    assert sum(1 for c in default_creds if c["vendor"] == "cisco") >= 2
+    assert any(c["password"] == "" for c in default_creds)
+
+    actual_creds = [
+        {"name": "Actual-Cisco", "vendor": "cisco", "username": "netadmin", "password": "real-cisco-pw", "secret": "real"},
+        {"name": "Actual-HP", "vendor": "hpprocurve", "username": "admin", "password": "real-hp-pw"},
+        {"name": "Actual-Juniper", "vendor": "juniper", "username": "root", "password": "real-junos-pw"},
+        {"name": "Actual-FortiGate", "vendor": "fortinet", "username": "admin", "password": "real-forti-pw"},
+        {"name": "Actual-MikroTik", "vendor": "mikrotik", "username": "admin", "password": "real-mt-pw"},
+        {"name": "Actual-OPNsense", "vendor": "opnsense", "username": "root", "password": "real-opn-pw"},
+    ]
+    combined_creds = default_creds + actual_creds
+
+    cases = [
+        ("cisco", CiscoDriver, "10.0.1.10", ("netadmin", "real-cisco-pw")),
+        ("hpprocurve", HPProCurveDriver, "10.0.1.11", ("admin", "real-hp-pw")),
+        ("juniper", JuniperDriver, "10.0.1.12", ("root", "real-junos-pw")),
+        ("fortinet", FortinetDriver, "10.0.1.13", ("admin", "real-forti-pw")),
+        ("mikrotik", MikroTikDriver, "10.0.1.14", ("admin", "real-mt-pw")),
+        ("opnsense", OPNsenseDriver, "10.0.1.15", ("root", "real-opn-pw")),
+    ]
+
+    for vendor_key, driver_cls, ip, expected_pair in cases:
+        attempts: list[tuple[str, str]] = []
+
+        def make_connect(expected=expected_pair, log_attempts=attempts):
+            def _connect(self):
+                log_attempts.append((self.username, self.password))
+                if (self.username, self.password) == expected:
+                    return MagicMock()
+                raise Exception("Authentication failed.")
+
+            return _connect
+
+        expected_data = {
+            "ip": ip,
+            "status": "success",
+            "mgmt_method": "SSH",
+            "vendor": vendor_key,
+            "hostname": f"host-{vendor_key}",
+        }
+
+        with (
+            patch("net_docu_crawler.crawler.detect_vendor_range", return_value=(vendor_key, "")),
+            patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value=""),
+            patch.object(driver_cls, "connect", make_connect()),
+            patch.object(driver_cls, "crawl", return_value=expected_data),
+        ):
+            result = crawl_target_with_ports(ip, combined_creds, open_ports=[(22, "ssh")])
+            assert result is not None
+            assert result["status"] == "success"
+            assert result["hostname"] == f"host-{vendor_key}"
+            # Must have tried multiple defaults before succeeding on the actual (last) credential
+            assert len(attempts) >= 2
+            assert attempts[-1] == expected_pair
+
+
+def test_detect_local_subnets_and_default_ssh_2222():
+    from net_docu_crawler.crawler import detect_local_subnets
+    from net_docu_crawler.drivers.detector import scan_host_ports
+
+    fake_ip_out = (
+        "2: enp8s0    inet 192.168.50.10/24 brd 192.168.50.255 scope global enp8s0\n"
+        "4: docker0   inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"
+        "5: virbr0    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0\n"
+    )
+    mock_proc = MagicMock(returncode=0, stdout=fake_ip_out)
+    with patch("net_docu_crawler.crawler.subprocess.run", return_value=mock_proc):
+        assert detect_local_subnets() == ["192.168.50.0/24"]
+
+    # Default scan_host_ports checks [22, 2222] for SSH and [23] for Telnet
+    probed = []
+
+    def fake_probe(ip, port, timeout=0.8):
+        probed.append((ip, port))
+        return port == 2222
+
+    with patch("net_docu_crawler.drivers.detector.probe_tcp_port", side_effect=fake_probe):
+        res = scan_host_ports("10.0.0.5")
+        assert (10, 0) != res
+        assert ("10.0.0.5", 22) in probed
+        assert ("10.0.0.5", 2222) in probed
+        assert ("10.0.0.5", 23) in probed
+        assert res == [(2222, "ssh")]
+
+
+def test_arp_inventory_http_fingerprint_and_snmp_probe():
+    from net_docu_crawler.crawler import build_partial_device_record
+    from net_docu_crawler.drivers.detector import _ber_tlv, probe_http_fingerprint, probe_snmp_sysinfo
+
+    arp_rec = build_partial_device_record(
+        ip="192.168.1.77",
+        mac="38:63:bb:57:ca:40",
+        port=0,
+        transport="arp",
+        status="discovered",
+    )
+    assert arp_rec["mgmt_method"] == "ARP/OUI"
+    assert arp_rec["status"] == "discovered"
+
+    # HTTP fingerprint
+    mock_sock = MagicMock()
+    mock_sock.recv.side_effect = [
+        b"HTTP/1.1 200 OK\r\nServer: nginx/1.24\r\n\r\n<html><title>Synology DiskStation</title></html>",
+        b"",
+    ]
+    with (
+        patch("net_docu_crawler.drivers.detector.probe_tcp_port", side_effect=lambda ip, p, timeout=0.7: p == 80),
+        patch("net_docu_crawler.drivers.detector.socket.socket", return_value=mock_sock),
+    ):
+        fp = probe_http_fingerprint("192.168.1.77")
+        assert fp is not None
+        assert fp["port"] == 80
+        assert fp["scheme"] == "http"
+        assert fp["server"] == "nginx/1.24"
+        assert fp["title"] == "Synology DiskStation"
+
+    # SNMPv2c sysDescr / sysName
+    fake_snmp_resp = _ber_tlv(
+        0x30,
+        _ber_tlv(0x02, b"\x01")
+        + _ber_tlv(0x04, b"public")
+        + _ber_tlv(
+            0xA2,
+            _ber_tlv(0x04, b"HP J9727A 2920-24G-PoE+ Switch") + _ber_tlv(0x04, b"SW-2920-24G"),
+        ),
+    )
+    mock_udp = MagicMock()
+    mock_udp.recvfrom.return_value = (fake_snmp_resp, ("192.168.1.220", 161))
+    with patch("net_docu_crawler.drivers.detector.socket.socket", return_value=mock_udp):
+        info = probe_snmp_sysinfo("192.168.1.220", community="public")
+        assert info == {"sysDescr": "HP J9727A 2920-24G-PoE+ Switch", "sysName": "SW-2920-24G"}
+
+
+def test_extract_followable_subnets_wan_boundary_and_overrides():
+    from net_docu_crawler.crawler import extract_followable_subnets
+
+    devices = [
+        {
+            "ip": "192.168.1.1",
+            "l3_interfaces": [
+                {"interface": "igc0", "ip_address": "100.64.224.70/19"},  # CGNAT WAN
+                {"interface": "igc1", "ip_address": "192.168.1.1/24"},
+                {"interface": "igc2", "ip_address": "192.168.10.1/24"},
+                {"interface": "igc3", "ip_address": "8.8.8.1/24"},  # Public IP
+            ],
+            "routes": [
+                {"subnet": "0.0.0.0/0", "next_hop": "100.64.224.1"},
+                {"subnet": "172.16.1.0/24", "next_hop": "192.168.1.254"},
+                {"subnet": "10.0.0.0/8", "next_hop": "192.168.1.254"},  # Too broad (/8)
+            ],
+        }
+    ]
+
+    # Default: strictly RFC 1918 and /22../30
+    default_subnets = extract_followable_subnets(devices)
+    assert set(default_subnets) == {"192.168.1.0/24", "192.168.10.0/24", "172.16.1.0/24"}
+
+    # CGNAT override (min_prefix=19 to allow /19 CGNAT)
+    cgnat_subnets = extract_followable_subnets(devices, allow_cgnat=True, min_prefix=19)
+    assert "100.64.224.0/19" in cgnat_subnets
+    assert "8.8.8.0/24" not in cgnat_subnets
+
+    # Public ISP override
+    public_subnets = extract_followable_subnets(devices, allow_public=True, min_prefix=19)
+    assert "8.8.8.0/24" in public_subnets
+    assert "100.64.224.0/19" in public_subnets
+
+
+def test_migration_parsers_port_profiles_routing_fhrp_and_dhcp():
+    from net_docu_crawler.migration_parsers import (
+        extract_dhcp_config,
+        extract_firewall_nat_vpn,
+        extract_port_profiles,
+        extract_routing_peers_and_fhrp_from_config,
+    )
+
+    cisco_cfg = """
+interface GigabitEthernet0/1
+ switchport mode access
+ switchport access vlan 10
+ switchport voice vlan 20
+ spanning-tree bpduguard enable
+ authentication port-control auto
+ channel-group 1 mode active
+!
+interface GigabitEthernet0/24
+ switchport mode trunk
+ switchport trunk native vlan 99
+ switchport trunk allowed vlan 10,20,99
+!
+interface Vlan10
+ ip address 192.168.10.2 255.255.255.0
+ standby 10 ip 192.168.10.1
+ standby 10 priority 110
+ ip helper-address 192.168.1.5
+!
+router bgp 65001
+ neighbor 10.0.0.2 remote-as 65002
+!
+router ospf 1
+ network 192.168.10.0 0.0.0.255 area 0
+!
+ip dhcp pool CORP_DATA
+ network 192.168.10.0 255.255.255.0
+ default-router 192.168.10.1
+ dns-server 192.168.1.5
+!
+"""
+    profiles = extract_port_profiles(
+        cisco_cfg,
+        vendor="Cisco",
+        poe={"ports": {"GigabitEthernet0/1": {"power_watts": 12.4}}},
+    )
+    assert profiles["GigabitEthernet0/1"]["mode"] == "access"
+    assert profiles["GigabitEthernet0/1"]["access_vlan"] == "10"
+    assert profiles["GigabitEthernet0/1"]["voice_vlan"] == "20"
+    assert profiles["GigabitEthernet0/1"]["bpdu_guard"] is True
+    assert profiles["GigabitEthernet0/1"]["dot1x_mab"] is True
+    assert profiles["GigabitEthernet0/1"]["lag_group"] == "Po1"
+    assert profiles["GigabitEthernet0/1"]["poe_watts"] == 12.4
+    assert profiles["GigabitEthernet0/24"]["mode"] == "trunk"
+    assert profiles["GigabitEthernet0/24"]["trunk_allowed_vlans"] == "10,20,99"
+
+    peers, fhrp = extract_routing_peers_and_fhrp_from_config(cisco_cfg, vendor="Cisco")
+    assert any(p["protocol"] == "bgp" and p["remote_as"] == "65002" for p in peers)
+    assert any(p["protocol"] == "ospf" and p["area"] == "0" for p in peers)
+    assert any(f["protocol"] == "hsrp" and f["vip"] == "192.168.10.1" and f["priority"] == 110 for f in fhrp)
+
+    dhcp = extract_dhcp_config(cisco_cfg, vendor="Cisco")
+    assert any(p["name"] == "CORP_DATA" and p["gateway"] == "192.168.10.1" for p in dhcp["pools"])
+    assert any(r["interface"] == "Vlan10" and r["helper_ip"] == "192.168.1.5" for r in dhcp["relays"])
+
+    opn_xml = """<opnsense>
+      <dhcpd><lan><range><from>192.168.1.100</from><to>192.168.1.200</to></range>
+      <staticmap><mac>aa:bb:cc:dd:ee:ff</mac><ipaddr>192.168.1.50</ipaddr><hostname>nas</hostname></staticmap>
+      </lan></dhcpd>
+      <virtualip><vip><mode>carp</mode><vhid>1</vhid><interface>lan</interface><subnet>192.168.1.1</subnet><advskew>0</advskew></vip></virtualip>
+      <filter><rule><type>pass</type><interface>lan</interface><protocol>tcp</protocol><source><network>lan</network></source><destination><network>any</network><port>443</port></destination><descr>Allow HTTPS</descr></rule></filter>
+    </opnsense>"""
+    opn_dhcp = extract_dhcp_config(opn_xml, vendor="OPNsense")
+    assert opn_dhcp["pools"][0]["range"] == "192.168.1.100-192.168.1.200"
+    assert opn_dhcp["reservations"][0]["hostname"] == "nas"
+    _, opn_fhrp = extract_routing_peers_and_fhrp_from_config(opn_xml, vendor="OPNsense")
+    assert opn_fhrp[0]["protocol"] == "carp"
+    sec = extract_firewall_nat_vpn(opn_xml, vendor="OPNsense")
+    assert sec["firewall_rules"][0]["dst_port"] == "443"
+
+
+def test_hpprocurve_poe_and_optics():
+    driver = HPProCurveDriver(ip="192.168.1.220")
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = [
+        "Total Available Power : 370 W\nTotal Power Drawn : 45.2 W\n 1 | Yes High 4 15.2 W\n",
+        " 23   SFP-SX   J4858C   Present\n 24   SFP+SR   J9150A   Present\n",
+    ]
+    poe = driver.get_poe(mock_conn)
+    assert poe["total_power_watts"] == 370.0
+    assert poe["used_power_watts"] == 45.2
+    assert poe["ports"]["1"]["power_watts"] == 15.2
+
+    optics = driver.get_optics(mock_conn)
+    assert len(optics) == 2
+    assert optics[0]["type"] == "SFP-SX"
+    assert optics[1]["part_number"] == "J9150A"
+
+
+def test_ciscosmb_driver_parsing_and_detection():
+    from net_docu_crawler.drivers import CiscoSMBDriver, get_driver
+    from net_docu_crawler.drivers.detector import detect_vendor_range
+
+    with (
+        patch("net_docu_crawler.drivers.detector.get_ssh_banner", return_value="SSH-2.0-Cisco-SG300-28P"),
+        patch("net_docu_crawler.drivers.detector.get_mac_from_system_arp", return_value=""),
+    ):
+        vendor, _ = detect_vendor_range("10.0.2.10")
+        assert vendor == "ciscosmb"
+
+    drv = get_driver("10.0.2.10", vendor_hint="ciscosmb")
+    assert isinstance(drv, CiscoSMBDriver)
+
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = [
+        "System Description: SG300-28P 28-Port Gigabit PoE Managed Switch\nSystem Name: SW-SMB-01\nSystem MAC Address: 00:11:22:33:44:55\n",
+        "Unit Model: SG300-28P\nSerial Number: DNI18120ABC\n",
+        "SW version: 1.4.11.5\n",
+        "192.168.1.210/24  vlan 1  Static\n",
+        "gi1   1G-Copper   Full  1000  Enabled  Off  Up   Disabled On\ngi2   1G-Copper   --    --    Enabled  Off  Down Disabled Off\n",
+        "gi28  aa:bb:cc:dd:ee:ff  ge-0/0/1  CORE-SW  B,R  120\n",
+        "C   192.168.1.0/24 is directly connected, vlan 1\nS   0.0.0.0/0 [1/0] via 192.168.1.1, vlan 1\n",
+        "vlan 1   gi1   192.168.1.1   00:90:0b:11:22:33   Dynamic\n",
+        "Spanning tree enabled mode RSTP\nThis bridge is the root\n",
+        "Available (W): 180.0\nConsumed (W): 15.4\ngi1  Enabled  High  15.4  Class3\n",
+        "1  aa:bb:cc:dd:ee:01  gi1  dynamic\n",
+        "gi27  OK  SFP\n",
+        "hostname SW-SMB-01\ninterface gi1\n switchport mode access\n switchport access vlan 10\n",
+    ]
+    data = drv.crawl(mock_conn)
+    assert data["hostname"] == "SW-SMB-01"
+    assert data["model"] == "SG300-28P"
+    assert data["serial"] == "DNI18120ABC"
+    assert data["firmware"] == "1.4.11.5"
+    assert data["mac_address"] == "00:11:22:33:44:55"
+    assert data["l3_interfaces"][0]["ip_address"] == "192.168.1.210/24"
+    assert data["interfaces_detail"]["gi1"]["speed"] == "1Gb/s"
+    assert data["neighbors"][0]["remote_device"] == "CORE-SW"
+    assert data["stp"]["enabled"] is True
+    assert data["stp"]["is_root"] is True
+    assert data["poe"]["used_power_watts"] == 15.4
+    assert data["optics"][0]["port"] == "gi27"
+    assert data["port_profiles"]["gi1"]["access_vlan"] == "10"

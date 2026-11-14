@@ -20,8 +20,6 @@ Official Documentation: https://www.arubanetworks.com/techdocs/ArubaDocPortal/co
 
 import re
 
-from netmiko import ConnectHandler
-
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
 
@@ -44,7 +42,7 @@ class ArubaDriver(BaseDriver):
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        conn = ConnectHandler(**device)
+        conn = self.connect_netmiko(device)
         return conn
 
     def get_version(self, conn) -> dict:

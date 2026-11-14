@@ -191,7 +191,7 @@ def get_unique_devices(devices):
         devices.keys(),
         key=lambda ip: (
             devices[ip].get("status") == "success",
-            devices[ip].get("mgmt_method") == "SSH",
+            str(devices[ip].get("mgmt_method", "")).startswith("SSH"),
             ip_sort_key_internal(ip),
         ),
         reverse=True,
@@ -310,6 +310,16 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
                     or "router" in hostname_lower
                 ):
                     dev_type = "Router"
+
+                status = dev.get("status", "success")
+                if status in ("unauthenticated", "unsupported", "discovered"):
+                    role = (
+                        "Unauthenticated"
+                        if status == "unauthenticated"
+                        else ("Unsupported" if status == "unsupported" else "ARP Discovered")
+                    )
+                    if not custom_dev_type or custom_dev_type == "unknown":
+                        dev_type = "Unknown"
 
                 writer.writerow(
                     {
@@ -1219,6 +1229,93 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             "  * No primary visibility or security gaps found. Central AAA, NTP synchronization, and secure SSH management are properly configured."
         )
 
+    # 5. Migration Intent, Routing Peers/FHRP, DHCP, & Hardware Sizing
+    lines.append("\n## 5. Migration Intent, Control-Plane, & Hardware Sizing")
+
+    # 5a. PoE & Optics BOM Summary
+    lines.append("\n### PoE Power Budget & Optical Transceiver Summary")
+    lines.append("| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+    for ip, dev in devices.items():
+        hostname = dev.get("hostname") or ip
+        poe = dev.get("poe", {}) or {}
+        tot_w = float(poe.get("total_power_watts", 0.0) or 0.0)
+        used_w = float(poe.get("used_power_watts", 0.0) or 0.0)
+        poe_ports = len(poe.get("ports", {}) or {})
+        optics_cnt = len(dev.get("optics", []) or [])
+        if tot_w > 0 or used_w > 0 or poe_ports > 0 or optics_cnt > 0:
+            lines.append(f"| {hostname} | {ip} | {tot_w:.1f} | {used_w:.1f} | {poe_ports} | {optics_cnt} |")
+
+    # 5b. Dynamic Routing Peers & FHRP
+    peer_rows = []
+    fhrp_rows = []
+    for ip, dev in devices.items():
+        hostname = dev.get("hostname") or ip
+        for p in dev.get("routing_peers", []) or []:
+            peer_rows.append(
+                f"| {hostname} | {p.get('protocol', '').upper()} | {p.get('neighbor_ip', '')} | "
+                f"{p.get('remote_as') or p.get('area') or '-'} | {p.get('state', '')} |"
+            )
+        for f_item in dev.get("fhrp", []) or []:
+            fhrp_rows.append(
+                f"| {hostname} | {f_item.get('protocol', '').upper()} | {f_item.get('group', '')} | "
+                f"{f_item.get('interface', '')} | {f_item.get('vip', '')} | {f_item.get('priority', '')} |"
+            )
+    if peer_rows:
+        lines.append("\n### Dynamic Routing Peers (BGP / OSPF)")
+        lines.append("| Device | Protocol | Neighbor / Network | AS / Area | State |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        lines.extend(peer_rows)
+    if fhrp_rows:
+        lines.append("\n### First-Hop Redundancy (HSRP / VRRP / CARP)")
+        lines.append("| Device | Protocol | Group | Interface | VIP | Priority |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        lines.extend(fhrp_rows)
+
+    # 5c. DHCP Scopes, Reservations & Relays
+    dhcp_pool_rows = []
+    dhcp_res_count = 0
+    dhcp_relay_rows = []
+    for ip, dev in devices.items():
+        hostname = dev.get("hostname") or ip
+        dhcp = dev.get("dhcp", {}) or {}
+        for pool in dhcp.get("pools", []) or []:
+            dhcp_pool_rows.append(
+                f"| {hostname} | {pool.get('name', '')} | {pool.get('network') or pool.get('range', '')} | "
+                f"{pool.get('gateway', '')} | {pool.get('dns', '')} |"
+            )
+        dhcp_res_count += len(dhcp.get("reservations", []) or [])
+        for rel in dhcp.get("relays", []) or []:
+            dhcp_relay_rows.append(f"| {hostname} | {rel.get('interface', '')} | {rel.get('helper_ip', '')} |")
+    if dhcp_pool_rows or dhcp_relay_rows or dhcp_res_count:
+        lines.append(f"\n### DHCP Services (Static Reservations Discovered: **{dhcp_res_count}**)")
+        if dhcp_pool_rows:
+            lines.append("| Device | Pool | Network / Range | Gateway | DNS |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- |")
+            lines.extend(dhcp_pool_rows)
+        if dhcp_relay_rows:
+            lines.append("\n| Device | Relay Interface | Helper IP |")
+            lines.append("| :--- | :--- | :--- |")
+            lines.extend(dhcp_relay_rows)
+
+    # 5d. Per-Port L2 Intent Summary
+    port_summary_rows = []
+    for ip, dev in devices.items():
+        hostname = dev.get("hostname") or ip
+        pp = dev.get("port_profiles", {}) or {}
+        if not pp:
+            continue
+        acc = sum(1 for v in pp.values() if v.get("mode") == "access")
+        trk = sum(1 for v in pp.values() if v.get("mode") == "trunk")
+        rtd = sum(1 for v in pp.values() if v.get("mode") == "routed")
+        lags = len({v.get("lag_group") for v in pp.values() if v.get("lag_group")})
+        port_summary_rows.append(f"| {hostname} | {len(pp)} | {acc} | {trk} | {rtd} | {lags} |")
+    if port_summary_rows:
+        lines.append("\n### Per-Port L2 Switching Intent")
+        lines.append("| Device | Profiled Ports | Access | Trunk | Routed | LAG Bundles |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        lines.extend(port_summary_rows)
+
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
@@ -1253,7 +1350,7 @@ def generate_best_practices_report(devices, output_path="Cisco Best Practices.md
 
         # Audits
         # 1. SSH vs Telnet
-        ssh_ok = mgmt_method == "SSH"
+        ssh_ok = str(mgmt_method).startswith("SSH")
 
         # 2. Central AAA
         aaa_ok = bool(services.get("radius_servers") or services.get("tacacs_servers"))
@@ -2751,3 +2848,157 @@ def generate_cutover_validation_script(
         print(f"[+] Cross-platform PowerShell cutover script written to: {ps1_path}")
     except Exception as e:
         print(f"[-] Error writing cutover validation script: {e}")
+
+
+def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv"):
+    """
+    Generate a hardware sizing & Bill-of-Materials (BOM) CSV aggregating per-device
+    port counts, PoE wattage budgets/draw, and SFP/SFP+/QSFP transceiver totals.
+    """
+    fields = [
+        "Hostname",
+        "IP Address",
+        "Vendor",
+        "Model",
+        "Device Type",
+        "Total Ports",
+        "Active Ports",
+        "PoE Budget (W)",
+        "PoE Used (W)",
+        "PoE Active Ports",
+        "Optics Count",
+        "Optics Breakdown",
+    ]
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for ip, dev in devices.items():
+                ints_detail = dev.get("interfaces_detail", {}) or {}
+                total_ports = len(ints_detail)
+                active_ports = sum(1 for d in ints_detail.values() if str(d.get("status", "")).lower() == "up")
+                poe = dev.get("poe", {}) or {}
+                tot_w = float(poe.get("total_power_watts", 0.0) or 0.0)
+                used_w = float(poe.get("used_power_watts", 0.0) or 0.0)
+                poe_ports = len(poe.get("ports", {}) or {})
+                optics = dev.get("optics", []) or []
+                opt_counts: dict[str, int] = {}
+                for opt in optics:
+                    otype = str(opt.get("type") or opt.get("part_number") or "SFP").strip()
+                    opt_counts[otype] = opt_counts.get(otype, 0) + 1
+                opt_str = "; ".join(f"{k}:{v}" for k, v in sorted(opt_counts.items())) or "None"
+                writer.writerow(
+                    {
+                        "Hostname": dev.get("hostname") or ip,
+                        "IP Address": ip,
+                        "Vendor": dev.get("vendor") or "Unknown",
+                        "Model": dev.get("model") or "Unknown",
+                        "Device Type": dev.get("device_type") or "unknown",
+                        "Total Ports": total_ports,
+                        "Active Ports": active_ports,
+                        "PoE Budget (W)": f"{tot_w:.1f}",
+                        "PoE Used (W)": f"{used_w:.1f}",
+                        "PoE Active Ports": poe_ports,
+                        "Optics Count": len(optics),
+                        "Optics Breakdown": opt_str,
+                    }
+                )
+        print(f"BOM & hardware sizing CSV successfully written to {output_path}")
+    except Exception as e:
+        print(f"Error generating BOM hardware sizing CSV: {e}")
+
+
+def generate_target_migration_configs(
+    devices,
+    target_vendor="cisco",
+    output_path="target_migration_configs.md",
+):
+    """
+    Generate vendor-neutral staged CLI configuration snippets for migrating
+    mixed-vendor devices onto a single target vendor (`cisco`, `juniper`, `arista`, `hpprocurve`).
+    """
+    tv = (target_vendor or "cisco").strip().lower()
+    lines = [
+        f"# Target Vendor Migration Configs (`{tv}`)",
+        "",
+        "Generated from normalized device intent (`l3_interfaces`, `port_profiles`, `routes`, `services`, `dhcp`).",
+        "",
+    ]
+    for ip, dev in devices.items():
+        if dev.get("status") != "success":
+            continue
+        hostname = dev.get("hostname") or ip
+        lines.append(f"## {hostname} ({dev.get('vendor', 'Unknown')} `{dev.get('model', '')}` -> `{tv}`)")
+        lines.append("```text")
+        services = dev.get("services", {}) or {}
+        port_profiles = dev.get("port_profiles", {}) or {}
+        l3_ints = dev.get("l3_interfaces", []) or []
+
+        if tv in ("cisco", "arista"):
+            lines.append(f"hostname {hostname}")
+            for ntp in services.get("ntp_servers", []):
+                lines.append(f"ntp server {ntp}")
+            for dns in services.get("dns_servers", []):
+                lines.append(f"ip name-server {dns}")
+            for intf in l3_ints[:20]:
+                iname = intf.get("interface", "")
+                ip_str = intf.get("ip_address", "")
+                if iname and ip_str:
+                    lines.append(f"! Source L3: {iname} -> {ip_str}")
+            for port, prof in list(port_profiles.items())[:48]:
+                lines.append(f"interface {port}")
+                if prof.get("mode") == "access" and prof.get("access_vlan"):
+                    lines.append(" switchport mode access")
+                    lines.append(f" switchport access vlan {prof['access_vlan']}")
+                    if prof.get("voice_vlan"):
+                        lines.append(f" switchport voice vlan {prof['voice_vlan']}")
+                elif prof.get("mode") == "trunk":
+                    lines.append(" switchport mode trunk")
+                    if prof.get("trunk_allowed_vlans"):
+                        lines.append(f" switchport trunk allowed vlan {prof['trunk_allowed_vlans']}")
+        elif tv == "juniper":
+            lines.append(f"set system host-name {hostname}")
+            for ntp in services.get("ntp_servers", []):
+                lines.append(f"set system ntp server {ntp}")
+            for dns in services.get("dns_servers", []):
+                lines.append(f"set system name-server {dns}")
+            for port, prof in list(port_profiles.items())[:48]:
+                if prof.get("mode") == "access" and prof.get("access_vlan"):
+                    lines.append(
+                        f"set interfaces {port} unit 0 family ethernet-switching interface-mode access"
+                    )
+                    lines.append(
+                        f"set interfaces {port} unit 0 family ethernet-switching vlan members {prof['access_vlan']}"
+                    )
+                elif prof.get("mode") == "trunk":
+                    lines.append(
+                        f"set interfaces {port} unit 0 family ethernet-switching interface-mode trunk"
+                    )
+                    if prof.get("trunk_allowed_vlans"):
+                        lines.append(
+                            f"set interfaces {port} unit 0 family ethernet-switching vlan members [{prof['trunk_allowed_vlans'].replace(',', ' ')}]"
+                        )
+        elif tv in ("hpprocurve", "procurve", "hp"):
+            lines.append(f'hostname "{hostname}"')
+            for ntp in services.get("ntp_servers", []):
+                lines.append(f"sntp server priority 1 {ntp}")
+            for dns in services.get("dns_servers", []):
+                lines.append(f"ip dns server-address priority 1 {dns}")
+            for port, prof in list(port_profiles.items())[:48]:
+                if prof.get("mode") == "access" and prof.get("access_vlan"):
+                    lines.append(f"vlan {prof['access_vlan']} untagged {port}")
+                elif prof.get("mode") == "trunk" and prof.get("trunk_allowed_vlans"):
+                    for vid in prof["trunk_allowed_vlans"].split(","):
+                        if vid.strip().isdigit():
+                            lines.append(f"vlan {vid.strip()} tagged {port}")
+        else:
+            lines.append(f"# Unsupported target_vendor={tv}")
+        lines.append("```")
+        lines.append("")
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"Target migration configs written to {output_path}")
+    except Exception as e:
+        print(f"Error generating target migration configs: {e}")

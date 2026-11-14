@@ -22,9 +22,11 @@ from net_docu_crawler.drivers.arista import AristaDriver
 from net_docu_crawler.drivers.aruba import ArubaDriver
 from net_docu_crawler.drivers.base import BaseDriver
 from net_docu_crawler.drivers.cisco import CiscoDriver
+from net_docu_crawler.drivers.ciscosmb import CiscoSMBDriver
 from net_docu_crawler.drivers.detector import detect_vendor_range
 from net_docu_crawler.drivers.fortinet import FortinetDriver
 from net_docu_crawler.drivers.frr import FRRDriver
+from net_docu_crawler.drivers.hpprocurve import HPProCurveDriver
 from net_docu_crawler.drivers.juniper import JuniperDriver
 from net_docu_crawler.drivers.mikrotik import MikroTikDriver
 from net_docu_crawler.drivers.openwrt import OpenWrtDriver
@@ -34,8 +36,16 @@ from net_docu_crawler.drivers.paloalto import PaloAltoDriver
 # Registry mapping vendor string to driver class
 DRIVER_REGISTRY: dict[str, type[BaseDriver]] = {
     "cisco": CiscoDriver,
+    "ciscosmb": CiscoSMBDriver,
+    "cisco_s300": CiscoSMBDriver,
+    "cbs": CiscoSMBDriver,
+    "sg300": CiscoSMBDriver,
+    "sg350": CiscoSMBDriver,
     "juniper": JuniperDriver,
     "aruba": ArubaDriver,
+    "hpprocurve": HPProCurveDriver,
+    "procurve": HPProCurveDriver,
+    "hp": HPProCurveDriver,
     "paloalto": PaloAltoDriver,
     "fortinet": FortinetDriver,
     "arista": AristaDriver,
@@ -55,6 +65,8 @@ def get_driver(
     secret: str = "",
     vendor_hint: str | None = None,
     timeout: int = 10,
+    port: int | None = None,
+    transport: str = "ssh",
 ) -> BaseDriver:
     """
     Factory function returning the appropriate vendor driver instance.
@@ -63,12 +75,23 @@ def get_driver(
     vendor = vendor_hint.lower() if vendor_hint else ""
 
     if not vendor or vendor not in DRIVER_REGISTRY:
-        detected_vendor, _banner = detect_vendor_range(ip, mac=mac, timeout=float(timeout))
+        probe_port = port if port is not None else (23 if transport == "telnet" else 22)
+        detected_vendor, _banner = detect_vendor_range(
+            ip, mac=mac, port=probe_port, timeout=float(timeout), transport=transport
+        )
         vendor = detected_vendor
 
     # Default fallback to CiscoDriver if unknown (preserves legacy behavior safely)
     driver_cls = DRIVER_REGISTRY.get(vendor, CiscoDriver)
-    return driver_cls(ip=ip, username=username, password=password, secret=secret, timeout=timeout)
+    return driver_cls(
+        ip=ip,
+        username=username,
+        password=password,
+        secret=secret,
+        timeout=timeout,
+        port=port,
+        transport=transport,
+    )
 
 
 __all__ = [
@@ -78,6 +101,7 @@ __all__ = [
     "ArubaDriver",
     "PaloAltoDriver",
     "FortinetDriver",
+    "HPProCurveDriver",
     "AristaDriver",
     "MikroTikDriver",
     "FRRDriver",

@@ -68,6 +68,7 @@ class OPNsenseDriver(BaseDriver):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
             hostname=self.ip,
+            port=self.port,
             username=self.username,
             password=self.password,
             timeout=self.timeout,

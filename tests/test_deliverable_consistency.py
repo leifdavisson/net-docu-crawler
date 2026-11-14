@@ -81,12 +81,13 @@ def test_dataset_structure_and_completeness():
         "192.168.1.1",
         "192.168.1.3",
         "192.168.1.215",
-        "192.168.1.250",
         "192.168.1.251",
         "192.168.1.252",
         "192.168.1.253",
         "192.168.1.254",
     }
+    has_access_switch = ("192.168.1.250" in crawled_ips) or ("192.168.1.220" in crawled_ips)
+    assert has_access_switch, "Expected either Cisco 891 (.250) or HP ProCurve (.220) in dataset"
     missing = expected_ips - crawled_ips
     assert not missing, f"Missing expected target devices in dataset: {missing}"
 

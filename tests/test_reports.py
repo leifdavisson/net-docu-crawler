@@ -196,3 +196,115 @@ def test_multivendor_report_alignment_no_false_positives(tmp_path):
     assert "Spanning Tree is DISABLED" not in rep_txt
     assert "Overlap Warning" not in rep_txt
     assert "CRITICAL IP CONFLICT" not in rep_txt
+
+
+def test_asset_inventory_partial_unauthenticated_and_custom_mgmt_method(tmp_path):
+    devices = {
+        "192.168.1.10": {
+            "hostname": "SW-CUSTOM",
+            "ip": "192.168.1.10",
+            "status": "success",
+            "mgmt_method": "SSH:2222",
+            "vendor": "HPProCurve",
+            "device_type": "switch",
+            "model": "J9727A",
+            "firmware": "WB.16.10",
+            "serial": "SG123",
+            "mac_address": "38:63:bb:57:ca:40",
+            "l3_interfaces": [],
+            "interfaces_detail": {},
+            "neighbors": [],
+            "routes": [],
+            "stp": {"enabled": True, "is_root": True, "vlans": {}},
+            "services": {"dns_servers": [], "ntp_servers": [], "radius_servers": [], "tacacs_servers": []},
+            "raw_config": "",
+        },
+        "192.168.1.50": {
+            "hostname": "192.168.1.50",
+            "ip": "192.168.1.50",
+            "status": "unauthenticated",
+            "mgmt_method": "Telnet",
+            "vendor": "cisco",
+            "device_type": "unknown",
+            "model": "Cisco Telnet Login",
+            "firmware": "Unknown",
+            "serial": "Unknown",
+            "mac_address": "aa:bb:cc:dd:ee:01",
+            "l3_interfaces": [],
+            "interfaces_detail": {},
+            "neighbors": [],
+            "routes": [],
+            "stp": {"enabled": False, "is_root": False, "vlans": {}},
+            "services": {"dns_servers": [], "ntp_servers": [], "radius_servers": [], "tacacs_servers": []},
+            "raw_config": "",
+        },
+        "192.168.1.60": {
+            "hostname": "192.168.1.60",
+            "ip": "192.168.1.60",
+            "status": "unsupported",
+            "mgmt_method": "SSH",
+            "vendor": "Synology",
+            "device_type": "unknown",
+            "model": "Synology Device",
+            "firmware": "Unknown",
+            "serial": "Unknown",
+            "mac_address": "aa:bb:cc:dd:ee:02",
+            "l3_interfaces": [],
+            "interfaces_detail": {},
+            "neighbors": [],
+            "routes": [],
+            "stp": {"enabled": False, "is_root": False, "vlans": {}},
+            "services": {"dns_servers": [], "ntp_servers": [], "radius_servers": [], "tacacs_servers": []},
+            "raw_config": "",
+        },
+    }
+
+    inv_path = str(tmp_path / "asset_inventory.csv")
+    rep_path = str(tmp_path / "report.md")
+    report_generator.generate_asset_inventory(devices, inv_path)
+    report_generator.generate_network_analysis_report(devices, rep_path)
+
+    with open(inv_path, encoding="utf-8") as f:
+        inv_txt = f.read()
+    with open(rep_path, encoding="utf-8") as f:
+        rep_txt = f.read()
+
+    assert "SW-CUSTOM,192.168.1.10" in inv_txt
+    assert "SSH:2222" in inv_txt
+    assert "192.168.1.50,192.168.1.50,aa:bb:cc:dd:ee:01,Unknown,Cisco Telnet Login,Unknown,Unknown,Unauthenticated,Telnet" in inv_txt
+    assert "192.168.1.60,192.168.1.60,aa:bb:cc:dd:ee:02,Unknown,Synology Device,Unknown,Unknown,Unsupported,SSH" in inv_txt
+    assert "Telnet" in rep_txt
+
+
+def test_bom_sizing_and_target_vendor_migration_configs(tmp_path):
+    devices = {
+        "192.168.1.220": {
+            "hostname": "SW-2920-24G",
+            "ip": "192.168.1.220",
+            "status": "success",
+            "mgmt_method": "SSH",
+            "vendor": "HPProCurve",
+            "device_type": "switch",
+            "model": "J9727A",
+            "interfaces_detail": {"1": {"status": "up"}, "2": {"status": "down"}},
+            "l3_interfaces": [{"interface": "VLAN1", "ip_address": "192.168.1.220/24"}],
+            "poe": {"total_power_watts": 370.0, "used_power_watts": 45.2, "ports": {"1": {"power_watts": 45.2}}},
+            "optics": [{"port": "23", "type": "SFP-SX"}, {"port": "24", "type": "SFP-SX"}],
+            "port_profiles": {"1": {"mode": "access", "access_vlan": "10"}},
+            "services": {"dns_servers": ["192.168.1.1"], "ntp_servers": ["192.168.1.1"]},
+        }
+    }
+
+    bom_path = str(tmp_path / "bom.csv")
+    junos_path = str(tmp_path / "target_juniper.md")
+    report_generator.generate_bom_hardware_sizing(devices, bom_path)
+    report_generator.generate_target_migration_configs(devices, target_vendor="juniper", output_path=junos_path)
+
+    with open(bom_path, encoding="utf-8") as f:
+        bom_txt = f.read()
+    with open(junos_path, encoding="utf-8") as f:
+        junos_txt = f.read()
+
+    assert "SW-2920-24G,192.168.1.220,HPProCurve,J9727A,switch,2,1,370.0,45.2,1,2,SFP-SX:2" in bom_txt
+    assert "set system host-name SW-2920-24G" in junos_txt
+    assert "set interfaces 1 unit 0 family ethernet-switching vlan members 10" in junos_txt

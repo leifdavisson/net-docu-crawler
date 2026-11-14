@@ -22,8 +22,6 @@ Official Documentation: https://www.juniper.net/documentation/product/us/en/juno
 import json
 import re
 
-from netmiko import ConnectHandler
-
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
 
@@ -75,7 +73,7 @@ class JuniperDriver(BaseDriver):
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        conn = ConnectHandler(**device)
+        conn = self.connect_netmiko(device)
         return conn
 
     def get_version(self, conn) -> dict:

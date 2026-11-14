@@ -22,8 +22,6 @@ Official Documentation: https://www.arista.com/en/um-eos
 import json
 import re
 
-from netmiko import ConnectHandler
-
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
 
@@ -51,7 +49,7 @@ class AristaDriver(BaseDriver):
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        conn = ConnectHandler(**device)
+        conn = self.connect_netmiko(device)
         try:
             conn.enable()
         except Exception:

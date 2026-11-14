@@ -36,8 +36,10 @@ Rather than maintaining separate network crawlers for each hardware vendor, **Ne
 | Platform | Primary OS Families | Personas Supported | Paging Disable Command | Structured Output Native? | Default Device Type |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | [**Cisco Systems**](cisco.md) | IOS, IOS-XE, NX-OS, IOS-XR | Switch, Router | `terminal length 0` | Regex Parsing / TextFSM | [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py) |
+| [**Cisco Small Business**](ciscosmb.md) | SG250/SG300/SG350/SG500/CBS250/CBS350 | Switch | `terminal datadump` | Regex Parsing | [`CiscoSMBDriver`](../../net_docu_crawler/drivers/ciscosmb.py) |
 | [**Juniper Networks**](juniper.md) | JunOS (EX, QFX, MX, SRX) | Switch, Router, Firewall | `set cli screen-length 0` | Native JSON (`\| display json`) | [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) |
-| [**Aruba / HPE**](aruba.md) | ArubaOS (IAP), AOS-CX, ProCurve | Access Point, Switch | `no page` | Regex Parsing | [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py) |
+| [**HP ProCurve / ArubaOS-S**](hpprocurve.md) | Provision / ArubaOS-S 14.x-16.x | Switch | `no page` | Regex Parsing / Fixed-width | [`HPProCurveDriver`](../../net_docu_crawler/drivers/hpprocurve.py) |
+| [**Aruba / HPE**](aruba.md) | ArubaOS (IAP), AOS-CX | Access Point, Switch | `no page` | Regex Parsing | [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py) |
 | [**Palo Alto Networks**](paloalto.md) | PAN-OS (PA-Series, Panorama) | Firewall | `set cli pager off` | Tabular / XML / CLI | [`PaloAltoDriver`](../../net_docu_crawler/drivers/paloalto.py) |
 | [**Fortinet**](fortinet.md) | FortiOS (FortiGate) | Firewall | `config system console`<br>`set output standard`<br>`end` | Tabular / CMDB | [`FortinetDriver`](../../net_docu_crawler/drivers/fortinet.py) |
 | [**Arista Networks**](arista.md) | EOS (vEOS, cEOS, Fixed) | Switch, Router | Native JSON | Native JSON (`\| json`) | [`AristaDriver`](../../net_docu_crawler/drivers/arista.py) |
@@ -101,7 +103,29 @@ Net-Docu-Crawler segregates discovery data based on **Device Personas**:
 
 ---
 
-## 5. Official Documentation Links & References
+## 5. Driver Support Policy & Explicitly Excluded Platforms
+
+To preserve **zero blast radius** and truthful, low-maintenance discovery, **Net-Docu-Crawler** only implements CLI/API drivers for platforms that meet all three criteria:
+1. Expose a **documented, non-interactive read-only CLI or local structured API** (SSH, Telnet, or local REST/XML/JSON).
+2. Possess **L2/L3 forwarding, routing, or security-policy authority** needed for network documentation and vendor migrations.
+3. Guarantee **zero-blast-radius** safety (no fragile VT100/ANSI menu traps, no cloud SaaS controller dependency, no ISP-owned demarcation gear).
+
+### Explicitly Excluded Categories (Documented Passively Instead)
+
+Hosts in these categories are intentionally **not** assigned CLI drivers. Instead, they are documented passively via upstream switch LLDP/CDP, `/proc/net/arp` + OUI lookup, HTTP/HTTPS banner & TLS certificate fingerprinting, and opt-in read-only SNMP (`--snmp`) in `asset_inventory.csv` and `port_mac_endpoint_mapping.csv`:
+
+- **Cloud-Only / Controller-Locked Platforms** *(Cisco Meraki, controller-managed Ubiquiti UniFi, Aruba Instant On, TP-Link Omada Cloud)*: No stable local read-only CLI; full extraction requires SaaS cloud API keys and outbound internet access.
+- **Web-Only "Smart" & Unmanaged Switches / Consumer ISP Combos** *(Netgear Plus/Smart web-only, D-Link EasySmart, unmanaged TP-Link, ISP-locked Arris/Sagemcom/Technicolor)*: No SSH/Telnet CLI; only proprietary HTML/CGI web forms without read-only separation.
+- **ANSI / VT100 Menu-Driven Legacy Gear** *(3Com SuperStack, Nortel/Avaya BayStack menu-driven Telnet, pre-IOS CatOS)*: Cursor-driven Telnet menus are brittle under automated Expect/Netmiko sessions and risk accidental configuration/reboot navigation.
+- **Carrier-Managed CPEs / ISP NIDs** *(ISP-owned Ciena, Adtran, Rad demarcation units)*: Belong to the upstream carrier; `--follow-subnets` documents the WAN interface on your own edge router/firewall and prunes at the RFC 1918 boundary unless explicitly overridden (`--allow-cgnat` / `--allow-public-subnets`).
+- **Non-Forwarding Endpoint & Infrastructure Appliances** *(Printers, IP cameras, VoIP phones, NAS, UPS/PDU, server BMCs iDRAC/iLO/IPMI)*: Not switching/routing infrastructure; credential probing risks lockouts or SIEM alerts.
+
+> [!NOTE]
+> **Cisco Small Business Switches (`SG250` / `SG300` / `SG350` / `CBS250` / `CBS350`)**: CLI-capable managed models are supported via [`CiscoSMBDriver`](../../net_docu_crawler/drivers/ciscosmb.py) (`cisco_s300`). Web-only / unmanaged SMB models (`SG110`/`SG200`/`CBS110`) remain under the excluded web-only category above.
+
+---
+
+## 6. Official Documentation Links & References
 
 - **[Netmiko Multi-Vendor Network Automation Library](https://github.com/ktbyers/netmiko)**
 - **[Paramiko Python SSH Library](https://www.paramiko.org/)**

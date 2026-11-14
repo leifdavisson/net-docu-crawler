@@ -20,8 +20,6 @@ Official Documentation: https://docs.paloaltonetworks.com/pan-os
 
 import re
 
-from netmiko import ConnectHandler
-
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
 
@@ -49,7 +47,7 @@ class PaloAltoDriver(BaseDriver):
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        conn = ConnectHandler(**device)
+        conn = self.connect_netmiko(device)
         try:
             conn.send_command(self.paging_cmd)
         except Exception:

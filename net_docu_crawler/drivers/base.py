@@ -126,6 +126,17 @@ def extract_services_from_config(raw_config: str) -> dict:
         if m_tac:
             services["tacacs_servers"].append(m_tac.group(1))
 
+        # HP ProCurve / ArubaOS-S (Provision)
+        m_hp_dns = re.match(r"^ip\s+dns\s+server-address\s+(?:priority\s+\d+\s+)?(\S+)", line, re.IGNORECASE)
+        if m_hp_dns:
+            services["dns_servers"].append(m_hp_dns.group(1))
+        m_hp_sntp = re.match(r"^sntp\s+server\s+(?:priority\s+\d+\s+)?(\S+)", line, re.IGNORECASE)
+        if m_hp_sntp:
+            services["ntp_servers"].append(m_hp_sntp.group(1))
+        m_hp_syslog = re.match(r"^logging\s+(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE)
+        if m_hp_syslog:
+            services["syslog_servers"].append(m_hp_syslog.group(1))
+
         # Junos `display set`
         m_junos_dns = re.match(r"^set\s+system\s+name-server\s+(\S+)", line)
         if m_junos_dns:
@@ -249,6 +260,8 @@ class BaseDriver(ABC):
         secret: str = "",
         timeout: int = 10,
         session_log: str = "",
+        port: int | None = None,
+        transport: str = "ssh",
     ):
         self.ip = ip
         self.username = username
@@ -256,6 +269,54 @@ class BaseDriver(ABC):
         self.secret = secret
         self.timeout = timeout
         self.session_log = session_log
+        self.transport = (transport or "ssh").lower()
+        self.port = port if port is not None else (23 if self.transport == "telnet" else 22)
+
+    @staticmethod
+    def safe_netmiko_connect(device_params: dict):
+        """
+        Establishes a Netmiko connection with automatic fallback for legacy SSH peers.
+        If the initial handshake fails due to deprecated key exchange (KEX), host keys,
+        or ciphers (e.g. IncompatiblePeer: no acceptable kex algorithm / host key),
+        it automatically retries with legacy algorithms enabled.
+        """
+        from netmiko import ConnectHandler
+
+        try:
+            return ConnectHandler(**device_params)
+        except Exception as e:
+            err_msg = str(e).lower()
+            is_compat_err = (
+                "incompatible" in err_msg
+                or "no acceptable kex" in err_msg
+                or "no matching host key" in err_msg
+                or "no acceptable ciphers" in err_msg
+                or "no acceptable macs" in err_msg
+                or "key exchange failed" in err_msg
+            )
+            if is_compat_err:
+                fallback_params = dict(device_params)
+                fallback_params["disabled_algorithms"] = dict()
+                fallback_params["disable_sha2_fix"] = False
+                fallback_params["ssh_strict"] = False
+                return ConnectHandler(**fallback_params)
+            raise
+
+    def connect_netmiko(self, device_params: dict):
+        """
+        Applies configured transport (SSH or Telnet) and custom port before connecting
+        via safe_netmiko_connect().
+        """
+        from netmiko.ssh_dispatcher import CLASS_MAPPER
+
+        params = dict(device_params)
+        if self.port is not None:
+            params["port"] = self.port
+        if self.transport == "telnet":
+            base_type = params.get("device_type", "")
+            telnet_type = f"{base_type}_telnet"
+            params["device_type"] = telnet_type if telnet_type in CLASS_MAPPER else "generic_telnet"
+        return self.safe_netmiko_connect(params)
 
     @abstractmethod
     def connect(self):
@@ -323,6 +384,14 @@ class BaseDriver(ABC):
         """Optional hook for switches/routers to gather optical transceiver (SFP/SFP+/QSFP) DOM telemetry."""
         return []
 
+    def get_routing_peers(self, conn) -> list[dict]:
+        """Optional hook for routers/L3 switches to gather live BGP/OSPF neighbor state."""
+        return []
+
+    def get_fhrp(self, conn) -> list[dict]:
+        """Optional hook for routers/L3 switches to gather live HSRP/VRRP/CARP redundancy state."""
+        return []
+
     def get_services(self, conn, raw_config: str = "") -> dict:
         """Optional hook to extract DNS, NTP, RADIUS, and TACACS+ infrastructure services."""
         return extract_services_from_config(raw_config)
@@ -332,10 +401,15 @@ class BaseDriver(ABC):
         Template method executing the safe read-only discovery sequence.
         Returns normalized device data dictionary ready for reporting and diagram generation.
         """
+        if self.transport == "telnet":
+            mgmt_method = "Telnet" if self.port == 23 else f"Telnet:{self.port}"
+        else:
+            mgmt_method = "SSH" if self.port == 22 else f"SSH:{self.port}"
+
         device_data = {
             "ip": self.ip,
             "status": "success",
-            "mgmt_method": "SSH",
+            "mgmt_method": mgmt_method,
             "vendor": self.vendor_name,
             "device_persona": self.device_persona,
             "device_type": self.default_device_type,
@@ -353,6 +427,11 @@ class BaseDriver(ABC):
             "poe": {"total_power_watts": 0.0, "used_power_watts": 0.0, "available_power_watts": 0.0, "ports": {}},
             "optics": [],
             "routes": [],
+            "routing_peers": [],
+            "fhrp": [],
+            "port_profiles": {},
+            "dhcp": {"pools": [], "reservations": [], "relays": []},
+            "security_policy": {"firewall_rules": [], "nat_rules": [], "vpn_tunnels": []},
             "services": {},
             "raw_config": "",
         }
@@ -398,5 +477,28 @@ class BaseDriver(ABC):
         # 9. Configuration Backup & Infrastructure Services
         device_data["raw_config"] = self.get_running_config(conn)
         device_data["services"] = self.get_services(conn, device_data["raw_config"])
+
+        # 10. Vendor-Neutral Migration Intent (Port Profiles, Routing Peers/FHRP, DHCP, Firewall/NAT/VPN)
+        from net_docu_crawler.migration_parsers import (
+            extract_dhcp_config,
+            extract_firewall_nat_vpn,
+            extract_port_profiles,
+            extract_routing_peers_and_fhrp_from_config,
+        )
+
+        device_data["port_profiles"] = extract_port_profiles(
+            device_data["raw_config"], vendor=self.vendor_name, poe=device_data["poe"]
+        )
+        cfg_peers, cfg_fhrp = extract_routing_peers_and_fhrp_from_config(
+            device_data["raw_config"], vendor=self.vendor_name
+        )
+        live_peers = self.get_routing_peers(conn)
+        live_fhrp = self.get_fhrp(conn)
+        device_data["routing_peers"] = live_peers if live_peers else cfg_peers
+        device_data["fhrp"] = live_fhrp if live_fhrp else cfg_fhrp
+        device_data["dhcp"] = extract_dhcp_config(device_data["raw_config"], vendor=self.vendor_name)
+        device_data["security_policy"] = extract_firewall_nat_vpn(
+            device_data["raw_config"], vendor=self.vendor_name
+        )
 
         return device_data

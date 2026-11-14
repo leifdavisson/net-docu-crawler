@@ -22,11 +22,14 @@ Cascades across:
   Tier 4: Safest Single Probe Command (e.g., distinguishing IOS vs NX-OS vs XR)
 """
 
+import ipaddress
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import oui_lookup
 
@@ -52,6 +55,276 @@ def is_hypervisor_mac(mac: str) -> bool:
     return prefix in HYPERVISOR_OUI_PREFIXES
 
 
+def probe_tcp_port(ip: str, port: int, timeout: float = 0.8) -> bool:
+    """Fast, zero-blast TCP connect check to verify if a management port is open."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((ip, port)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def scan_host_ports(
+    ip: str,
+    ssh_ports: list[int] | None = None,
+    telnet_ports: list[int] | None = None,
+    timeout: float = 0.8,
+) -> list[tuple[int, str]]:
+    """Probes a single host for open SSH and Telnet ports, returning [(port, protocol)]."""
+    ssh_list = ssh_ports if ssh_ports is not None else [22, 2222]
+    telnet_list = telnet_ports if telnet_ports is not None else [23]
+    open_services: list[tuple[int, str]] = []
+    for p in ssh_list:
+        if probe_tcp_port(ip, p, timeout=timeout):
+            open_services.append((p, "ssh"))
+    for p in telnet_list:
+        if probe_tcp_port(ip, p, timeout=timeout):
+            open_services.append((p, "telnet"))
+    return open_services
+
+
+def scan_subnet_ports(
+    ips: list[str],
+    ssh_ports: list[int] | None = None,
+    telnet_ports: list[int] | None = None,
+    timeout: float = 0.8,
+    max_workers: int = 32,
+) -> dict[str, list[tuple[int, str]]]:
+    """
+    Parallel TCP port pre-filter across a list of target IPs.
+    Returns {ip: [(port, protocol), ...]} for hosts with at least one open management port.
+    """
+    results: dict[str, list[tuple[int, str]]] = {}
+    if not ips:
+        return results
+    workers = min(max_workers, max(1, len(ips)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(scan_host_ports, ip, ssh_ports, telnet_ports, timeout): ip
+            for ip in ips
+        }
+        for fut in as_completed(future_map):
+            ip = future_map[fut]
+            try:
+                open_ports = fut.result()
+                if open_ports:
+                    results[ip] = open_ports
+            except Exception:
+                pass
+    return results
+
+
+def get_arp_table_entries() -> dict[str, str]:
+    """
+    Read the local OS ARP cache (`/proc/net/arp` on Linux) and return `{ip: mac}`
+    for complete unicast entries (excluding 00:00:00:00:00:00 and multicast/broadcast).
+    """
+    entries: dict[str, str] = {}
+    if os.path.exists("/proc/net/arp"):
+        try:
+            with open("/proc/net/arp", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    ip_addr, mac = parts[0], parts[3].lower()
+                    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                        continue
+                    try:
+                        ip_obj = ipaddress.IPv4Address(ip_addr)
+                        if ip_obj.is_multicast or ip_obj.is_loopback:
+                            continue
+                    except ValueError:
+                        continue
+                    entries[ip_addr] = mac
+        except Exception:
+            pass
+    return entries
+
+
+def probe_http_fingerprint(
+    ip: str,
+    ports: tuple[int, ...] = (443, 80, 8443, 8080),
+    timeout: float = 1.0,
+) -> dict | None:
+    """
+    Read-only HTTP/HTTPS banner and TLS certificate probe for headless/web-managed
+    devices (switches, APs, printers, NAS, iDRAC/iLO). Returns fingerprint dict or None.
+    """
+    for port in ports:
+        if not probe_tcp_port(ip, port, timeout=min(timeout, 0.7)):
+            continue
+        scheme = "https" if port in (443, 8443) else "http"
+        server_hdr = ""
+        title = ""
+        cert_cn = ""
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        conn_sock = raw_sock
+        try:
+            raw_sock.connect((ip, port))
+            if scheme == "https":
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                conn_sock = ctx.wrap_socket(raw_sock, server_hostname=ip)
+                try:
+                    der_cert = conn_sock.getpeercert(binary_form=True)
+                    if der_cert:
+                        from cryptography import x509
+
+                        cert = x509.load_der_x509_certificate(der_cert)
+                        cn_attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+                        if cn_attrs:
+                            cert_cn = str(cn_attrs[0].value).strip()
+                except Exception:
+                    pass
+            req = f"GET / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode("ascii")
+            conn_sock.sendall(req)
+            chunks = []
+            total = 0
+            while total < 8192:
+                try:
+                    data = conn_sock.recv(2048)
+                except TimeoutError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+                total += len(data)
+            resp_text = b"".join(chunks).decode("utf-8", errors="ignore")
+            m_srv = re.search(r"^Server:\s*(.+)$", resp_text, re.IGNORECASE | re.MULTILINE)
+            if m_srv:
+                server_hdr = m_srv.group(1).strip()
+            m_title = re.search(r"<title[^>]*>([^<]+)</title>", resp_text, re.IGNORECASE | re.DOTALL)
+            if m_title:
+                title = " ".join(m_title.group(1).split())[:80]
+            return {
+                "port": port,
+                "scheme": scheme,
+                "server": server_hdr,
+                "title": title,
+                "cert_cn": cert_cn,
+            }
+        except Exception:
+            continue
+        finally:
+            try:
+                conn_sock.close()
+            except Exception:
+                pass
+    return None
+
+
+def _ber_len(length: int) -> bytes:
+    if length < 0x80:
+        return bytes([length])
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(encoded)]) + encoded
+
+
+def _ber_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+def _encode_oid(oid: tuple[int, ...]) -> bytes:
+    body = bytearray([oid[0] * 40 + oid[1]])
+    for arc in oid[2:]:
+        if arc == 0:
+            body.append(0)
+        else:
+            parts = []
+            while arc > 0:
+                parts.append(arc & 0x7F)
+                arc >>= 7
+            parts.reverse()
+            for idx, p in enumerate(parts):
+                body.append(p | (0x80 if idx < len(parts) - 1 else 0))
+    return _ber_tlv(0x06, bytes(body))
+
+
+def _decode_snmp_strings(data: bytes) -> list[str]:
+    """Extract OCTET STRING (tag 0x04) values from an SNMPv2c GetResponse payload."""
+    strings: list[str] = []
+    i = 0
+    n = len(data)
+    while i < n:
+        tag = data[i]
+        i += 1
+        if i >= n:
+            break
+        lb = data[i]
+        i += 1
+        if lb & 0x80:
+            num_octets = lb & 0x7F
+            if i + num_octets > n:
+                break
+            length = int.from_bytes(data[i : i + num_octets], "big")
+            i += num_octets
+        else:
+            length = lb
+        if i + length > n:
+            break
+        val = data[i : i + length]
+        if tag == 0x04:
+            strings.append(val.decode("utf-8", errors="ignore").strip())
+            i += length
+        elif tag in (0x30, 0xA2):
+            continue
+        else:
+            i += length
+    return strings
+
+
+def probe_snmp_sysinfo(
+    ip: str,
+    community: str = "public",
+    port: int = 161,
+    timeout: float = 1.0,
+) -> dict | None:
+    """
+    Lightweight read-only SNMPv2c GetRequest for `sysDescr.0` (1.3.6.1.2.1.1.1.0)
+    and `sysName.0` (1.3.6.1.2.1.1.5.0). Zero external dependencies.
+    """
+    vb1 = _ber_tlv(0x30, _encode_oid((1, 3, 6, 1, 2, 1, 1, 1, 0)) + b"\x05\x00")
+    vb2 = _ber_tlv(0x30, _encode_oid((1, 3, 6, 1, 2, 1, 1, 5, 0)) + b"\x05\x00")
+    varbinds = _ber_tlv(0x30, vb1 + vb2)
+    pdu = _ber_tlv(
+        0xA0,  # GetRequest-PDU
+        _ber_tlv(0x02, b"\x01")  # request-id = 1
+        + _ber_tlv(0x02, b"\x00")  # error-status = 0
+        + _ber_tlv(0x02, b"\x00")  # error-index = 0
+        + varbinds,
+    )
+    pkt = _ber_tlv(
+        0x30,
+        _ber_tlv(0x02, b"\x01")  # version = 1 (SNMPv2c)
+        + _ber_tlv(0x04, community.encode("utf-8"))
+        + pdu,
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(pkt, (ip, port))
+        resp, _addr = sock.recvfrom(4096)
+        octet_strings = _decode_snmp_strings(resp)
+        # First octet string is community echo; subsequent are sysDescr, sysName
+        values = [s for s in octet_strings if s and s != community]
+        if not values:
+            return None
+        return {
+            "sysDescr": values[0] if len(values) >= 1 else "",
+            "sysName": values[1] if len(values) >= 2 else "",
+        }
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
 def get_ssh_banner(ip: str, port: int = 22, timeout: float = 3.0) -> str:
     """Reads the SSH transport identification string directly from the remote server without authenticating."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -61,6 +334,50 @@ def get_ssh_banner(ip: str, port: int = 22, timeout: float = 3.0) -> str:
         s.connect((ip, port))
         raw = s.recv(1024)
         banner = raw.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    finally:
+        s.close()
+    return banner
+
+
+def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
+    """
+    Reads the initial Telnet login banner without authenticating, stripping Telnet IAC
+    negotiation sequences (0xFF <cmd> <opt>) cleanly.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    banner = ""
+    try:
+        s.connect((ip, port))
+        raw = b""
+        # Read initial negotiation + banner chunks
+        for _ in range(2):
+            try:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                raw += chunk
+                # If only IAC bytes arrived, decline options so server sends banner
+                if all(b >= 240 or b in (1, 3, 24, 31, 32, 33, 34, 35, 36, 39) for b in chunk[:6]):
+                    s.sendall(b"\xff\xfc\x18\xff\xfc\x1f\r\n")
+            except TimeoutError:
+                break
+        # Strip 3-byte Telnet IAC commands (0xFF, cmd, opt) and 2-byte commands
+        cleaned = bytearray()
+        i = 0
+        while i < len(raw):
+            if raw[i] == 0xFF and i + 1 < len(raw):
+                cmd = raw[i + 1]
+                if cmd in (0xFB, 0xFC, 0xFD, 0xFE) and i + 2 < len(raw):
+                    i += 3
+                else:
+                    i += 2
+            else:
+                cleaned.append(raw[i])
+                i += 1
+        banner = cleaned.decode("utf-8", errors="ignore").strip()
     except Exception:
         pass
     finally:
@@ -102,7 +419,13 @@ def get_mac_from_system_arp(ip: str) -> str:
     return ""
 
 
-def detect_vendor_range(ip: str, mac: str = "", port: int = 22, timeout: float = 3.0) -> tuple[str, str]:
+def detect_vendor_range(
+    ip: str,
+    mac: str = "",
+    port: int = 22,
+    timeout: float = 3.0,
+    transport: str = "ssh",
+) -> tuple[str, str]:
     """
     Identifies high-level vendor range and transport banner:
     Returns: (vendor_candidate, banner_string)
@@ -119,7 +442,9 @@ def detect_vendor_range(ip: str, mac: str = "", port: int = 22, timeout: float =
             candidate = "cisco"
         elif "juniper" in vendor_oui:
             candidate = "juniper"
-        elif any(h in vendor_oui for h in ["aruba", "hewlett packard", "hpe"]):
+        elif any(h in vendor_oui for h in ["hewlett packard", "procurve"]):
+            candidate = "hpprocurve"
+        elif any(h in vendor_oui for h in ["aruba", "hpe"]):
             candidate = "aruba"
         elif "palo alto" in vendor_oui:
             candidate = "paloalto"
@@ -130,22 +455,31 @@ def detect_vendor_range(ip: str, mac: str = "", port: int = 22, timeout: float =
         elif "mikrotik" in vendor_oui:
             candidate = "mikrotik"
 
-    # Tier 2: SSH Transport Banner inspection (runs when MAC is unknown, across an L3 gateway, or on a VM NIC)
+    # Tier 2: Transport Banner inspection (runs when MAC is unknown, across an L3 gateway, or on a VM NIC)
     banner = ""
     if candidate == "unknown":
-        banner = get_ssh_banner(ip, port=port, timeout=timeout)
+        if transport == "telnet":
+            banner = get_telnet_banner(ip, port=port, timeout=timeout)
+        else:
+            banner = get_ssh_banner(ip, port=port, timeout=timeout)
         banner_lower = banner.lower()
 
-        if "cisco" in banner_lower:
+        if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
+            candidate = "hpprocurve"
+        elif any(
+            k in banner_lower for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business", "cisco_s300")
+        ):
+            candidate = "ciscosmb"
+        elif "cisco" in banner_lower or "user access verification" in banner_lower:
             candidate = "cisco"
         elif "aruba" in banner_lower:
             candidate = "aruba"
         elif "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
             candidate = "fortinet"
+        elif "junos" in banner_lower or "juniper" in banner_lower:
+            candidate = "juniper"
         elif "panos" in banner_lower or "paloalto" in banner_lower:
             candidate = "paloalto"
-        elif "junos" in banner_lower:
-            candidate = "juniper"
         elif "rosssh" in banner_lower or "mikrotik" in banner_lower:
             candidate = "mikrotik"
         elif "arista" in banner_lower:
@@ -199,6 +533,10 @@ def inspect_prompt_os(prompt: str) -> str:
         or re.search(r"^[A-Za-z0-9_-]+\s+#\s*$", prompt)
     ):
         return "fortinet"
+
+    # HP ProCurve / ArubaOS-S switch prompt format: ProCurve# or HP-2920#
+    if re.search(r"^(?:procurve|hp-)[A-Za-z0-9_-]*(?:\s*\(config[^\)]*\))?[>#]\s*$", prompt, re.IGNORECASE):
+        return "hpprocurve"
 
     # Arista / Cisco switch prompt format: hostname> or hostname#
     if re.search(r"^[A-Za-z0-9_-]+(?:\s*\(config[^\)]*\))?[>#]\s*$", prompt):

@@ -27,7 +27,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 flowchart LR
     Targets["Target IPs / Routed Subnets<br>(192.168.1.0/24, 172.16.1.0/24)"]
     Cascade["4-Tier Zero-Blast-Radius Cascade<br>1. Offline ARP OUI<br>2. TCP 22 SSH Banner<br>3. Post-Auth Prompt<br>4. Version Probe"]
-    Drivers["10 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
+    Drivers["11 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
     Registry["DeviceRegistry<br>- SVI and Hypervisor MAC Safe<br>- Global ARP Neighbor Resolution<br>- Bidirectional Link Stitching"]
     Reports["Deliverables (docs/reports/)<br>- L2 and L3 Mermaid Topologies<br>- Asset Inventory and Cabling CSVs<br>- Health Audit and Migration Blueprint"]
 
@@ -48,8 +48,10 @@ flowchart LR
 | Platform / OS | Driver | Transport | Official Reference |
 | :--- | :--- | :--- | :--- |
 | **Cisco IOS / IOS-XE / NX-OS / IOS-XR** | [`CiscoDriver`](net_docu_crawler/drivers/cisco.py) | [Netmiko](https://github.com/ktbyers/netmiko) (`cisco_ios`) | [Cisco IOS & NX-OS Docs](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html) |
+| **Cisco Small Business (SG300 / SG350 / CBS350)** | [`CiscoSMBDriver`](net_docu_crawler/drivers/ciscosmb.py) | Netmiko (`cisco_s300`) | [Cisco SMB 300 Command Ref](https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html) |
 | **Juniper Junos OS (EX / QFX / SRX / MX)** | [`JuniperDriver`](net_docu_crawler/drivers/juniper.py) | Netmiko (`juniper_junos` JSON) | [Juniper Junos Documentation](https://www.juniper.net/documentation/product/us/en/junos-os/) |
 | **Arista EOS / vEOS** | [`AristaDriver`](net_docu_crawler/drivers/arista.py) | Netmiko (`arista_eos` JSON) | [Arista EOS User Manual](https://www.arista.com/en/um-eos) |
+| **HP ProCurve / ArubaOS-S (Provision)** | [`HPProCurveDriver`](net_docu_crawler/drivers/hpprocurve.py) | Netmiko (`hp_procurve`) | [ArubaOS-S Documentation](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm) |
 | **Aruba Instant / AOS-CX** | [`ArubaDriver`](net_docu_crawler/drivers/aruba.py) | Netmiko (`aruba_osswitch`) | [HPE Aruba Networking Portal](https://www.arubanetworks.com/techdocs/ArubaDocPortal/content/cons-instant-home.htm) |
 | **MikroTik RouterOS / CHR** | [`MikroTikDriver`](net_docu_crawler/drivers/mikrotik.py) | Netmiko (`mikrotik_routeros`) | [MikroTik RouterOS CLI Docs](https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface) |
 | **Fortinet FortiOS (FortiGate)** | [`FortinetDriver`](net_docu_crawler/drivers/fortinet.py) | Netmiko (`fortinet`) | [FortiOS CLI Reference](https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference) |
@@ -57,6 +59,8 @@ flowchart LR
 | **OPNsense (FreeBSD)** | [`OPNsenseDriver`](net_docu_crawler/drivers/opnsense.py) | [Paramiko](https://www.paramiko.org/) (`exec_command`) | [OPNsense Documentation](https://docs.opnsense.org/) |
 | **OpenWrt (`ubus` / `uci`)** | [`OpenWrtDriver`](net_docu_crawler/drivers/openwrt.py) | Netmiko (`linux` + `ubus` JSON) | [OpenWrt Documentation](https://openwrt.org/docs/start) |
 | **FRRouting (`vtysh` on Linux/LXC)** | [`FRRDriver`](net_docu_crawler/drivers/frr.py) | Netmiko (`linux` + `vtysh -c`) | [FRRouting User Guide](https://docs.frrouting.org/) |
+
+> **Note on Excluded Platforms:** Cloud-only controllers (Meraki, UniFi), web-only smart/unmanaged switches (including Cisco SG110/SG200/CBS110), ANSI menu-driven legacy gear, ISP-owned CPEs, and non-forwarding endpoints are intentionally documented passively (LLDP + ARP/OUI + HTTP/TLS + optional SNMP) rather than via CLI drivers. See [Driver Support Policy & Excluded Platforms](docs/drivers/overview.md#5-driver-support-policy--explicitly-excluded-platforms) for details.
 
 ---
 
