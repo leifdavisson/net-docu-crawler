@@ -525,6 +525,7 @@ def crawl_target_with_ports(
     mac: str = "",
     http_fingerprint: bool = True,
     vendor_hint: str = "",
+    try_all_creds: bool = False,
 ) -> dict | None:
     """
     Probe a target across its discovered open `(port, transport)` pairs.
@@ -561,17 +562,19 @@ def crawl_target_with_ports(
             vendor_cand = hint_norm
         elif vendor_cand == "unknown" and http_fingerprint:
             http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
+            if http_fp:
+                _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {http_fp}")
             http_vendor = infer_vendor_from_http(http_fp)
             if http_vendor != "unknown":
                 vendor_cand = http_vendor
                 _log_event(
                     log_file,
-                    f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand} ({http_fp})",
+                    f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand}",
                 )
         last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
         _log_event(
             log_file,
-            f"Target {ip}:{port} ({transport}) -> vendor={vendor_cand}, banner={banner!r}",
+            f"Target {ip}:{port} ({transport}) -> vendor={vendor_cand}, mac={host_mac or 'none'}, banner={banner!r}",
         )
 
         if vendor_cand in VENDOR_DRIVER_MAP:
@@ -603,12 +606,51 @@ def crawl_target_with_ports(
             sorted_creds.sort(
                 key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
             )
+            if not try_all_creds:
+                scoped_creds = [
+                    c
+                    for c in sorted_creds
+                    if not c.get("vendor") or c.get("vendor", "").strip().lower() == vendor_cand.lower()
+                ]
+                if scoped_creds:
+                    sorted_creds = scoped_creds
+                else:
+                    _log_event(
+                        log_file,
+                        f"No credentials tagged '{vendor_cand}' or untagged; falling back to all {len(sorted_creds)} profiles.",
+                    )
+
+        _driver_vendor_map = {
+            CiscoDriver: "cisco",
+            CiscoSMBDriver: "ciscosmb",
+            AristaDriver: "arista",
+            JuniperDriver: "juniper",
+            FortinetDriver: "fortinet",
+            ArubaDriver: "aruba",
+            HPProCurveDriver: "hpprocurve",
+            PaloAltoDriver: "paloalto",
+            MikroTikDriver: "mikrotik",
+            OPNsenseDriver: "opnsense",
+            OpenWrtDriver: "openwrt",
+            FRRDriver: "frrouting",
+        }
 
         transport_failed = False
         for driver_cls in driver_classes:
             if transport_failed:
                 break
-            for cred in sorted_creds:
+            driver_creds = sorted_creds
+            if vendor_cand == "unknown" and not try_all_creds:
+                drv_vendor = _driver_vendor_map.get(driver_cls, "")
+                if drv_vendor:
+                    filtered = [
+                        c
+                        for c in sorted_creds
+                        if not c.get("vendor") or c.get("vendor", "").strip().lower() == drv_vendor
+                    ]
+                    if filtered:
+                        driver_creds = filtered
+            for cred in driver_creds:
                 user = cred.get("username", "")
                 pwd = cred.get("password", "")
                 secret = cred.get("secret", "")
@@ -782,6 +824,7 @@ def crawl_network(
     allow_public_subnets: bool = False,
     target_vendor: str = "",
     vendor_hint: str = "",
+    try_all_creds: bool = False,
     save_baseline: str = "",
     compare_baseline: str = "",
 ) -> list[dict]:
@@ -877,6 +920,7 @@ def crawl_network(
                     open_ports=open_ports_map.get(ip),
                     http_fingerprint=http_fingerprint,
                     vendor_hint=vendor_hint,
+                    try_all_creds=try_all_creds,
                 ): ip
                 for ip in targets_to_crawl
             }
@@ -1278,6 +1322,16 @@ def main():
         help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., fortinet, ciscosmb, cisco)",
     )
     parser.add_argument(
+        "--try-all-creds",
+        action="store_true",
+        help="Try all credential profiles even when a specific vendor is detected (not recommended for lockout-protected devices)",
+    )
+    parser.add_argument(
+        "--no-online-oui",
+        action="store_true",
+        help="Disable online OUI lookup fallback for unseen MAC prefixes (air-gapped mode)",
+    )
+    parser.add_argument(
         "--save-baseline",
         default="",
         help="Save pre-cutover baseline state JSON to the specified path",
@@ -1306,6 +1360,9 @@ def main():
         print(f"[+] Validated {len(creds)} credential profile(s) from {args.credentials}")
         return
 
+    if args.no_online_oui:
+        os.environ["NET_DOCU_OFFLINE_OUI"] = "1"
+
     t_start = time.time()
     try:
         crawl_network(
@@ -1328,6 +1385,7 @@ def main():
             allow_public_subnets=args.allow_public_subnets,
             target_vendor=args.target_vendor,
             vendor_hint=args.vendor_hint,
+            try_all_creds=args.try_all_creds,
             save_baseline=args.save_baseline,
             compare_baseline=args.compare_baseline,
         )

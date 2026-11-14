@@ -13,8 +13,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import json
 import os
 import re
+import threading
+import urllib.error
+import urllib.request
 
 # Bundled comprehensive offline database of enterprise network equipment vendor OUIs.
 # Zero external web requests required: safe for isolated, air-gapped management VLANs.
@@ -490,8 +494,13 @@ COMMON_OUIS = {
     "00:16:3E": "Xen Virtual NIC",
 }
 
-# Optional local IEEE OUI database file path (used only if present on disk; no network calls)
+# Optional local IEEE OUI database file path
 OUI_FILE = "oui.txt"
+# Persistent cache for online OUI lookups so each unseen OUI is queried at most once
+OUI_CACHE_FILE = "oui_cache.json"
+_oui_cache_lock = threading.Lock()
+_online_oui_cache: dict[str, str] = {}
+_online_cache_loaded = False
 
 
 def normalize_mac(mac_str):
@@ -556,11 +565,69 @@ def load_oui_file():
     return True
 
 
-def get_vendor(mac_str):
+def _load_online_cache() -> None:
+    global _online_oui_cache, _online_cache_loaded
+    if _online_cache_loaded:
+        return
+    _online_cache_loaded = True
+    if not os.path.exists(OUI_CACHE_FILE):
+        return
+    try:
+        with open(OUI_CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _online_oui_cache = {str(k).upper(): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+
+
+def _save_online_cache() -> None:
+    try:
+        with open(OUI_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_online_oui_cache, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _is_globally_administered_unicast(prefix: str) -> bool:
+    """Returns True if the OUI prefix is a valid unicast, globally-administered IEEE OUI."""
+    try:
+        first_octet = int(prefix.split(":")[0], 16)
+    except Exception:
+        return False
+    # Bit 0 = multicast, Bit 1 = locally administered
+    return (first_octet & 0x03) == 0
+
+
+def _fetch_oui_online(prefix: str, timeout: float = 1.5) -> str:
     """
-    Returns the manufacturer/vendor name for a MAC address completely offline.
+    Queries api.macvendors.com for an unseen OUI prefix and caches the result
+    (including 'Unknown' on 404) so each OUI is looked up online at most once.
+    """
+    url = f"https://api.macvendors.com/{prefix}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Net-Docu-Crawler/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                vendor = resp.read().decode("utf-8", errors="ignore").strip()
+                if vendor:
+                    return vendor
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "Unknown"
+    except Exception:
+        return ""
+    return "Unknown"
+
+
+def get_vendor(mac_str, online: bool = True):
+    """
+    Returns the manufacturer/vendor name for a MAC address.
     1. Checks the built-in enterprise network vendor dictionary.
     2. Checks the local OUI text database (if present on disk).
+    3. Checks the persistent `oui_cache.json` for previously seen OUIs.
+    4. If `online=True` (and NET_DOCU_OFFLINE_OUI is not set), queries api.macvendors.com
+       once for unseen globally-administered unicast OUIs and caches the result.
     Returns 'Unknown' if not identified.
     """
     if not mac_str:
@@ -578,6 +645,25 @@ def get_vendor(mac_str):
     if load_oui_file():
         if prefix in _loaded_ouis:
             return _loaded_ouis[prefix]
+
+    # 3. Check persistent cache of previously queried OUIs
+    with _oui_cache_lock:
+        _load_online_cache()
+        if prefix in _online_oui_cache:
+            return _online_oui_cache[prefix]
+
+    # 4. Online lookup for unseen globally-administered unicast OUIs
+    offline_env = os.environ.get("NET_DOCU_OFFLINE_OUI", "").strip().lower() in ("1", "true", "yes")
+    if online and not offline_env and _is_globally_administered_unicast(prefix):
+        with _oui_cache_lock:
+            _load_online_cache()
+            if prefix in _online_oui_cache:
+                return _online_oui_cache[prefix]
+            vendor = _fetch_oui_online(prefix)
+            if vendor:
+                _online_oui_cache[prefix] = vendor
+                _save_online_cache()
+                return vendor
 
     return "Unknown"
 

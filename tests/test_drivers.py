@@ -783,6 +783,42 @@ def test_vendor_hint_and_http_fallback_avoid_cisco_on_fortigate():
         assert fg_inst.connect.call_count == 1
 
 
+def test_strict_vendor_credential_scoping_skips_unrelated_vendors():
+    from net_docu_crawler.crawler import crawl_target_with_ports
+
+    tried_users = []
+    fg_cls = MagicMock()
+    fg_cls.__name__ = "FortinetDriver"
+
+    def _make_inst(**kwargs):
+        tried_users.append((kwargs["username"], kwargs["password"]))
+        inst = MagicMock()
+        inst.connect.side_effect = Exception("Authentication to device failed.")
+        return inst
+
+    fg_cls.side_effect = _make_inst
+
+    creds = [
+        {"name": "Cisco-1", "vendor": "cisco", "username": "cisco_u", "password": "pw"},
+        {"name": "HP-1", "vendor": "hpprocurve", "username": "manager", "password": "pw"},
+        {"name": "FG-1", "vendor": "fortinet", "username": "fg_admin", "password": "fg_pw"},
+        {"name": "Generic-1", "username": "site_admin", "password": "site_pw"},
+    ]
+
+    with (
+        patch("net_docu_crawler.crawler.detect_vendor_range", return_value=("fortinet", "SSH-2.0-FortiSSH")),
+        patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value=""),
+        patch.dict("net_docu_crawler.crawler.VENDOR_DRIVER_MAP", {"fortinet": fg_cls}),
+    ):
+        res = crawl_target_with_ports(
+            ip="10.29.0.1",
+            credentials=creds,
+            open_ports=[(22, "ssh")],
+        )
+        assert res["status"] == "unauthenticated"
+        assert tried_users == [("fg_admin", "fg_pw"), ("site_admin", "site_pw")]
+
+
 def test_all_10_drivers_session_log_and_interface():
     drivers = [
         CiscoDriver(ip="10.0.0.1", session_log="/tmp/test.log"),
