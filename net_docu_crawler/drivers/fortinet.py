@@ -82,7 +82,15 @@ class FortinetDriver(BaseDriver):
         if not info["hostname"]:
             prompt = conn.find_prompt()
             m_p = re.match(r"^([A-Za-z0-9_-]+)", prompt)
-            if m_p:
+            if m_p and m_p.group(1).lower() not in (
+                "authentication",
+                "password",
+                "login",
+                "username",
+                "incorrect",
+                "failed",
+                "denied",
+            ):
                 info["hostname"] = m_p.group(1)
 
         return info

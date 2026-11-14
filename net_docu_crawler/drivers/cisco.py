@@ -116,7 +116,38 @@ class CiscoDriver(BaseDriver):
             sh_lldp = conn.send_command("show lldp neighbors detail")
             for n in parser.parse_lldp_neighbors_detail(sh_lldp):
                 n["remote_platform"] = n.get("platform", "")
-                key = (n.get("local_port", ""), n.get("remote_device", "").lower())
+                lldp_name = (n.get("remote_device") or "").strip()
+                lldp_ip = (n.get("remote_ip") or "").strip()
+                lldp_mac_hex = re.sub(r"[^0-9a-f]", "", (n.get("remote_mac") or "").lower())
+                lldp_port = (n.get("local_port") or "").strip()
+
+                # Correlate LLDP with existing CDP entries (IOS 12.x LLDP omits Local Intf,
+                # while CDP often reports a 12-hex MAC as Device ID instead of System Name).
+                matched_cdp = None
+                for existing in neighbors:
+                    ex_ip = (existing.get("remote_ip") or "").strip()
+                    ex_dev_hex = re.sub(r"[^0-9a-f]", "", (existing.get("remote_device") or "").lower())
+                    if lldp_port and existing.get("local_port") == lldp_port:
+                        matched_cdp = existing
+                        break
+                    if lldp_ip and ex_ip and lldp_ip == ex_ip:
+                        matched_cdp = existing
+                        break
+                    if lldp_mac_hex and len(lldp_mac_hex) == 12 and ex_dev_hex == lldp_mac_hex:
+                        matched_cdp = existing
+                        break
+
+                if matched_cdp is not None:
+                    ex_dev = (matched_cdp.get("remote_device") or "").strip()
+                    if lldp_name and re.fullmatch(r"[0-9a-fA-F]{12}", ex_dev):
+                        matched_cdp["remote_device"] = lldp_name
+                    if not matched_cdp.get("remote_mac") and n.get("remote_mac"):
+                        matched_cdp["remote_mac"] = n["remote_mac"]
+                    continue
+
+                if not lldp_port:
+                    continue
+                key = (lldp_port, lldp_name.lower())
                 if key not in seen:
                     seen.add(key)
                     neighbors.append(n)

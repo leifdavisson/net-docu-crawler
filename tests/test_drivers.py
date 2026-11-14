@@ -1378,3 +1378,63 @@ def test_ssh_banner_strips_kexinit_and_detects_ciscosmb():
         vendor, banner = detect_vendor_range("10.29.0.152", mac="5c:e1:76:a2:b2:1d", transport="ssh")
         assert vendor == "ciscosmb"
         assert banner == "SSH-2.0-OpenSSH_7.3p1.RL"
+
+
+def test_cisco_driver_merges_cdp_mac_with_lldp_system_name():
+    """Verify CiscoDriver upgrades MAC-only CDP Device IDs using LLDP System Name without duplicate edges."""
+    from net_docu_crawler.drivers.cisco import CiscoDriver
+
+    cdp_out = (
+        "-------------------------\n"
+        "Device ID: 5ce176a2c372\n"
+        "Entry address(es):\n"
+        "  IP address: 10.29.55.13\n"
+        "Platform: Cisco SG250-26HP (PID:SG250-26HP-K9)-VS,  Capabilities: Router Switch IGMP\n"
+        "Interface: GigabitEthernet1/0/2,  Port ID (outgoing port): gi26\n"
+        "-------------------------\n"
+        "Device ID: 2c73a0368d71\n"
+        "Entry address(es):\n"
+        "  IP address: 10.29.55.10\n"
+        "Platform: Cisco SG250X-48 (PID:SG250X-48-K9)-VSD,  Capabilities: Router Switch IGMP\n"
+        "Interface: GigabitEthernet1/0/3,  Port ID (outgoing port): te3\n"
+    )
+    lldp_out = (
+        "------------------------------------------------\n"
+        "Chassis id: 5ce1.76a2.c372\n"
+        "Port id: gi26\n"
+        "System Name: genshaft-sw-rm13\n"
+        "Management Addresses:\n"
+        "    IP: 10.29.55.13\n"
+        "------------------------------------------------\n"
+        "Chassis id: 2c73.a036.8d71\n"
+        "Port id: te3\n"
+        "System Name: genshaft-sw-100\n"
+        "Management Addresses:\n"
+        "    IP: 10.29.55.10\n"
+    )
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = [cdp_out, lldp_out]
+    drv = CiscoDriver("10.29.55.15", "admin", "pass")
+    neighbors = drv.get_neighbors(mock_conn)
+    assert len(neighbors) == 2
+    assert neighbors[0]["local_port"] == "GigabitEthernet1/0/2"
+    assert neighbors[0]["remote_device"] == "genshaft-sw-rm13"
+    assert neighbors[1]["local_port"] == "GigabitEthernet1/0/3"
+    assert neighbors[1]["remote_device"] == "genshaft-sw-100"
+
+
+def test_detector_skips_windows_openssh_and_fortinet_ignores_auth_prompts():
+    """Verify Windows OpenSSH banners are skipped and FortinetDriver rejects auth-prompt words as hostnames."""
+    from net_docu_crawler.drivers.detector import detect_vendor_range
+    from net_docu_crawler.drivers.fortinet import FortinetDriver
+
+    with patch("net_docu_crawler.drivers.detector.get_ssh_banner", return_value="SSH-2.0-OpenSSH_for_Windows_7.7"):
+        vendor, _ = detect_vendor_range("10.29.25.35", transport="ssh")
+        assert vendor == "unsupported_appliance"
+
+    mock_conn = MagicMock()
+    mock_conn.send_command.return_value = "authentication failed\n"
+    mock_conn.find_prompt.return_value = "Password:"
+    drv = FortinetDriver("10.29.25.34", "admin", "pass")
+    ver = drv.get_version(mock_conn)
+    assert ver["hostname"] == ""

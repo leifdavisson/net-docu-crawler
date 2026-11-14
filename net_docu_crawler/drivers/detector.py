@@ -559,7 +559,7 @@ def detect_vendor_range(
                 candidate = "opnsense"
             elif "dropbear" in banner_lower or "openwrt" in banner_lower:
                 candidate = "openwrt"
-            elif "crestron" in banner_lower:
+            elif "crestron" in banner_lower or "openssh_for_windows" in banner_lower:
                 candidate = "unsupported_appliance"
 
     return candidate, banner

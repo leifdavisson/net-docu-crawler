@@ -367,14 +367,19 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
     link_styles = []
 
     # Safe alphanumeric IDs mapping for L2 graph to avoid syntax errors with special characters
+    # Key crawled devices by IP (not hostname) so colliding hostnames never overwrite/duplicate IDs.
     node_ids = {}
+    hostname_to_node_id = {}
     defined_nodes = set()
     sw_counter = 0
 
     # Pre-populate IDs for all scanned devices
     for ip, dev in devices.items():
         hostname = dev.get("hostname") or ip
-        node_ids[hostname] = f"sw_{sw_counter}"
+        nid = f"sw_{sw_counter}"
+        node_ids[ip] = nid
+        if hostname not in hostname_to_node_id:
+            hostname_to_node_id[hostname] = nid
         defined_nodes.add(hostname)
         sw_counter += 1
 
@@ -384,7 +389,7 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         model = dev.get("model") or "Unknown"
         is_root = dev.get("stp", {}).get("is_root", False)
 
-        node_id = node_ids[hostname]
+        node_id = node_ids[ip]
         # Node label with Model
         safe_hostname = hostname.replace('"', '\\"')
         safe_model = model.replace('"', '\\"')
@@ -454,11 +459,14 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             node_b = matched_remote or remote_host
 
             # Ensure safe ID exists for node_b
-            if node_b not in node_ids:
-                node_ids[node_b] = f"ext_{len(node_ids)}"
+            if node_b in hostname_to_node_id:
+                node_b_id = hostname_to_node_id[node_b]
+            else:
+                if node_b not in node_ids:
+                    node_ids[node_b] = f"ext_{len(node_ids) + sw_counter}"
+                node_b_id = node_ids[node_b]
 
-            node_a_id = node_ids[hostname]
-            node_b_id = node_ids[node_b]
+            node_a_id = node_ids[ip]
 
             # If external (not a crawled device) and not defined yet, define it
             if node_b not in defined_nodes and node_b not in external_nodes_defined:

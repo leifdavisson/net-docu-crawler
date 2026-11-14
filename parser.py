@@ -603,17 +603,54 @@ def parse_lldp_neighbors_detail(output):
         if not line:
             continue
 
-        local_int_match = re.match(r"^Local\s+Interface:\s*(\S+)", line, re.IGNORECASE)
-        if local_int_match:
-            if current and "local_port" in current:
+        if re.match(r"^-{10,}$", line):
+            if current and (current.get("local_port") or current.get("remote_device") or current.get("remote_mac")):
+                current["device_type"] = classify_device_type(
+                    current.get("platform", ""), current.get("remote_device", "")
+                )
                 neighbors.append(current)
-            current = {
-                "local_port": local_int_match.group(1),
-                "remote_device": "",
-                "remote_port": "",
-                "remote_ip": "",
-                "platform": "",
-            }
+            current = {}
+            continue
+
+        local_int_match = re.match(r"^Local\s+(?:Interface|Intf):\s*(\S+)", line, re.IGNORECASE)
+        if local_int_match:
+            if current and current.get("local_port"):
+                current["device_type"] = classify_device_type(
+                    current.get("platform", ""), current.get("remote_device", "")
+                )
+                neighbors.append(current)
+                current = {}
+            if not current:
+                current = {
+                    "local_port": local_int_match.group(1),
+                    "remote_device": "",
+                    "remote_port": "",
+                    "remote_ip": "",
+                    "remote_mac": "",
+                    "platform": "",
+                }
+            else:
+                current["local_port"] = local_int_match.group(1)
+            continue
+
+        chassis_match = re.match(r"^Chassis\s+id:\s*(\S+)", line, re.IGNORECASE)
+        if chassis_match:
+            if current and (current.get("remote_device") or current.get("remote_mac")):
+                current["device_type"] = classify_device_type(
+                    current.get("platform", ""), current.get("remote_device", "")
+                )
+                neighbors.append(current)
+                current = {}
+            if not current:
+                current = {
+                    "local_port": "",
+                    "remote_device": "",
+                    "remote_port": "",
+                    "remote_ip": "",
+                    "remote_mac": "",
+                    "platform": "",
+                }
+            current["remote_mac"] = chassis_match.group(1)
             continue
 
         if not current:
@@ -624,6 +661,7 @@ def parse_lldp_neighbors_detail(output):
                     "remote_device": xr_dev_match.group(1).split(".")[0],
                     "remote_port": "",
                     "remote_ip": "",
+                    "remote_mac": "",
                     "platform": "",
                 }
             continue

@@ -313,3 +313,17 @@ def test_bom_sizing_and_target_vendor_migration_configs(tmp_path):
     assert "SW-2920-24G,192.168.1.220,HPProCurve,J9727A,switch,2,1,370.0,45.2,1,2,SFP-SX:2" in bom_txt
     assert "set system host-name SW-2920-24G" in junos_txt
     assert "set interfaces 1 unit 0 family ethernet-switching vlan members 10" in junos_txt
+
+
+def test_generate_l2_diagram_colliding_hostnames(tmp_path):
+    """Verify two crawled devices sharing a generic hostname get distinct Mermaid node IDs."""
+    devices = {
+        "10.29.55.12": {"hostname": "Unknown", "model": "SwitchA", "device_type": "switch", "neighbors": []},
+        "10.29.55.14": {"hostname": "Unknown", "model": "SwitchB", "device_type": "switch", "neighbors": []},
+    }
+    l2_path = str(tmp_path / "L2.md")
+    report_generator.generate_l2_diagram(devices, l2_path)
+    with open(l2_path, encoding="utf-8") as f:
+        txt = f.read()
+    assert 'sw_0["Unknown<br/>(SwitchA)"]' in txt
+    assert 'sw_1["Unknown<br/>(SwitchB)"]' in txt
