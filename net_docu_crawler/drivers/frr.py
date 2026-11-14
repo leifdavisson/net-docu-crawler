@@ -36,6 +36,27 @@ class FRRDriver(BaseDriver):
     default_device_type = "router"
     paging_cmd = ""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._frr_available: bool | None = None
+
+    def _has_frr(self, conn) -> bool:
+        """Checks once per session whether FRRouting (vtysh) is installed and responding."""
+        if self._frr_available is not None:
+            return self._frr_available
+        try:
+            raw = conn.send_command("vtysh -c 'show version'")
+            m_ver = re.search(r"FRRouting\s+([^\s\(\)]+)", raw)
+            if m_ver:
+                self._frr_available = True
+                self._frr_version = m_ver.group(1)
+                return True
+        except Exception:
+            pass
+        self._frr_available = False
+        self._frr_version = ""
+        return False
+
     def connect(self):
         device = {
             "device_type": "linux",
@@ -58,6 +79,7 @@ class FRRDriver(BaseDriver):
             "firmware": "FRR",
             "os_type": "frrouting",
             "device_persona": self.device_persona,
+            "device_type": self.default_device_type,
         }
         try:
             h = conn.send_command("hostname -s").strip()
@@ -66,17 +88,84 @@ class FRRDriver(BaseDriver):
         except Exception:
             pass
 
+        if self._has_frr(conn):
+            ver = getattr(self, "_frr_version", "")
+            if ver:
+                info["firmware"] = f"FRR {ver}"
+            return info
+
+        # Safe plain-Linux host fallback when vtysh is not installed/running
+        info["device_persona"] = "host"
+        info["device_type"] = "server"
+        info["os_type"] = "linux"
+        info["model"] = "Linux Host"
+        info["firmware"] = "Linux"
         try:
-            raw = conn.send_command("vtysh -c 'show version'")
-            m_ver = re.search(r"FRRouting\s+([^\s\(\)]+)", raw)
-            if m_ver:
-                info["firmware"] = f"FRR {m_ver.group(1)}"
+            os_rel = conn.send_command("cat /etc/os-release")
+            m_pretty = re.search(r'^PRETTY_NAME="([^"]+)"', os_rel, re.MULTILINE)
+            if m_pretty:
+                pretty = m_pretty.group(1).strip()
+                info["model"] = f"Linux Host ({pretty})"
+                info["firmware"] = pretty
         except Exception:
             pass
 
         return info
 
+    def _get_linux_interfaces(self, conn) -> tuple[list, dict]:
+        """Collects read-only interface and IPv4 details via `ip -j` when vtysh is absent."""
+        l3_interfaces = []
+        interfaces_detail = {}
+        try:
+            link_raw = conn.send_command("ip -j link show")
+            link_data = json.loads(link_raw)
+            for link in link_data:
+                ifname = link.get("ifname", "")
+                if not ifname or ifname == "lo":
+                    continue
+                oper = str(link.get("operstate", "")).lower()
+                status = "up" if oper == "up" else "down"
+                raw_mac = link.get("address", "")
+                mac = oui_lookup.normalize_mac(raw_mac).lower() if raw_mac else ""
+                interfaces_detail[ifname] = {
+                    "ip_address": "",
+                    "status": status,
+                    "mac_address": mac,
+                }
+        except Exception:
+            pass
+
+        try:
+            addr_raw = conn.send_command("ip -j -4 addr show")
+            addr_data = json.loads(addr_raw)
+            for entry in addr_data:
+                ifname = entry.get("ifname", "")
+                if not ifname or ifname == "lo":
+                    continue
+                status = interfaces_detail.get(ifname, {}).get("status", "up")
+                for addr_info in entry.get("addr_info", []):
+                    local = addr_info.get("local", "")
+                    prefix = addr_info.get("prefixlen")
+                    if not local or local.startswith("127."):
+                        continue
+                    cidr = f"{local}/{prefix}" if prefix is not None else local
+                    l3_interfaces.append(
+                        {
+                            "interface": ifname,
+                            "ip_address": cidr,
+                            "status": status,
+                            "protocol": status,
+                        }
+                    )
+                    if ifname in interfaces_detail and not interfaces_detail[ifname]["ip_address"]:
+                        interfaces_detail[ifname]["ip_address"] = cidr
+        except Exception:
+            pass
+        return l3_interfaces, interfaces_detail
+
     def get_interfaces(self, conn) -> tuple[list, dict]:
+        if not self._has_frr(conn):
+            return self._get_linux_interfaces(conn)
         l3_interfaces = []
         interfaces_detail = {}
         try:
@@ -140,6 +229,24 @@ class FRRDriver(BaseDriver):
 
     def get_routing_table(self, conn) -> list[dict]:
         routes = []
+        if not self._has_frr(conn):
+            try:
+                raw = conn.send_command("ip -j route show")
+                data = json.loads(raw)
+                for r in data:
+                    dst = r.get("dst", "")
+                    subnet = "0.0.0.0/0" if dst == "default" else dst
+                    routes.append(
+                        {
+                            "subnet": subnet,
+                            "protocol": r.get("protocol", "kernel"),
+                            "next_hop": r.get("gateway", "connected"),
+                            "interface": r.get("dev", ""),
+                        }
+                    )
+            except Exception:
+                pass
+            return routes
         try:
             raw = conn.send_command("vtysh -c 'show ip route json'")
             data = json.loads(raw)
@@ -186,6 +293,8 @@ class FRRDriver(BaseDriver):
         return arp_entries
 
     def get_running_config(self, conn) -> str:
+        if not self._has_frr(conn):
+            return ""
         try:
             return conn.send_command("vtysh -c 'show running-config'")
         except Exception:

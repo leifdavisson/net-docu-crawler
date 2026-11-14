@@ -251,7 +251,9 @@ def infer_vendor_from_http(fp: dict | None) -> str:
         r"\b(?:fg|fgt)\d+[a-z0-9-]*\b", cert_cn
     ):
         return "fortinet"
-    if any(k in combined for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business")):
+    if any(
+        k in combined for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business", "goahead-webs")
+    ):
         return "ciscosmb"
     if "cisco" in combined:
         return "cisco"
@@ -386,7 +388,9 @@ def get_ssh_banner(ip: str, port: int = 22, timeout: float = 3.0) -> str:
     try:
         s.connect((ip, port))
         raw = s.recv(1024)
-        banner = raw.decode("utf-8", errors="ignore").strip()
+        # Keep only the RFC 4253 SSH identification line; discard trailing binary KEXINIT bytes.
+        raw_line = raw.split(b"\n", 1)[0].split(b"\r", 1)[0]
+        banner = raw_line.decode("utf-8", errors="ignore").strip()
     except Exception:
         pass
     finally:
@@ -508,44 +512,55 @@ def detect_vendor_range(
         elif "mikrotik" in vendor_oui:
             candidate = "mikrotik"
 
-    # Tier 2: Transport Banner inspection (runs when MAC is unknown, across an L3 gateway, or on a VM NIC)
+    # Tier 2: Transport Banner inspection (runs when MAC is unknown, across an L3 gateway,
+    # on a VM NIC, or to refine generic Cisco OUI matches into Cisco Small Business)
     banner = ""
-    if candidate == "unknown":
+    if candidate in ("unknown", "cisco"):
         if transport == "telnet":
             banner = get_telnet_banner(ip, port=port, timeout=timeout)
         else:
             banner = get_ssh_banner(ip, port=port, timeout=timeout)
         banner_lower = banner.lower()
 
-        if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
-            candidate = "hpprocurve"
-        elif any(
+        if any(
             k in banner_lower
-            for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business", "cisco_s300")
-        ):
+            for k in (
+                "sg300",
+                "sg350",
+                "sg500",
+                "cbs250",
+                "cbs350",
+                "cisco small business",
+                "cisco_s300",
+                "openssh_7.3p1.rl",
+            )
+        ) or banner_lower.endswith(".rl"):
             candidate = "ciscosmb"
-        elif "cisco" in banner_lower or "user access verification" in banner_lower:
-            candidate = "cisco"
-        elif "aruba" in banner_lower:
-            candidate = "aruba"
-        elif "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
-            candidate = "fortinet"
-        elif "junos" in banner_lower or "juniper" in banner_lower:
-            candidate = "juniper"
-        elif "panos" in banner_lower or "paloalto" in banner_lower:
-            candidate = "paloalto"
-        elif "rosssh" in banner_lower or "mikrotik" in banner_lower:
-            candidate = "mikrotik"
-        elif "arista" in banner_lower:
-            candidate = "arista"
-        elif "debian" in banner_lower or "ubuntu" in banner_lower:
-            candidate = "frrouting"
-        elif "freebsd" in banner_lower or "opnsense" in banner_lower:
-            candidate = "opnsense"
-        elif "dropbear" in banner_lower or "openwrt" in banner_lower:
-            candidate = "openwrt"
-        elif "crestron" in banner_lower:
-            candidate = "unsupported_appliance"
+        elif candidate == "unknown":
+            if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
+                candidate = "hpprocurve"
+            elif "cisco" in banner_lower or "user access verification" in banner_lower:
+                candidate = "cisco"
+            elif "aruba" in banner_lower:
+                candidate = "aruba"
+            elif "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
+                candidate = "fortinet"
+            elif "junos" in banner_lower or "juniper" in banner_lower:
+                candidate = "juniper"
+            elif "panos" in banner_lower or "paloalto" in banner_lower:
+                candidate = "paloalto"
+            elif "rosssh" in banner_lower or "mikrotik" in banner_lower:
+                candidate = "mikrotik"
+            elif "arista" in banner_lower:
+                candidate = "arista"
+            elif "debian" in banner_lower or "ubuntu" in banner_lower:
+                candidate = "frrouting"
+            elif "freebsd" in banner_lower or "opnsense" in banner_lower:
+                candidate = "opnsense"
+            elif "dropbear" in banner_lower or "openwrt" in banner_lower:
+                candidate = "openwrt"
+            elif "crestron" in banner_lower:
+                candidate = "unsupported_appliance"
 
     return candidate, banner
 

@@ -1314,3 +1314,67 @@ def test_windows_subnet_and_arp_fallbacks():
     ):
         entries = get_arp_table_entries()
         assert entries == {"10.20.30.1": "00:11:22:33:44:55"}
+
+
+def test_frr_driver_plain_linux_server_fallback():
+    """Verify FRRDriver safely collects read-only host facts when vtysh is absent."""
+    from net_docu_crawler.drivers.frr import FRRDriver
+
+    drv = FRRDriver("10.29.55.50", "admin", "pass")
+    mock_conn = MagicMock()
+
+    def _send_cmd(cmd, **kwargs):
+        if cmd == "hostname -s":
+            return "debian-app-01\n"
+        if cmd == "vtysh -c 'show version'":
+            return "bash: vtysh: command not found\n"
+        if cmd == "cat /etc/os-release":
+            return 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\n'
+        if cmd == "ip -j link show":
+            return '[{"ifname": "lo", "operstate": "UNKNOWN", "address": "00:00:00:00:00:00"}, {"ifname": "eth0", "operstate": "UP", "address": "bc:24:11:aa:bb:cc"}]'
+        if cmd == "ip -j -4 addr show":
+            return '[{"ifname": "eth0", "addr_info": [{"local": "10.29.55.50", "prefixlen": 24}]}]'
+        if cmd == "lldpcli show neighbors -f json":
+            return "bash: lldpcli: command not found\n"
+        if cmd == "ip -j route show":
+            return '[{"dst": "default", "gateway": "10.29.55.1", "dev": "eth0", "protocol": "dhcp"}]'
+        if cmd == "ip -j neigh show":
+            return '[{"dst": "10.29.55.1", "lladdr": "b4:b2:e9:4e:7d:31", "dev": "eth0"}]'
+        raise AssertionError(f"Unexpected command on plain Linux host: {cmd}")
+
+    mock_conn.send_command.side_effect = _send_cmd
+    data = drv.crawl(mock_conn)
+    assert data["hostname"] == "debian-app-01"
+    assert data["device_type"] == "server"
+    assert data["device_persona"] == "host"
+    assert "Debian GNU/Linux 13" in data["model"]
+    assert data["l3_interfaces"][0]["ip_address"] == "10.29.55.50/24"
+    assert data["routes"][0]["subnet"] == "0.0.0.0/0"
+    assert data["raw_config"] == ""
+
+
+def test_ssh_banner_strips_kexinit_and_detects_ciscosmb():
+    """Verify get_ssh_banner strips binary KEXINIT bytes and detects OpenSSH_7.3p1.RL / GoAhead-Webs."""
+    from net_docu_crawler.drivers.detector import (
+        detect_vendor_range,
+        get_ssh_banner,
+        infer_vendor_from_http,
+    )
+
+    mock_sock = MagicMock()
+    mock_sock.recv.return_value = b"SSH-2.0-dropbear_2024.86\r\n\x00\x00\x01\xd4\x05\x14\xab\xcdssh-rsa"
+    with patch("net_docu_crawler.drivers.detector.socket.socket", return_value=mock_sock):
+        assert get_ssh_banner("10.29.55.51") == "SSH-2.0-dropbear_2024.86"
+
+    assert (
+        infer_vendor_from_http({"port": 443, "scheme": "https", "server": "GoAhead-Webs", "title": "", "cert_cn": ""})
+        == "ciscosmb"
+    )
+
+    with (
+        patch("net_docu_crawler.drivers.detector.oui_lookup.lookup_oui", return_value="Cisco Systems, Inc"),
+        patch("net_docu_crawler.drivers.detector.get_ssh_banner", return_value="SSH-2.0-OpenSSH_7.3p1.RL"),
+    ):
+        vendor, banner = detect_vendor_range("10.29.0.152", mac="5c:e1:76:a2:b2:1d", transport="ssh")
+        assert vendor == "ciscosmb"
+        assert banner == "SSH-2.0-OpenSSH_7.3p1.RL"
