@@ -108,6 +108,8 @@ class JuniperDriver(BaseDriver):
             if m_model:
                 info["model"] = m_model.group(1)
             m_ver = re.search(r"Junos:\s+(\S+)", raw)
+            if not m_ver:
+                m_ver = re.search(r"JUNOS\s+(?:Base OS boot|Software Release)\s+\[([^\]]+)\]", raw, re.IGNORECASE)
             if m_ver:
                 info["firmware"] = m_ver.group(1)
 
@@ -309,19 +311,40 @@ class JuniperDriver(BaseDriver):
             for b in blocks[1:]:
                 m_port = re.match(r"\s*(\S+)", b)
                 m_sys = re.search(r"System name\s*:\s*(\S+)", b)
+                m_chassis = re.search(r"Chassis\s+(?:id|ID)\s*:\s*(\S+)", b)
                 m_ip = re.search(r"Management address\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", b)
-                m_rem_port = re.search(r"Port id\s*:\s*(\S+)", b)
+                m_rem_port = re.search(r"Port id\s*:\s*(\S+)", b, re.IGNORECASE)
                 m_desc = re.search(r"System description\s*:\s*(.+)", b)
-                if m_port and m_sys:
+                m_caps = re.search(r"System capabilities\s*:\s*(.+)", b)
+                if m_port and (m_sys or m_chassis):
                     local_port = re.sub(r"\.0$", "", m_port.group(1).rstrip(","))
-                    plat = m_desc.group(1).strip()[:60] if m_desc else "JunOS-Discovered"
-                    dev_type = "ap" if any(k in plat.lower() for k in ["ap", "aruba", "access point"]) else "switch"
+                    remote_mac = m_chassis.group(1).strip() if m_chassis else ""
+                    remote_dev = m_sys.group(1) if m_sys else remote_mac
+                    norm_mac = oui_lookup.normalize_mac(remote_mac) if remote_mac else ""
+                    mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
+                    plat = m_desc.group(1).strip()[:60] if m_desc else ""
+                    caps_low = m_caps.group(1).lower() if m_caps else ""
+                    vendor_low = mac_vendor.lower() if mac_vendor != "Unknown" else ""
+
+                    dev_type = "switch"
+                    if (
+                        any(k in plat.lower() for k in ["ap", "aruba", "unifi", "instant", "wlan", "access point"])
+                        or any(k in caps_low for k in ["wlan", "access point"])
+                        or (not plat and any(v in vendor_low for v in ["aruba", "ubiquiti", "ruckus", "meraki"]))
+                    ):
+                        dev_type = "ap"
+                    if not plat and mac_vendor != "Unknown":
+                        plat = f"{mac_vendor} AP" if dev_type == "ap" else mac_vendor
+                    elif not plat:
+                        plat = "JunOS-Discovered"
+
                     neighbors.append(
                         {
                             "local_port": local_port,
-                            "remote_device": m_sys.group(1),
+                            "remote_device": remote_dev,
                             "remote_port": m_rem_port.group(1) if m_rem_port else "Unknown",
                             "remote_ip": m_ip.group(1) if m_ip else "",
+                            "remote_mac": remote_mac,
                             "platform": plat,
                             "remote_platform": plat,
                             "device_type": dev_type,
@@ -351,7 +374,9 @@ class JuniperDriver(BaseDriver):
             low = raw_txt.lower()
             if "stp bridge parameters" in low or "enabled protocol" in low:
                 stp["enabled"] = True
-                if "root" in low and "0:0" in low:
+                m_root = re.search(r"Root ID\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                m_bridge = re.search(r"Bridge ID\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                if "this bridge is the root" in low or (m_root and m_bridge and m_root.group(1) == m_bridge.group(1)):
                     stp["is_root"] = True
         except Exception:
             pass
@@ -378,7 +403,32 @@ class JuniperDriver(BaseDriver):
                     nh_if = nh.get("via", [{}])[0].get("data", "")
                     routes.append({"subnet": dest, "protocol": proto, "next_hop": via, "interface": nh_if})
         except Exception:
-            pass
+            try:
+                raw_txt = conn.send_command("show route table inet.0")
+                cur_dest = ""
+                cur_proto = ""
+                for line in raw_txt.splitlines():
+                    m_dest = re.match(r"^(\d+\.\d+\.\d+\.\d+/\d+)\s+\*?\[([A-Za-z0-9_-]+)/\d+\]", line.strip())
+                    if m_dest:
+                        cur_dest = m_dest.group(1)
+                        cur_proto = m_dest.group(2)
+                        if cur_dest.startswith("128.0.") or cur_dest == "224.0.0.5/32":
+                            cur_dest = ""
+                        continue
+                    if cur_dest:
+                        m_nh = re.search(r"(?:to\s+(\d+\.\d+\.\d+\.\d+)\s+)?via\s+(\S+)", line)
+                        if m_nh:
+                            routes.append(
+                                {
+                                    "subnet": cur_dest,
+                                    "protocol": cur_proto,
+                                    "next_hop": m_nh.group(1) or "Directly Connected",
+                                    "interface": m_nh.group(2),
+                                }
+                            )
+                            cur_dest = ""
+            except Exception:
+                pass
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -404,7 +454,31 @@ class JuniperDriver(BaseDriver):
                         }
                     )
         except Exception:
-            pass
+            try:
+                raw_txt = conn.send_command("show arp no-resolve")
+                for line in raw_txt.splitlines():
+                    parts = line.split()
+                    if (
+                        len(parts) >= 4
+                        and re.match(r"^[0-9a-fA-F:]{17}$", parts[0])
+                        and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[1])
+                    ):
+                        ip_addr = parts[1]
+                        if ip_addr.startswith("128.0."):
+                            continue
+                        norm_mac = oui_lookup.normalize_mac(parts[0]).lower()
+                        arp_entries.append(
+                            {
+                                "ip": ip_addr,
+                                "mac": norm_mac,
+                                "interface": parts[-1],
+                                "age": "1",
+                                "type": "ARPA",
+                                "vendor": oui_lookup.lookup_oui(norm_mac),
+                            }
+                        )
+            except Exception:
+                pass
         return arp_entries
 
     def get_poe(self, conn) -> dict:

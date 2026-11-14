@@ -1486,3 +1486,77 @@ def test_non_network_appliance_classification_and_retry_failed(tmp_path):
         mock_scan.assert_called_once()
         assert mock_scan.call_args[0][0] == ["10.29.55.51"]
         assert (tmp_path / "out" / "failed_hosts.json").exists()
+
+
+def test_juniper_junos9_text_fallbacks():
+    """Verify JuniperDriver falls back cleanly on Junos 9.x where '| display json' is unsupported."""
+    from net_docu_crawler.drivers.juniper import JuniperDriver
+
+    drv = JuniperDriver("10.10.0.10", "netops", "pass")
+    mock_conn = MagicMock()
+
+    def _send_cmd(cmd, **kwargs):
+        if "| display json" in cmd:
+            return "syntax error, expecting <command>.\n"
+        if cmd == "show version":
+            return "Hostname: ex4200-core-01\nModel: ex4200-48p\nJUNOS Base OS boot [9.6R3.8]\n"
+        if cmd == "show chassis hardware":
+            return "Hardware inventory:\nItem             Version  Part number  Serial number     Description\nChassis                                BM0209123456      EX4200-48P\n"
+        if cmd == "show chassis mac-addresses":
+            return "MAC address information:\n  Public base address     00:23:9c:aa:bb:00\n"
+        if cmd == "show interfaces terse":
+            return (
+                "ge-0/0/0                up    up\n"
+                "ge-0/0/0.0              up    up   eth-switch\n"
+                "vlan.10                 up    up   inet     10.10.10.1/24\n"
+                "lo0.0                   up    up   inet     127.0.0.1\n"
+            )
+        if cmd == "show lldp neighbors detail":
+            return (
+                "Local Interface: ge-0/0/1.0\n"
+                "Chassis id: 00:0b:86:11:22:33\n"
+                "Port id: eth0\n"
+                "System capabilities: WLAN Access Point\n"
+                "Management address: 10.10.10.50\n"
+            )
+        if cmd == "show spanning-tree bridge":
+            return "STP bridge parameters\nEnabled protocol: RSTP\nRoot ID: 32768.00:23:9c:aa:bb:00\nBridge ID: 32768.00:23:9c:aa:bb:00\n"
+        if cmd == "show route table inet.0":
+            return (
+                "0.0.0.0/0          *[Static/5] 10w0d 00:00:00\n"
+                "                    > to 10.10.10.254 via vlan.10\n"
+                "10.10.10.0/24      *[Direct/0] 10w0d 00:00:00\n"
+                "                    > via vlan.10\n"
+            )
+        if cmd == "show arp no-resolve":
+            return "00:0b:86:11:22:33 10.10.10.50     10.10.10.50               vlan.10              none\n"
+        if cmd == "show poe controller":
+            return "Controller  Maximum power  Power consumed  Available power\n0           400.0W         15.4W           384.6W\n"
+        if cmd == "show poe interface":
+            return "ge-0/0/1    Enabled   ON     15.4W    Class3\n"
+        if cmd == "show ethernet-switching table":
+            return "default           00:0b:86:11:22:33  Learn          0 ge-0/0/1.0\n"
+        if cmd == "show interfaces diagnostics optics":
+            return ""
+        if cmd == "show configuration | display set":
+            return "set system host-name ex4200-core-01\nset system name-server 10.10.10.2\n"
+        return ""
+
+    mock_conn.send_command.side_effect = _send_cmd
+    data = drv.crawl(mock_conn)
+    assert data["hostname"] == "ex4200-core-01"
+    assert data["model"] == "ex4200-48p"
+    assert data["firmware"] == "9.6R3.8"
+    assert data["serial"] == "BM0209123456"
+    assert data["mac_address"] == "00:23:9c:aa:bb:00"
+    assert data["l3_interfaces"][0]["ip_address"] == "10.10.10.1/24"
+    assert data["stp"]["enabled"] is True
+    assert data["stp"]["is_root"] is True
+    assert data["neighbors"][0]["local_port"] == "ge-0/0/1"
+    assert data["neighbors"][0]["remote_ip"] == "10.10.10.50"
+    assert len(data["routes"]) == 2
+    assert data["routes"][0]["subnet"] == "0.0.0.0/0"
+    assert data["routes"][0]["next_hop"] == "10.10.10.254"
+    assert data["arp_table"][0]["ip"] == "10.10.10.50"
+    assert data["poe"]["used_power_watts"] == 15.4
+    assert data["services"]["dns_servers"] == ["10.10.10.2"]

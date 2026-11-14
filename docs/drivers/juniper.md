@@ -58,7 +58,21 @@ To resolve this without manual operator intervention:
 2. The [`DeviceRegistry`](../../net_docu_crawler/topology_resolver.py) cross-references this MAC address against the harvested **Global ARP Cache** collected from the core router or firewall.
 3. Once matched, the neighbor's IPv4 management address is automatically populated, allowing the crawler to continue its Breadth-First Search (BFS) graph traversal.
 
-## 4. Minimum Read-Only JunOS User Class
+## 4. Legacy Junos 9.x–13.x Compatibility Notes
+
+Junos releases prior to **14.2** (including **Junos 9.x** on EX3200/EX4200/EX2200) do not support `| display json`. [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) automatically falls back to standard CLI text parsing for:
+- `show version` (matches both `Junos: <ver>` and `JUNOS Base OS boot [<ver>]`)
+- `show chassis hardware` & `show chassis mac-addresses`
+- `show interfaces terse` (including legacy `vlan.X` SVIs prior to ELS `irb.X`)
+- `show lldp neighbors detail` (including APs without `System name`, resolved via `Chassis id` + [`oui_lookup.py`](../../oui_lookup.py))
+- `show spanning-tree bridge` (`Root ID` vs `Bridge ID` comparison)
+- `show route table inet.0` and `show arp no-resolve`
+- `show poe controller`, `show poe interface`, `show ethernet-switching table`, and `show configuration | display set`
+
+> [!TIP]
+> Avoid using the `root` account for automated crawls on Junos 9.x—`root` drops into the FreeBSD `csh` shell (`root@switch%`) rather than the operational `>` CLI. Use a dedicated read-only user class as shown below.
+
+## 5. Minimum Read-Only JunOS User Class
 
 ```junos
 set system login class read-only-auditor permissions [ view view-configuration ]
