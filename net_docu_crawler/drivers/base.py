@@ -280,7 +280,11 @@ class BaseDriver(ABC):
         or ciphers (e.g. IncompatiblePeer: no acceptable kex algorithm / host key),
         it automatically retries with legacy algorithms enabled.
         """
+        import logging
+
         from netmiko import ConnectHandler
+
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
         try:
             return ConnectHandler(**device_params)
@@ -289,6 +293,7 @@ class BaseDriver(ABC):
             is_compat_err = (
                 "incompatible" in err_msg
                 or "no acceptable kex" in err_msg
+                or "no acceptable host key" in err_msg
                 or "no matching host key" in err_msg
                 or "no acceptable ciphers" in err_msg
                 or "no acceptable macs" in err_msg
@@ -297,7 +302,7 @@ class BaseDriver(ABC):
             if is_compat_err:
                 fallback_params = dict(device_params)
                 fallback_params["disabled_algorithms"] = dict()
-                fallback_params["disable_sha2_fix"] = False
+                fallback_params["disable_sha2_fix"] = True
                 fallback_params["ssh_strict"] = False
                 return ConnectHandler(**fallback_params)
             raise

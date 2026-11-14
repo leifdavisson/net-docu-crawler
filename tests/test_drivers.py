@@ -654,8 +654,44 @@ def test_safe_netmiko_connect_fallback():
         # Verify fallback params were passed
         fallback_call_args = mock_connect.call_args[1]
         assert fallback_call_args["disabled_algorithms"] == {}
-        assert fallback_call_args["disable_sha2_fix"] is False
+        assert fallback_call_args["disable_sha2_fix"] is True
         assert fallback_call_args["ssh_strict"] is False
+
+
+def test_crawl_target_stops_retrying_ssh_drivers_on_transport_error():
+    from net_docu_crawler.crawler import crawl_target_with_ports
+
+    def _make_mock_driver(name):
+        cls = MagicMock()
+        cls.__name__ = name
+        inst = MagicMock()
+        inst.connect.side_effect = Exception("Incompatible ssh peer (no acceptable host key)")
+        cls.return_value = inst
+        return cls, inst
+
+    cisco_cls, cisco_inst = _make_mock_driver("CiscoDriver")
+    arista_cls, arista_inst = _make_mock_driver("AristaDriver")
+    juniper_cls, juniper_inst = _make_mock_driver("JuniperDriver")
+    fortinet_cls, fortinet_inst = _make_mock_driver("FortinetDriver")
+
+    with (
+        patch("net_docu_crawler.crawler.detect_vendor_range", return_value=("unknown", "")),
+        patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value=""),
+        patch("net_docu_crawler.crawler.CiscoDriver", cisco_cls),
+        patch("net_docu_crawler.crawler.AristaDriver", arista_cls),
+        patch("net_docu_crawler.crawler.JuniperDriver", juniper_cls),
+        patch("net_docu_crawler.crawler.FortinetDriver", fortinet_cls),
+    ):
+        result = crawl_target_with_ports(
+            ip="10.29.0.152",
+            credentials=[{"username": "admin", "password": "pw"}],
+            open_ports=[(22, "ssh")],
+        )
+        assert result["status"] == "unsupported"
+        assert cisco_inst.connect.call_count == 1
+        assert arista_inst.connect.call_count == 0
+        assert juniper_inst.connect.call_count == 0
+        assert fortinet_inst.connect.call_count == 0
 
 
 def test_all_10_drivers_session_log_and_interface():

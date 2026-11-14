@@ -467,7 +467,10 @@ def crawl_target_with_ports(
                 key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
             )
 
+        transport_failed = False
         for driver_cls in driver_classes:
+            if transport_failed:
+                break
             for cred in sorted_creds:
                 user = cred.get("username", "")
                 pwd = cred.get("password", "")
@@ -512,6 +515,19 @@ def crawl_target_with_ports(
                     ):
                         saw_auth_failure = True
                         continue
+                    if any(
+                        k in err_msg
+                        for k in (
+                            "incompatible",
+                            "no acceptable host key",
+                            "no acceptable kex",
+                            "error reading ssh protocol banner",
+                            "connection refused",
+                            "timed out",
+                            "tcp connection to device failed",
+                        )
+                    ):
+                        transport_failed = True
                     break
 
     status = "unauthenticated" if (last_vendor in VENDOR_DRIVER_MAP and saw_auth_failure) else "unsupported"
