@@ -901,11 +901,12 @@ def test_base_driver_connect_netmiko_custom_port_and_telnet():
         assert mock_connect.call_args[1]["port"] == 2323
         assert mock_connect.call_args[1]["device_type"] == "hp_procurve_telnet"
 
-        # Fallback to generic_telnet when *_telnet is not in Netmiko CLASS_MAPPER
-        drv_gen = MikroTikDriver(ip="10.0.0.2", username="admin", password="pw", port=23, transport="telnet")
-        drv_gen.connect_netmiko({"device_type": "mikrotik_routeros", "ip": "10.0.0.2"})
-        assert mock_connect.call_args[1]["port"] == 23
-        assert mock_connect.call_args[1]["device_type"] == "generic_telnet"
+        # Reject Telnet when *_telnet is not in Netmiko CLASS_MAPPER (never silently fall back to generic_telnet)
+        import pytest
+
+        drv_fg = FortinetDriver(ip="10.0.0.2", username="admin", password="pw", port=23, transport="telnet")
+        with pytest.raises(ValueError, match="Telnet transport is not supported"):
+            drv_fg.connect_netmiko({"device_type": "fortinet", "ip": "10.0.0.2"})
 
 
 def test_crawler_parse_target_specs_and_partial_inventory():

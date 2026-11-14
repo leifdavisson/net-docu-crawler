@@ -320,7 +320,9 @@ class BaseDriver(ABC):
         if self.transport == "telnet":
             base_type = params.get("device_type", "")
             telnet_type = f"{base_type}_telnet"
-            params["device_type"] = telnet_type if telnet_type in CLASS_MAPPER else "generic_telnet"
+            if telnet_type not in CLASS_MAPPER:
+                raise ValueError(f"Telnet transport is not supported by {self.__class__.__name__} ({base_type})")
+            params["device_type"] = telnet_type
         return self.safe_netmiko_connect(params)
 
     @abstractmethod

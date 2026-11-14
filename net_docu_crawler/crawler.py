@@ -639,6 +639,8 @@ def crawl_target_with_ports(
         for driver_cls in driver_classes:
             if transport_failed:
                 break
+            if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
+                continue
             driver_creds = sorted_creds
             if vendor_cand == "unknown" and not try_all_creds:
                 drv_vendor = _driver_vendor_map.get(driver_cls, "")

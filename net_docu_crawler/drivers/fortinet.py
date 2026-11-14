@@ -35,6 +35,7 @@ class FortinetDriver(BaseDriver):
     vendor_name = "Fortinet"
     device_persona = "firewall"
     default_device_type = "firewall"
+    supports_telnet = False
     paging_cmd = "config system console\nset output standard\nend"
 
     def connect(self):
