@@ -197,6 +197,121 @@ def load_credentials(path: str = "credentials.json") -> list[dict]:
         return json.load(f)
 
 
+def validate_credentials(entries: object, source: str = "credentials.json") -> tuple[list[dict], list[str], list[str]]:
+    """
+    Validates parsed credential profiles and removes exact duplicates.
+    Returns (valid_entries, warnings, errors).
+    """
+    warnings: list[str] = []
+    errors: list[str] = []
+    valid_entries: list[dict] = []
+
+    if not isinstance(entries, list):
+        errors.append(f"{source}: top-level JSON must be a list of credential objects, got {type(entries).__name__}.")
+        return valid_entries, warnings, errors
+
+    seen: dict[tuple[str, str, str, str], str] = {}
+    for idx, item in enumerate(entries):
+        label = f"{source}[{idx}]"
+        if not isinstance(item, dict):
+            errors.append(f"{label}: expected JSON object, got {type(item).__name__}.")
+            continue
+
+        name = item.get("name", label)
+        if not isinstance(name, str) or not name.strip():
+            name = label
+
+        username = item.get("username")
+        if not isinstance(username, str) or not username.strip():
+            errors.append(f"{name}: missing or empty 'username' string.")
+            continue
+
+        password = item.get("password", "")
+        if not isinstance(password, str):
+            errors.append(f"{name}: 'password' must be a string, got {type(password).__name__}.")
+            continue
+
+        secret = item.get("secret", "")
+        if secret is None:
+            secret = ""
+        if not isinstance(secret, str):
+            errors.append(f"{name}: 'secret' must be a string, got {type(secret).__name__}.")
+            continue
+
+        vendor = item.get("vendor", "")
+        if vendor is None:
+            vendor = ""
+        if not isinstance(vendor, str):
+            errors.append(f"{name}: 'vendor' must be a string, got {type(vendor).__name__}.")
+            continue
+        vendor_norm = vendor.strip().lower()
+        if vendor_norm and vendor_norm not in VENDOR_DRIVER_MAP:
+            warnings.append(
+                f"{name}: unknown vendor tag '{vendor}' (not in VENDOR_DRIVER_MAP; will not get vendor-priority sorting)."
+            )
+
+        dedup_key = (vendor_norm, username, password, secret)
+        if dedup_key in seen:
+            warnings.append(
+                f"{name}: duplicate of '{seen[dedup_key]}' (vendor={vendor_norm or 'any'}, username={username!r}) — skipping."
+            )
+            continue
+        seen[dedup_key] = name
+
+        normalized = dict(item)
+        normalized["username"] = username
+        normalized["password"] = password
+        if "secret" in item or secret:
+            normalized["secret"] = secret
+        if vendor_norm:
+            normalized["vendor"] = vendor_norm
+        valid_entries.append(normalized)
+
+    return valid_entries, warnings, errors
+
+
+def load_and_validate_credentials(
+    credentials_path: str | list[str] | tuple[str, ...] = "credentials.json",
+) -> tuple[list[dict], list[str], list[str]]:
+    """
+    Loads and validates one or more credential JSON files before a crawl starts.
+    Returns (valid_entries, warnings, errors).
+    """
+    paths = list(credentials_path) if isinstance(credentials_path, (list, tuple)) else [credentials_path]
+    all_raw: list[dict] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    for path in paths:
+        if not os.path.exists(path):
+            errors.append(f"Credential file not found: {path}")
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            errors.append(f"Invalid JSON in {path} (line {e.lineno}, col {e.colno}): {e.msg}")
+            continue
+        except OSError as e:
+            errors.append(f"Failed to read {path}: {e}")
+            continue
+
+        valid, w, err = validate_credentials(data, source=path)
+        all_raw.extend(valid)
+        warnings.extend(w)
+        errors.extend(err)
+
+    # Cross-file deduplication if multiple credential files were supplied
+    if len(paths) > 1 and all_raw:
+        all_raw, w_cross, _ = validate_credentials(all_raw, source="merged_credentials")
+        warnings.extend(w_cross)
+
+    if not all_raw and not errors:
+        errors.append("No valid credential profiles found.")
+
+    return all_raw, warnings, errors
+
+
 def _log_event(log_path: str, msg: str):
     if not log_path:
         return
@@ -647,6 +762,16 @@ def crawl_network(
     save_baseline: str = "",
     compare_baseline: str = "",
 ) -> list[dict]:
+    credentials, cred_warnings, cred_errors = load_and_validate_credentials(credentials_path)
+    for w in cred_warnings:
+        print(f"[!] Credential warning: {w}")
+    for err in cred_errors:
+        print(f"[-] Credential error: {err}")
+    if cred_errors:
+        raise ValueError(
+            f"Credential validation failed ({len(cred_errors)} error(s)). Fix {credentials_path} and retry."
+        )
+
     # Determine output destination (structured run folder vs legacy flat folder)
     if organize:
         base = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else "deliverables"
@@ -664,14 +789,10 @@ def crawl_network(
     os.makedirs(logs_dir, exist_ok=True)
     crawler_log = os.path.join(logs_dir, "crawler_execution.log")
 
-    if isinstance(credentials_path, (list, tuple)):
-        credentials = []
-        for cred_file in credentials_path:
-            credentials.extend(load_credentials(cred_file))
-    else:
-        credentials = load_credentials(credentials_path)
-    print(f"[+] Loaded {len(credentials)} credential profiles from {credentials_path}")
-    _log_event(crawler_log, f"Loaded {len(credentials)} credential profiles from {credentials_path}")
+    print(f"[+] Validated and loaded {len(credentials)} credential profile(s) from {credentials_path}")
+    _log_event(crawler_log, f"Validated and loaded {len(credentials)} credential profile(s) from {credentials_path}")
+    for w in cred_warnings:
+        _log_event(crawler_log, f"Credential warning: {w}")
 
     # Expand any CIDR subnets and ip:port targets
     expanded_targets, explicit_ports = parse_target_specs(targets, ssh_ports=ssh_ports, telnet_ports=telnet_ports)
@@ -1136,32 +1257,51 @@ def main():
         default="",
         help="Compare current crawl against a saved baseline JSON and generate migration_verification_report.md",
     )
+    parser.add_argument(
+        "--validate-credentials",
+        action="store_true",
+        help="Validate --credentials JSON file(s) and exit without running a crawl",
+    )
 
     args = parser.parse_args()
 
+    if args.validate_credentials:
+        creds, warnings, errors = load_and_validate_credentials(args.credentials)
+        for w in warnings:
+            print(f"[!] Credential warning: {w}")
+        for err in errors:
+            print(f"[-] Credential error: {err}")
+        if errors:
+            sys.exit(1)
+        print(f"[+] Validated {len(creds)} credential profile(s) from {args.credentials}")
+        return
+
     t_start = time.time()
-    crawl_network(
-        targets=args.targets,
-        credentials_path=args.credentials,
-        output_dir=args.output_dir,
-        organize=not args.no_organize,
-        domain=args.domain,
-        sanitize_passwords=args.sanitize_passwords,
-        timeout=args.timeout,
-        ssh_ports=args.ssh_ports,
-        telnet_ports=args.telnet_ports,
-        max_workers=args.workers,
-        http_fingerprint=not args.no_http_fingerprint,
-        snmp=args.snmp,
-        snmp_community=args.snmp_community,
-        follow_subnets=args.follow_subnets,
-        max_hops=args.max_hops,
-        allow_cgnat=args.allow_cgnat,
-        allow_public_subnets=args.allow_public_subnets,
-        target_vendor=args.target_vendor,
-        save_baseline=args.save_baseline,
-        compare_baseline=args.compare_baseline,
-    )
+    try:
+        crawl_network(
+            targets=args.targets,
+            credentials_path=args.credentials,
+            output_dir=args.output_dir,
+            organize=not args.no_organize,
+            domain=args.domain,
+            sanitize_passwords=args.sanitize_passwords,
+            timeout=args.timeout,
+            ssh_ports=args.ssh_ports,
+            telnet_ports=args.telnet_ports,
+            max_workers=args.workers,
+            http_fingerprint=not args.no_http_fingerprint,
+            snmp=args.snmp,
+            snmp_community=args.snmp_community,
+            follow_subnets=args.follow_subnets,
+            max_hops=args.max_hops,
+            allow_cgnat=args.allow_cgnat,
+            allow_public_subnets=args.allow_public_subnets,
+            target_vendor=args.target_vendor,
+            save_baseline=args.save_baseline,
+            compare_baseline=args.compare_baseline,
+        )
+    except ValueError:
+        sys.exit(1)
     print(f"\n[+] Total crawl and documentation runtime: {time.time() - t_start:.2f} seconds")
 
 

@@ -694,6 +694,33 @@ def test_crawl_target_stops_retrying_ssh_drivers_on_transport_error():
         assert fortinet_inst.connect.call_count == 0
 
 
+def test_validate_credentials_dedups_and_flags_errors(tmp_path):
+    from net_docu_crawler.crawler import load_and_validate_credentials, validate_credentials
+
+    entries = [
+        {"name": "C1", "vendor": "cisco", "username": "admin", "password": "pw1", "secret": "pw1"},
+        {"name": "C1-Dup", "vendor": "cisco", "username": "admin", "password": "pw1", "secret": "pw1"},
+        {"name": "BadVendor", "vendor": "unknown_os", "username": "admin", "password": "pw2"},
+        {"name": "NoUser", "vendor": "cisco", "username": "", "password": "pw3"},
+        {"name": "IntPass", "vendor": "cisco", "username": "admin", "password": 1234},
+    ]
+    valid, warnings, errors = validate_credentials(entries, source="test.json")
+    assert len(valid) == 2
+    assert any("duplicate of 'C1'" in w for w in warnings)
+    assert any("unknown vendor tag 'unknown_os'" in w for w in warnings)
+    assert len(errors) == 2
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text('[{"username": "admin",]', encoding="utf-8")
+    v_bad, _, err_bad = load_and_validate_credentials(str(bad_json))
+    assert v_bad == []
+    assert any("Invalid JSON" in e for e in err_bad)
+
+    missing_v, _, err_missing = load_and_validate_credentials(str(tmp_path / "missing.json"))
+    assert missing_v == []
+    assert any("not found" in e for e in err_missing)
+
+
 def test_all_10_drivers_session_log_and_interface():
     drivers = [
         CiscoDriver(ip="10.0.0.1", session_log="/tmp/test.log"),
