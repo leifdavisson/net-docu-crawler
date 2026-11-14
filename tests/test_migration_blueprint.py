@@ -39,7 +39,7 @@ def test_compute_organized_output_dir():
 
     p2p_path = compute_organized_output_dir(targets=["10.10.1.0/30"], domain="dmz")
     posix_p2p = p2p_path.replace("\\", "/")
-    assert "10.10.1.0-30_" in posix_p2p
+    assert posix_p2p.startswith("deliverables/10.10.1.0-30_")
     assert p2p_path.endswith("_dmz")
 
 

@@ -601,12 +601,12 @@ def extract_followable_subnets(
 
 def compute_organized_output_dir(
     targets: list[str],
-    base_dir: str = "docs/reports",
+    base_dir: str = "deliverables",
     domain: str = "lan",
 ) -> str:
     """
     Computes a structured directory path: <base_dir>/<Subnet>_<TimeStamp>_<domain>/
-    Example: docs/reports/192.168.1.0-24_20261107_221530_lan
+    Example: deliverables/192.168.1.0-24_20261107_221530_lan
     """
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     scope_slug = "multi_target"
@@ -629,7 +629,7 @@ def crawl_network(
     targets: list[str],
     credentials_path: str | list[str] = "credentials.json",
     output_dir: str = "",
-    organize: bool = False,
+    organize: bool = True,
     domain: str = "lan",
     sanitize_passwords: bool = False,
     timeout: int = 8,
@@ -649,12 +649,12 @@ def crawl_network(
 ) -> list[dict]:
     # Determine output destination (structured run folder vs legacy flat folder)
     if organize:
-        base = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else "docs/reports"
+        base = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else "deliverables"
         run_output_dir = compute_organized_output_dir(targets, base_dir=base, domain=domain)
         is_organized = True
     elif not output_dir or output_dir == "auto":
-        run_output_dir = compute_organized_output_dir(targets, domain=domain)
-        is_organized = True
+        run_output_dir = "docs/net_docu_crawler"
+        is_organized = False
     else:
         run_output_dir = output_dir
         is_organized = False
@@ -968,27 +968,44 @@ def crawl_network(
         print(f"[+] Generated post-cutover verification diff report: {ver_path}")
 
     # If organized run folder was created, update latest pointer and maintain legacy path compatibility
-    if is_organized and run_output_dir.startswith("docs/reports"):
+    if is_organized:
         latest_link = os.path.join(os.path.dirname(run_output_dir), "latest")
         try:
-            if os.path.islink(latest_link) or os.path.exists(latest_link):
-                if os.path.islink(latest_link):
-                    os.unlink(latest_link)
-                elif os.path.isdir(latest_link):
-                    shutil.rmtree(latest_link)
-                elif os.path.isfile(latest_link):
+            if os.path.islink(latest_link):
+                os.unlink(latest_link)
+            elif os.path.exists(latest_link):
+                if os.path.isdir(latest_link):
+                    try:
+                        # On Windows, os.rmdir removes an NTFS junction without deleting target contents
+                        os.rmdir(latest_link)
+                    except OSError:
+                        shutil.rmtree(latest_link)
+                else:
                     os.remove(latest_link)
-            os.symlink(os.path.basename(run_output_dir), latest_link)
+            os.symlink(os.path.basename(run_output_dir), latest_link, target_is_directory=True)
             print(f"[+] Updated symlink: {latest_link} -> {os.path.basename(run_output_dir)}")
         except OSError:
-            # On Windows without SeCreateSymbolicLinkPrivilege, maintain pointer via latest.txt
-            try:
-                latest_txt = os.path.join(os.path.dirname(run_output_dir), "latest.txt")
-                with open(latest_txt, "w", encoding="utf-8") as f:
-                    f.write(os.path.basename(run_output_dir) + "\n")
-                print(f"[+] Recorded latest run pointer: {latest_txt} -> {os.path.basename(run_output_dir)}")
-            except Exception:
-                pass
+            # On Windows without SeCreateSymbolicLinkPrivilege, try an NTFS junction first, then latest.txt
+            junction_created = False
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", os.path.abspath(latest_link), os.path.abspath(run_output_dir)],
+                        check=True,
+                        capture_output=True,
+                    )
+                    print(f"[+] Updated junction: {latest_link} -> {os.path.basename(run_output_dir)}")
+                    junction_created = True
+                except Exception:
+                    junction_created = False
+            if not junction_created:
+                try:
+                    latest_txt = os.path.join(os.path.dirname(run_output_dir), "latest.txt")
+                    with open(latest_txt, "w", encoding="utf-8") as f:
+                        f.write(os.path.basename(run_output_dir) + "\n")
+                    print(f"[+] Recorded latest run pointer: {latest_txt} -> {os.path.basename(run_output_dir)}")
+                except Exception:
+                    pass
 
         # Mirror deliverables to docs/net_docu_crawler for backward compatibility
         legacy_dir = "docs/net_docu_crawler"
@@ -1025,12 +1042,17 @@ def main():
     parser.add_argument(
         "--output-dir",
         default="docs/net_docu_crawler",
-        help="Output directory for reports (or use --organize for Subnet_TimeStamp_domain)",
+        help="Flat output directory when --no-organize is used, or custom base directory when organized (default base: deliverables/)",
     )
     parser.add_argument(
         "--organize",
         action="store_true",
-        help="Store deliverables in a structured folder: docs/reports/<Subnet>_<TimeStamp>_<domain>/",
+        help="(Default) Store deliverables in a structured folder: deliverables/<Subnet>_<TimeStamp>_<domain>/",
+    )
+    parser.add_argument(
+        "--no-organize",
+        action="store_true",
+        help="Write flat output directly to --output-dir without creating a <Subnet>_<TimeStamp>_<domain> subfolder",
     )
     parser.add_argument(
         "--domain",
@@ -1122,7 +1144,7 @@ def main():
         targets=args.targets,
         credentials_path=args.credentials,
         output_dir=args.output_dir,
-        organize=args.organize,
+        organize=not args.no_organize,
         domain=args.domain,
         sanitize_passwords=args.sanitize_passwords,
         timeout=args.timeout,
