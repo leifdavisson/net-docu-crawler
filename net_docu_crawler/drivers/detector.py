@@ -139,6 +139,25 @@ def get_arp_table_entries() -> dict[str, str]:
                     entries[ip_addr] = mac
         except Exception:
             pass
+    elif sys.platform == "win32":
+        try:
+            out = subprocess.check_output(["arp", "-a"], text=True, timeout=3, errors="ignore")
+            for line in out.splitlines():
+                m = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+\S+", line)
+                if not m:
+                    continue
+                ip_addr, mac = m.group(1), m.group(2).replace("-", ":").lower()
+                if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                    continue
+                try:
+                    ip_obj = ipaddress.IPv4Address(ip_addr)
+                    if ip_obj.is_multicast or ip_obj.is_loopback:
+                        continue
+                except ValueError:
+                    continue
+                entries[ip_addr] = mac
+        except Exception:
+            pass
     return entries
 
 

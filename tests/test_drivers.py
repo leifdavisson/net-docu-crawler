@@ -875,7 +875,10 @@ def test_detect_local_subnets_and_default_ssh_2222():
         "5: virbr0    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0\n"
     )
     mock_proc = MagicMock(returncode=0, stdout=fake_ip_out)
-    with patch("net_docu_crawler.crawler.subprocess.run", return_value=mock_proc):
+    with (
+        patch("net_docu_crawler.crawler.sys.platform", "linux"),
+        patch("net_docu_crawler.crawler.subprocess.run", return_value=mock_proc),
+    ):
         assert detect_local_subnets() == ["192.168.50.0/24"]
 
     # Default scan_host_ports checks [22, 2222] for SSH and [23] for Telnet
@@ -1119,3 +1122,33 @@ def test_ciscosmb_driver_parsing_and_detection():
     assert data["poe"]["used_power_watts"] == 15.4
     assert data["optics"][0]["port"] == "gi27"
     assert data["port_profiles"]["gi1"]["access_vlan"] == "10"
+
+
+def test_windows_subnet_and_arp_fallbacks():
+    from net_docu_crawler.crawler import detect_local_subnets
+    from net_docu_crawler.drivers.detector import get_arp_table_entries
+
+    ipconfig_out = (
+        "Ethernet adapter Ethernet:\n"
+        "   IPv4 Address. . . . . . . . . . . : 10.20.30.15\n"
+        "   Subnet Mask . . . . . . . . . . . : 255.255.255.0\n"
+    )
+    with (
+        patch("net_docu_crawler.crawler.sys.platform", "win32"),
+        patch("net_docu_crawler.crawler.subprocess.run", return_value=MagicMock(returncode=0, stdout=ipconfig_out)),
+    ):
+        assert detect_local_subnets() == ["10.20.30.0/24"]
+
+    arp_out = (
+        "Interface: 10.20.30.15 --- 0x5\n"
+        "  Internet Address      Physical Address      Type\n"
+        "  10.20.30.1            00-11-22-33-44-55     dynamic\n"
+        "  224.0.0.22            01-00-5e-00-00-16     static\n"
+    )
+    with (
+        patch("net_docu_crawler.drivers.detector.os.path.exists", return_value=False),
+        patch("net_docu_crawler.drivers.detector.sys.platform", "win32"),
+        patch("net_docu_crawler.drivers.detector.subprocess.check_output", return_value=arp_out),
+    ):
+        entries = get_arp_table_entries()
+        assert entries == {"10.20.30.1": "00:11:22:33:44:55"}

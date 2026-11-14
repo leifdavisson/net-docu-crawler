@@ -25,8 +25,10 @@ import datetime
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -67,31 +69,50 @@ def detect_local_subnets() -> list[str]:
     """
     subnets: list[str] = []
     try:
-        proc = subprocess.run(
-            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                parts = line.split()
-                if len(parts) < 4 or "inet" not in parts:
-                    continue
-                ifname = parts[1].rstrip(":")
-                if ifname.startswith(_VIRTUAL_IFACE_PREFIXES):
-                    continue
-                inet_idx = parts.index("inet")
-                if inet_idx + 1 >= len(parts):
-                    continue
-                cidr = parts[inet_idx + 1]
-                try:
-                    net = ipaddress.IPv4Interface(cidr).network
-                    if 22 <= net.prefixlen <= 30 and str(net) not in subnets:
-                        subnets.append(str(net))
-                except ValueError:
-                    continue
+        if sys.platform == "win32":
+            proc = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=3, check=False)
+            if proc.returncode == 0:
+                cur_ip = ""
+                for line in proc.stdout.splitlines():
+                    m_ip = re.search(r"IPv4 Address[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE)
+                    if m_ip:
+                        cur_ip = m_ip.group(1)
+                        continue
+                    m_mask = re.search(r"Subnet Mask[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE)
+                    if m_mask and cur_ip:
+                        try:
+                            net = ipaddress.IPv4Interface(f"{cur_ip}/{m_mask.group(1)}").network
+                            if 22 <= net.prefixlen <= 30 and not net.is_loopback and str(net) not in subnets:
+                                subnets.append(str(net))
+                        except ValueError:
+                            pass
+                        cur_ip = ""
+        else:
+            proc = subprocess.run(
+                ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) < 4 or "inet" not in parts:
+                        continue
+                    ifname = parts[1].rstrip(":")
+                    if ifname.startswith(_VIRTUAL_IFACE_PREFIXES):
+                        continue
+                    inet_idx = parts.index("inet")
+                    if inet_idx + 1 >= len(parts):
+                        continue
+                    cidr = parts[inet_idx + 1]
+                    try:
+                        net = ipaddress.IPv4Interface(cidr).network
+                        if 22 <= net.prefixlen <= 30 and str(net) not in subnets:
+                            subnets.append(str(net))
+                    except ValueError:
+                        continue
     except Exception:
         pass
     return subnets[:1] if subnets else ["192.168.1.0/24"]
