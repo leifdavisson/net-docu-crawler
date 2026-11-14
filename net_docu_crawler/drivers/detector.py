@@ -235,6 +235,43 @@ def probe_http_fingerprint(
     return None
 
 
+def infer_vendor_from_http(fp: dict | None) -> str:
+    """
+    Infers a network OS vendor key from a `probe_http_fingerprint()` result
+    (title, server header, or TLS certificate Common Name).
+    """
+    if not fp:
+        return "unknown"
+    title = str(fp.get("title", "")).lower()
+    server = str(fp.get("server", "")).lower()
+    cert_cn = str(fp.get("cert_cn", "")).lower()
+    combined = f"{title} {server} {cert_cn}"
+
+    if any(k in combined for k in ("fortinet", "fortigate", "fortios")) or re.search(
+        r"\b(?:fg|fgt)\d+[a-z0-9-]*\b", cert_cn
+    ):
+        return "fortinet"
+    if any(k in combined for k in ("sg300", "sg350", "sg500", "cbs250", "cbs350", "cisco small business")):
+        return "ciscosmb"
+    if "cisco" in combined:
+        return "cisco"
+    if any(k in combined for k in ("procurve", "hewlett-packard", "hp switch")):
+        return "hpprocurve"
+    if "aruba" in combined:
+        return "aruba"
+    if "opnsense" in combined:
+        return "opnsense"
+    if "openwrt" in combined or "luci" in combined:
+        return "openwrt"
+    if "mikrotik" in combined or "routeros" in combined:
+        return "mikrotik"
+    if "juniper" in combined or "junos" in combined:
+        return "juniper"
+    if "palo alto" in combined or "pan-os" in combined:
+        return "paloalto"
+    return "unknown"
+
+
 def _ber_len(length: int) -> bytes:
     if length < 0x80:
         return bytes([length])
@@ -507,6 +544,8 @@ def detect_vendor_range(
             candidate = "opnsense"
         elif "dropbear" in banner_lower or "openwrt" in banner_lower:
             candidate = "openwrt"
+        elif "crestron" in banner_lower:
+            candidate = "unsupported_appliance"
 
     return candidate, banner
 

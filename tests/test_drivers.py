@@ -721,6 +721,68 @@ def test_validate_credentials_dedups_and_flags_errors(tmp_path):
     assert any("not found" in e for e in err_missing)
 
 
+def test_infer_vendor_from_http_and_crestron_skip():
+    from net_docu_crawler.crawler import crawl_target_with_ports
+    from net_docu_crawler.drivers.detector import detect_vendor_range, infer_vendor_from_http
+
+    assert infer_vendor_from_http({"title": "FortiGate", "server": "xxxxxxxx", "cert_cn": ""}) == "fortinet"
+    assert infer_vendor_from_http({"title": "", "server": "", "cert_cn": "FGT60FTK21000001"}) == "fortinet"
+    assert infer_vendor_from_http({"title": "Cisco Small Business SG350", "server": "", "cert_cn": ""}) == "ciscosmb"
+
+    with patch("net_docu_crawler.drivers.detector.get_ssh_banner", return_value="SSH-2.0-CrestronSSH"):
+        cand, _ = detect_vendor_range("10.29.0.131", mac="")
+        assert cand == "unsupported_appliance"
+
+    cisco_cls = MagicMock()
+    with (
+        patch(
+            "net_docu_crawler.crawler.detect_vendor_range",
+            return_value=("unsupported_appliance", "SSH-2.0-CrestronSSH"),
+        ),
+        patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value=""),
+        patch("net_docu_crawler.crawler.CiscoDriver", cisco_cls),
+    ):
+        res = crawl_target_with_ports(
+            ip="10.29.0.131",
+            credentials=[{"username": "admin", "password": "pw"}],
+            open_ports=[(22, "ssh")],
+        )
+        assert res["status"] == "unsupported"
+        assert cisco_cls.call_count == 0
+
+
+def test_vendor_hint_and_http_fallback_avoid_cisco_on_fortigate():
+    from net_docu_crawler.crawler import crawl_target_with_ports
+
+    cisco_cls = MagicMock()
+    fg_cls = MagicMock()
+    fg_cls.__name__ = "FortinetDriver"
+    fg_inst = MagicMock()
+    fg_inst.connect.return_value = MagicMock()
+    fg_inst.crawl.return_value = {"hostname": "FG-01", "ip": "10.29.0.1", "device_type": "firewall"}
+    fg_cls.return_value = fg_inst
+
+    with (
+        patch("net_docu_crawler.crawler.detect_vendor_range", return_value=("unknown", "SSH-2.0-8cCW9hKGiHPMf")),
+        patch("net_docu_crawler.crawler.get_mac_from_system_arp", return_value=""),
+        patch(
+            "net_docu_crawler.crawler.probe_http_fingerprint",
+            return_value={"title": "FortiGate", "server": "xxxxxxxx", "cert_cn": "FGT60FTK0001"},
+        ),
+        patch("net_docu_crawler.crawler.CiscoDriver", cisco_cls),
+        patch.dict("net_docu_crawler.crawler.VENDOR_DRIVER_MAP", {"fortinet": fg_cls}),
+    ):
+        res = crawl_target_with_ports(
+            ip="10.29.0.1",
+            credentials=[{"username": "admin", "password": "pw", "vendor": "fortinet"}],
+            open_ports=[(22, "ssh")],
+            http_fingerprint=True,
+        )
+        assert res["hostname"] == "FG-01"
+        assert cisco_cls.call_count == 0
+        assert fg_inst.connect.call_count == 1
+
+
 def test_all_10_drivers_session_log_and_interface():
     drivers = [
         CiscoDriver(ip="10.0.0.1", session_log="/tmp/test.log"),

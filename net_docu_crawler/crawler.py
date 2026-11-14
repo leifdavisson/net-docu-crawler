@@ -53,6 +53,7 @@ from net_docu_crawler.drivers.detector import (
     detect_vendor_range,
     get_arp_table_entries,
     get_mac_from_system_arp,
+    infer_vendor_from_http,
     probe_http_fingerprint,
     probe_snmp_sysinfo,
     scan_subnet_ports,
@@ -522,6 +523,8 @@ def crawl_target_with_ports(
     log_file: str = "",
     open_ports: list[tuple[int, str]] | None = None,
     mac: str = "",
+    http_fingerprint: bool = True,
+    vendor_hint: str = "",
 ) -> dict | None:
     """
     Probe a target across its discovered open `(port, transport)` pairs.
@@ -532,6 +535,7 @@ def crawl_target_with_ports(
     # Try SSH before Telnet
     ports_to_try = sorted(ports_to_try, key=lambda pt: (0 if pt[1] == "ssh" else 1, pt[0]))
     host_mac = mac or get_mac_from_system_arp(ip)
+    hint_norm = vendor_hint.strip().lower()
 
     last_vendor = "unknown"
     last_banner = ""
@@ -546,6 +550,24 @@ def crawl_target_with_ports(
             timeout=min(float(timeout), 3.0),
             transport=transport,
         )
+        if vendor_cand == "unsupported_appliance":
+            last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
+            _log_event(
+                log_file,
+                f"Target {ip}:{port} ({transport}) -> non-network appliance ({banner!r}); skipping SSH/Telnet login.",
+            )
+            break
+        if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
+            vendor_cand = hint_norm
+        elif vendor_cand == "unknown" and http_fingerprint:
+            http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
+            http_vendor = infer_vendor_from_http(http_fp)
+            if http_vendor != "unknown":
+                vendor_cand = http_vendor
+                _log_event(
+                    log_file,
+                    f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand} ({http_fp})",
+                )
         last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
         _log_event(
             log_file,
@@ -759,6 +781,7 @@ def crawl_network(
     allow_cgnat: bool = False,
     allow_public_subnets: bool = False,
     target_vendor: str = "",
+    vendor_hint: str = "",
     save_baseline: str = "",
     compare_baseline: str = "",
 ) -> list[dict]:
@@ -852,6 +875,8 @@ def crawl_network(
                     session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
                     log_file=crawler_log,
                     open_ports=open_ports_map.get(ip),
+                    http_fingerprint=http_fingerprint,
+                    vendor_hint=vendor_hint,
                 ): ip
                 for ip in targets_to_crawl
             }
@@ -1248,6 +1273,11 @@ def main():
         help="Generate staged target-vendor migration CLI configs (cisco, juniper, arista, hpprocurve)",
     )
     parser.add_argument(
+        "--vendor-hint",
+        default="",
+        help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., fortinet, ciscosmb, cisco)",
+    )
+    parser.add_argument(
         "--save-baseline",
         default="",
         help="Save pre-cutover baseline state JSON to the specified path",
@@ -1297,6 +1327,7 @@ def main():
             allow_cgnat=args.allow_cgnat,
             allow_public_subnets=args.allow_public_subnets,
             target_vendor=args.target_vendor,
+            vendor_hint=args.vendor_hint,
             save_baseline=args.save_baseline,
             compare_baseline=args.compare_baseline,
         )
