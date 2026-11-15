@@ -257,7 +257,7 @@ def infer_vendor_from_http(fp: dict | None) -> str:
         return "ciscosmb"
     if "cisco" in combined:
         return "cisco"
-    if any(k in combined for k in ("procurve", "hewlett-packard", "hp switch")):
+    if any(k in combined for k in ("procurve", "hewlett-packard", "hp switch", "ehttp")):
         return "hpprocurve"
     if "aruba" in combined:
         return "aruba"

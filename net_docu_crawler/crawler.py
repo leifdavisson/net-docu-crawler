@@ -595,6 +595,8 @@ def crawl_target_with_ports(
                         f"Target {ip}:{port} ({transport}) -> non-network appliance ({app_class[1]}, ports={app_ports}); skipping SSH/Telnet login.",
                     )
                     break
+        if vendor_cand == "unknown" and last_vendor in VENDOR_DRIVER_MAP:
+            vendor_cand = last_vendor
         last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
         _log_event(
             log_file,

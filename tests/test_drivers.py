@@ -2007,3 +2007,9 @@ def test_hpprocurve_vt100_escape_cleaning():
     assert info["mac_address"] == "aa:bb:cc:dd:ee:ff"
     assert info["model"] == "HP 5412zl"
     assert proxy.find_prompt() == "sw-core-5412#"
+
+
+def test_hpprocurve_ehttp_http_fingerprint():
+    from net_docu_crawler.drivers.detector import infer_vendor_from_http
+
+    assert infer_vendor_from_http({"port": 80, "scheme": "http", "server": "eHTTP v2.0", "title": ""}) == "hpprocurve"
