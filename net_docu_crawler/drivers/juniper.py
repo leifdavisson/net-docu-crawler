@@ -149,6 +149,7 @@ class JuniperDriver(BaseDriver):
         if not info["hostname"]:
             info["hostname"] = conn.find_prompt().split("@")[-1].replace(">", "").replace("#", "").strip()
 
+        self._model = info.get("model", "")
         return info
 
     def get_interfaces(self, conn) -> tuple[list, dict]:
@@ -570,6 +571,9 @@ class JuniperDriver(BaseDriver):
 
     def get_poe(self, conn) -> dict:
         poe = {"total_power_watts": 0.0, "used_power_watts": 0.0, "available_power_watts": 0.0, "ports": {}}
+        model_l = getattr(self, "_model", "").lower()
+        if model_l.startswith(("ex4600", "ex4650", "ex9200", "qfx", "mx", "srx", "ptx", "acx")):
+            return poe
         try:
             raw = conn.send_command("show poe controller | display json")
             data = json.loads(raw)
@@ -598,6 +602,8 @@ class JuniperDriver(BaseDriver):
         except Exception:
             try:
                 raw_txt = conn.send_command("show poe controller")
+                if "syntax error" in raw_txt.lower() or "unknown command" in raw_txt.lower():
+                    return poe
                 m_max = re.search(r"Maximum power\s*:\s*([\d\.]+)W?", raw_txt, re.IGNORECASE)
                 m_con = re.search(r"Power consumed\s*:\s*([\d\.]+)W?", raw_txt, re.IGNORECASE)
                 m_avail = re.search(r"Available power\s*:\s*([\d\.]+)W?", raw_txt, re.IGNORECASE)

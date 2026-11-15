@@ -2173,3 +2173,75 @@ def test_log_replay_junos_at_prompt_and_hpprocurve_vendor():
     assert "show chassis hardware" in conn.commands
     assert _infer_vendor_from_log(junos_log, "Juniper Networks") == "juniper"
     assert _infer_vendor_from_log("DO-Main-BLDG# show system", "HP ProCurve / ArubaOS-S") == "hpprocurve"
+
+
+def test_non_switch_appliance_detection_ports_and_http():
+    from net_docu_crawler.drivers.detector import APPLIANCE_PROBE_PORTS, classify_non_network_appliance
+
+    assert 9100 in APPLIANCE_PROBE_PORTS
+    assert 5000 in APPLIANCE_PROBE_PORTS
+    assert 41795 in APPLIANCE_PROBE_PORTS
+
+    assert classify_non_network_appliance(banner="SSH-2.0-OpenSSH_8.1", open_app_ports=[9100]) == (
+        "printer",
+        "Network Printer",
+    )
+    assert classify_non_network_appliance(banner="SSH-2.0-OpenSSH_8.1", open_app_ports=[41795]) == (
+        "av_control",
+        "Crestron AV Controller",
+    )
+    assert classify_non_network_appliance(
+        banner="SSH-2.0-OpenSSH_8.9", http_fp={"title": "Proxmox Virtual Environment", "server": "pve-api-daemon"}
+    ) == ("server", "Server / Hypervisor / NAS")
+    assert classify_non_network_appliance(
+        banner="SSH-2.0-OpenSSH_8.1", http_fp={"title": "Extron IPL Pro", "server": "Extron"}
+    ) == ("av_control", "AV Controller")
+
+
+def test_juniper_skips_poe_on_non_poe_models_and_syntax_error():
+    import json
+
+    from net_docu_crawler.drivers.juniper import JuniperDriver
+
+    calls = []
+
+    class NonPoeJunosConn:
+        def send_command(self, cmd):
+            calls.append(cmd)
+            if cmd == "show version | display json":
+                return json.dumps(
+                    {
+                        "software-information": [
+                            {
+                                "host-name": [{"data": "CORE-EX4600"}],
+                                "junos-version": [{"data": "17.3R3-S4.2"}],
+                                "product-model": [{"data": "ex4600-40f"}],
+                            }
+                        ]
+                    }
+                )
+            if cmd == "show chassis hardware | display json":
+                return json.dumps({"chassis-inventory": [{"chassis": [{"serial-number": [{"data": "SN123"}]}]}]})
+            return ""
+
+        def find_prompt(self):
+            return "user@CORE-EX4600>"
+
+    drv = JuniperDriver("10.250.6.2")
+    drv.get_version(NonPoeJunosConn())
+    poe = drv.get_poe(NonPoeJunosConn())
+    assert poe["total_power_watts"] == 0.0
+    assert not any("show poe" in c for c in calls)
+
+    # Also verify early stop if model was unknown but `show poe controller` returns syntax error
+    calls_err = []
+
+    class SyntaxErrConn:
+        def send_command(self, cmd):
+            calls_err.append(cmd)
+            return "syntax error, expecting <command>."
+
+    drv2 = JuniperDriver("10.250.6.3")
+    poe2 = drv2.get_poe(SyntaxErrConn())
+    assert poe2["total_power_watts"] == 0.0
+    assert calls_err == ["show poe controller | display json", "show poe controller"]

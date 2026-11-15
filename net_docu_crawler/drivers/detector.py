@@ -275,14 +275,14 @@ def infer_vendor_from_http(fp: dict | None) -> str:
 
 
 # Non-network appliance ports inspired by casting-diag (https://github.com/leifdavisson/casting-diag)
-APPLIANCE_PROBE_PORTS: tuple[int, ...] = (41794, 7236, 7000, 8008, 8000, 554)
+APPLIANCE_PROBE_PORTS: tuple[int, ...] = (41794, 41795, 7236, 7000, 5000, 8008, 8000, 554, 9100)
 
 
 def probe_appliance_ports(ip: str, timeout: float = 0.25) -> list[int]:
     """
-    Lightweight, read-only TCP connect probe for common AV/display/camera appliance ports:
-    41794 (Crestron CIP), 7236 (Miracast/Airtame), 7000 (AirPlay), 8008 (Google Cast),
-    8000 (Newline/Hikvision SDK), 554 (RTSP Camera).
+    Lightweight, read-only TCP connect probe for common AV/display/camera/printer appliance ports:
+    41794/41795 (Crestron CIP/CTP), 7236 (Miracast/Airtame), 7000/5000 (AirPlay),
+    8008 (Google Cast), 8000 (Newline/Hikvision SDK), 554 (RTSP Camera), 9100 (JetDirect Printer).
     """
     open_ports: list[int] = []
     for port in APPLIANCE_PROBE_PORTS:
@@ -315,18 +315,27 @@ def classify_non_network_appliance(
     title_l = str((http_fp or {}).get("title", "")).lower()
     ports = set(open_app_ports or [])
 
-    if "crestron" in banner_l or "crestron" in oui_l or 41794 in ports:
+    if "crestron" in banner_l or "crestron" in oui_l or 41794 in ports or 41795 in ports:
         return ("av_control", "Crestron AV Controller")
+    if any(k in (banner_l + " " + oui_l + " " + server_l + " " + title_l) for k in ("extron", "biamp", "q-sys", "amx")):
+        return ("av_control", "AV Controller")
     if "hikvision" in oui_l or "app-webs" in server_l or ("webs" in server_l and (554 in ports or 8000 in ports)):
         return ("camera", "Hikvision IP Camera")
     if 7236 in ports:
         return ("display", "Miracast / Airtame Display")
-    if 7000 in ports:
+    if 7000 in ports or (5000 in ports and "airplay" in (server_l + " " + title_l)):
         return ("display", "Apple AirPlay Display")
     if 8008 in ports:
         return ("display", "Google Cast Display")
     if 554 in ports:
         return ("camera", "RTSP IP Camera")
+    if 9100 in ports or any(
+        k in (server_l + " " + title_l + " " + oui_l)
+        for k in ("jetdirect", "laserjet", "cups", "epson", "canon", "brother", "xerox", "ricoh", "lexmark", "kyocera")
+    ):
+        return ("printer", "Network Printer")
+    if any(k in (server_l + " " + title_l) for k in ("proxmox", "idrac", "ilo", "synology", "qnap", "esxi", "vmware")):
+        return ("server", "Server / Hypervisor / NAS")
     if "openssh_for_windows" in banner_l:
         return ("server", "Windows Host (OpenSSH)")
     if "axis" in oui_l or "axis" in title_l:
