@@ -19,6 +19,7 @@ Extracts normalized per-port L2 intent, routing peers & FHRP (HSRP/VRRP/CARP),
 DHCP scopes/reservations/relays, and firewall/NAT/VPN summaries from raw configs.
 """
 
+import ipaddress
 import re
 import xml.etree.ElementTree as ET
 
@@ -410,6 +411,125 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                     "pool": "openwrt",
                 }
             )
+
+    # 4. FortiOS config system dhcp server
+    if "config system dhcp server" in raw_config:
+        m_dhcp = re.search(
+            r"(?ms)^config system dhcp server\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)",
+            raw_config,
+        )
+        if m_dhcp:
+            dhcp_body = m_dhcp.group(1)
+            cur_pool: dict | None = None
+            sub_ctx: str | None = None
+            cur_res: dict | None = None
+            depth = 0
+            for raw_line in dhcp_body.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("config "):
+                    depth += 1
+                    if depth == 1 and line == "config ip-range":
+                        sub_ctx = "ip-range"
+                    elif depth == 1 and line == "config reserved-address":
+                        sub_ctx = "reserved-address"
+                    else:
+                        sub_ctx = None
+                    continue
+                if line == "end":
+                    if depth > 0:
+                        depth -= 1
+                    if depth == 0:
+                        sub_ctx = None
+                        cur_res = None
+                    continue
+                m_edit = re.match(r"^edit\s+(\S+)", line)
+                if m_edit:
+                    if depth == 0:
+                        cur_pool = {
+                            "id": m_edit.group(1).strip('"'),
+                            "interface": "",
+                            "netmask": "",
+                            "gateway": "",
+                            "dns": "",
+                            "ranges": [],
+                            "disabled": False,
+                            "reservations": [],
+                        }
+                    elif depth == 1 and sub_ctx == "reserved-address" and cur_pool is not None:
+                        cur_res = {"mac": "", "ip": "", "hostname": "", "action": "reserved"}
+                    continue
+                if line == "next":
+                    if depth == 0 and cur_pool is not None:
+                        if not cur_pool["disabled"]:
+                            rng_str = ", ".join(cur_pool["ranges"])
+                            anchor = cur_pool["gateway"] or (
+                                cur_pool["ranges"][0].split("-")[0] if cur_pool["ranges"] else ""
+                            )
+                            net_str = ""
+                            if anchor and cur_pool["netmask"]:
+                                try:
+                                    net_str = str(
+                                        ipaddress.IPv4Interface(f"{anchor}/{cur_pool['netmask']}").network
+                                    )
+                                except Exception:
+                                    net_str = f"{anchor} {cur_pool['netmask']}"
+                            pool_name = cur_pool["interface"] or f"dhcp-{cur_pool['id']}"
+                            result["pools"].append(
+                                {
+                                    "name": pool_name,
+                                    "network": net_str,
+                                    "range": rng_str,
+                                    "gateway": cur_pool["gateway"],
+                                    "dns": cur_pool["dns"],
+                                }
+                            )
+                            for res in cur_pool["reservations"]:
+                                if res.get("ip") or res.get("mac"):
+                                    result["reservations"].append(
+                                        {
+                                            "mac": res["mac"],
+                                            "ip": res["ip"],
+                                            "hostname": res["hostname"],
+                                            "pool": pool_name,
+                                        }
+                                    )
+                        cur_pool = None
+                    elif depth == 1 and sub_ctx == "reserved-address" and cur_pool is not None and cur_res is not None:
+                        cur_pool["reservations"].append(cur_res)
+                        cur_res = None
+                    continue
+
+                if cur_pool is None:
+                    continue
+                if depth == 0:
+                    if line == "set status disable":
+                        cur_pool["disabled"] = True
+                    elif line.startswith("set interface "):
+                        cur_pool["interface"] = line.split("set interface", 1)[1].strip().strip('"')
+                    elif line.startswith("set netmask "):
+                        cur_pool["netmask"] = line.split("set netmask", 1)[1].strip().strip('"')
+                    elif line.startswith("set default-gateway "):
+                        cur_pool["gateway"] = line.split("set default-gateway", 1)[1].strip().strip('"')
+                    elif line.startswith("set dns-server1 "):
+                        cur_pool["dns"] = line.split("set dns-server1", 1)[1].strip().strip('"')
+                elif depth == 1 and sub_ctx == "ip-range":
+                    if line.startswith("set start-ip "):
+                        cur_pool.setdefault("_start_ip", line.split("set start-ip", 1)[1].strip().strip('"'))
+                        cur_pool["_start_ip"] = line.split("set start-ip", 1)[1].strip().strip('"')
+                    elif line.startswith("set end-ip "):
+                        end_ip = line.split("set end-ip", 1)[1].strip().strip('"')
+                        start_ip = cur_pool.pop("_start_ip", "")
+                        if start_ip or end_ip:
+                            cur_pool["ranges"].append(f"{start_ip}-{end_ip}".strip("-"))
+                elif depth == 1 and sub_ctx == "reserved-address" and cur_res is not None:
+                    if line.startswith("set ip "):
+                        cur_res["ip"] = line.split("set ip", 1)[1].strip().strip('"')
+                    elif line.startswith("set mac "):
+                        cur_res["mac"] = line.split("set mac", 1)[1].strip().strip('"').lower()
+                    elif line.startswith("set description "):
+                        cur_res["hostname"] = line.split("set description", 1)[1].strip().strip('"')
 
     return result
 

@@ -11,6 +11,7 @@ Write-Host "2) Run organized crawl (--follow-subnets --max-hops 2)"
 Write-Host "3) Retry failed hosts (--retry-failed)"
 Write-Host "4) Update repo (git pull)"
 Write-Host "5) Regenerate deliverables from dataset (--from-dataset)"
+Write-Host "6) Re-parse raw session logs (--reparse-logs)"
 Write-Host "q) Quit"
 
 $choice = Read-Host "Select an option"
@@ -37,6 +38,11 @@ switch ($choice) {
         $datasetPath = Read-Host "Path to net_docu_crawler_dataset.json"
         if ([string]::IsNullOrWhiteSpace($datasetPath)) { exit 0 }
         & $Py net_crawler.py --from-dataset $datasetPath
+    }
+    "6" {
+        $runDir = Read-Host "Path to run directory containing logs/"
+        if ([string]::IsNullOrWhiteSpace($runDir)) { exit 0 }
+        & $Py net_crawler.py --reparse-logs $runDir
     }
     default {
         Write-Host "Unknown option: $choice" -ForegroundColor Yellow

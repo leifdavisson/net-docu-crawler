@@ -22,6 +22,7 @@ Supports local broadcast domains and routed L3 subnets across firewalls and gate
 
 import argparse
 import datetime
+import glob
 import ipaddress
 import json
 import os
@@ -1259,6 +1260,60 @@ def _sanitize_session_logs(logs_dir: str):
             pass
 
 
+def enrich_devices_from_dhcp_reservations(raw_devices: list[dict]) -> list[dict]:
+    """
+    Cross-reference discovered/unauthenticated/unsupported hosts against DHCP
+    static reservations extracted from crawled firewalls/routers/switches so
+    APs, WLCs, NVRs, and printers inherit their real reservation hostnames.
+    """
+    by_ip: dict[str, dict] = {}
+    by_mac: dict[str, dict] = {}
+    for dev in raw_devices:
+        if not isinstance(dev, dict):
+            continue
+        dhcp = dev.get("dhcp") or {}
+        for res in dhcp.get("reservations", []):
+            hostname = str(res.get("hostname") or "").strip()
+            if not hostname:
+                continue
+            ip_val = str(res.get("ip") or "").strip()
+            mac_val = oui_lookup.normalize_mac(str(res.get("mac") or "")).lower()
+            info = {"hostname": hostname, "pool": str(res.get("pool") or "").strip()}
+            if ip_val and ip_val not in by_ip:
+                by_ip[ip_val] = info
+            if mac_val and mac_val not in by_mac:
+                by_mac[mac_val] = info
+
+    if not by_ip and not by_mac:
+        return raw_devices
+
+    for dev in raw_devices:
+        if not isinstance(dev, dict):
+            continue
+        status = str(dev.get("status") or "").lower()
+        cur_host = str(dev.get("hostname") or "").strip()
+        ip_val = str(dev.get("ip") or "").strip()
+        mac_val = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower()
+        needs_name = (
+            status in ("discovered", "unauthenticated", "unsupported")
+            or not cur_host
+            or cur_host in ("Unknown", ip_val)
+            or cur_host.startswith("ARP_")
+        )
+        if not needs_name:
+            continue
+        match = by_ip.get(ip_val) or (by_mac.get(mac_val) if mac_val else None)
+        if not match:
+            continue
+        dev["hostname"] = match["hostname"]
+        dev["canonical_hostname"] = match["hostname"]
+        if not dev.get("model") or dev.get("model") in ("Unknown", "N/A"):
+            pool = match.get("pool", "")
+            dev["model"] = f"DHCP Reservation ({pool})" if pool else "DHCP Reservation"
+
+    return raw_devices
+
+
 def render_deliverables_from_dataset(
     raw_devices: list[dict],
     registry: DeviceRegistry | None = None,
@@ -1277,6 +1332,7 @@ def render_deliverables_from_dataset(
     Can be called live after `crawl_network()` or offline via `--from-dataset`.
     """
     os.makedirs(run_output_dir, exist_ok=True)
+    enrich_devices_from_dhcp_reservations(raw_devices)
     if registry is None:
         registry = DeviceRegistry()
         for dev in raw_devices:
@@ -1524,6 +1580,188 @@ def render_from_dataset_file(
     )
 
 
+class LogReplayConnection:
+    """
+    Offline Netmiko-compatible connection adapter that replays recorded CLI
+    command outputs from `<ip>_raw_session.log` files without touching the network.
+    """
+
+    def __init__(self, log_text: str):
+        self.commands: dict[str, str] = {}
+        self.prompt: str = ""
+        self._parse_log(log_text)
+
+    def _parse_log(self, log_text: str) -> None:
+        lines = log_text.splitlines()
+        base_prompt = ""
+        prompt_re = None
+        # Identify the device prompt prefix from the first prompt+command line
+        for ln in lines:
+            m = re.match(r"^([A-Za-z0-9._-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
+            if m:
+                base_prompt = m.group(1)
+                prompt_re = re.compile(
+                    rf"^{re.escape(base_prompt)}(?:\s*\([^)]+\))?\s*[#>$]\s*(.*)$"
+                )
+                break
+        if not prompt_re:
+            return
+
+        cur_cmd: str | None = None
+        cur_buf: list[str] = []
+        for ln in lines:
+            m = prompt_re.match(ln)
+            if m:
+                if cur_cmd is not None:
+                    self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
+                cmd_part = m.group(1).strip()
+                if not self.prompt and "(" not in ln.split("#", 1)[0].split(">", 1)[0]:
+                    sep = "#" if "#" in ln else (">" if ">" in ln else "$")
+                    self.prompt = ln.split(sep, 1)[0] + sep
+                cur_cmd = cmd_part if cmd_part else None
+                cur_buf = []
+            elif cur_cmd is not None:
+                cur_buf.append(ln)
+        if cur_cmd is not None:
+            self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
+
+    def send_command(self, command_string: str, **kwargs) -> str:
+        cmd = command_string.strip()
+        if cmd in self.commands:
+            return self.commands[cmd]
+        # Fallback: case-insensitive or prefix match
+        cmd_l = cmd.lower()
+        for k, v in self.commands.items():
+            if k.lower() == cmd_l:
+                return v
+        return ""
+
+    def find_prompt(self) -> str:
+        return self.prompt or "device#"
+
+    def enable(self) -> None:
+        return None
+
+    def disconnect(self) -> None:
+        return None
+
+
+def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
+    ev = (existing_vendor or "").lower()
+    if ev in ("fortinet", "cisco_ios", "cisco_nxos", "cisco_xe", "cisco_xr", "arista_eos", "juniper_junos", "mikrotik_routeros", "opnsense", "openwrt"):
+        return ev
+    low = log_text.lower()
+    if "fortigate" in low or "fortios" in low or "get system status" in low or "config system interface" in low:
+        return "fortinet"
+    if "cisco ios" in low or "show ip interface brief" in low or "show cdp neighbors detail" in low:
+        return "cisco_ios"
+    if "arista" in low or "eos" in low:
+        return "arista_eos"
+    if "junos" in low or "show chassis hardware" in low:
+        return "juniper_junos"
+    if "mikrotik" in low or "/system identity" in low:
+        return "mikrotik_routeros"
+    if "opnsense" in low or "/conf/config.xml" in low:
+        return "opnsense"
+    if "openwrt" in low or "ubus call" in low:
+        return "openwrt"
+    return ev or "cisco_ios"
+
+
+def reparse_logs_dir(
+    run_dir: str,
+    output_dir: str = "",
+    sanitize_passwords: bool = False,
+    target_vendor: str = "",
+    save_baseline: str = "",
+    compare_baseline: str = "",
+) -> list[dict]:
+    """
+    Offline mode (`--reparse-logs`): replay `logs/*_raw_session.log` in `run_dir`
+    through the latest vendor drivers and regenerate all deliverables with zero
+    network traffic, preserving partial/ARP-discovered entries from any existing
+    `net_docu_crawler_dataset.json`.
+    """
+    run_abs = os.path.abspath(run_dir)
+    logs_dir = os.path.join(run_abs, "logs") if os.path.isdir(os.path.join(run_abs, "logs")) else run_abs
+    dataset_path = os.path.join(run_abs, "net_docu_crawler_dataset.json")
+    target_out = (
+        output_dir
+        if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler"))
+        else run_abs
+    )
+
+    existing_by_ip: dict[str, dict] = {}
+    existing_order: list[str] = []
+    if os.path.isfile(dataset_path):
+        with open(dataset_path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            for rec in loaded:
+                if isinstance(rec, dict) and rec.get("ip"):
+                    ip_k = str(rec["ip"])
+                    existing_by_ip[ip_k] = rec
+                    existing_order.append(ip_k)
+
+    log_files = sorted(glob.glob(os.path.join(logs_dir, "*_raw_session.log")))
+    if not log_files:
+        raise FileNotFoundError(f"No *_raw_session.log files found in {logs_dir}")
+
+    reparsed_by_ip: dict[str, dict] = {}
+    for lf in log_files:
+        ip = os.path.basename(lf).replace("_raw_session.log", "")
+        with open(lf, encoding="utf-8", errors="ignore") as f:
+            log_text = f.read()
+
+        conn = LogReplayConnection(log_text)
+        # Skip tiny auth-failed stubs with fewer than 2 recorded commands
+        if len(conn.commands) < 2:
+            prev = existing_by_ip.get(ip)
+            if prev:
+                # Fix legacy misclassified auth-failure stubs
+                if prev.get("hostname") in ("authentication", "Password", "Login", "Username", ""):
+                    prev["status"] = "unauthenticated"
+                    prev["hostname"] = prev.get("ip", ip)
+                reparsed_by_ip[ip] = prev
+            continue
+
+        prev = existing_by_ip.get(ip, {})
+        vendor = _infer_vendor_from_log(log_text, prev.get("vendor", ""))
+        driver_cls = VENDOR_DRIVER_MAP.get(vendor, CiscoDriver)
+        driver = driver_cls(ip)
+        print(f"[+] Re-parsing {ip} ({vendor}) from {os.path.basename(lf)} ({len(conn.commands)} commands)")
+        dev = driver.crawl(conn)
+        dev["ip"] = ip
+        if not dev.get("mac_address") and prev.get("mac_address"):
+            dev["mac_address"] = prev["mac_address"]
+        for extra_k in ("http_title", "http_server", "ssh_banner", "open_ports", "discovery_source"):
+            if prev.get(extra_k) and not dev.get(extra_k):
+                dev[extra_k] = prev[extra_k]
+        reparsed_by_ip[ip] = dev
+
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for ip in existing_order:
+        if ip in reparsed_by_ip:
+            merged.append(reparsed_by_ip[ip])
+        else:
+            merged.append(existing_by_ip[ip])
+        seen.add(ip)
+    for ip, dev in reparsed_by_ip.items():
+        if ip not in seen:
+            merged.append(dev)
+
+    return render_deliverables_from_dataset(
+        raw_devices=merged,
+        run_output_dir=target_out,
+        sanitize_passwords=sanitize_passwords,
+        target_vendor=target_vendor,
+        save_baseline=save_baseline,
+        compare_baseline=compare_baseline,
+        logs_dir=logs_dir if sanitize_passwords else "",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Net-Docu-Crawler Multi-Vendor Network Discovery")
     parser.add_argument(
@@ -1671,6 +1909,11 @@ def main():
         help="Offline mode: regenerate all deliverables from an existing net_docu_crawler_dataset.json",
     )
     parser.add_argument(
+        "--reparse-logs",
+        default="",
+        help="Offline mode: replay logs/*_raw_session.log in a run directory through the latest drivers and regenerate all deliverables",
+    )
+    parser.add_argument(
         "--validate-credentials",
         action="store_true",
         help="Validate --credentials JSON file(s) and exit without running a crawl",
@@ -1694,6 +1937,18 @@ def main():
 
     t_start = time.time()
     try:
+        if args.reparse_logs:
+            reparse_logs_dir(
+                run_dir=args.reparse_logs,
+                output_dir=args.output_dir,
+                sanitize_passwords=args.sanitize_passwords,
+                target_vendor=args.target_vendor,
+                save_baseline=args.save_baseline,
+                compare_baseline=args.compare_baseline,
+            )
+            print(f"\n[+] Offline log re-parse completed in {time.time() - t_start:.2f} seconds")
+            return
+
         if args.from_dataset:
             render_from_dataset_file(
                 dataset_path=args.from_dataset,

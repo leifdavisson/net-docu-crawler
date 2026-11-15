@@ -893,6 +893,18 @@ def parse_show_ip_route(output, os_type):
             routes.append(
                 {"subnet": nx_conn_match.group(1), "protocol": "RoutingEntry", "next_hop": "Unknown", "interface": ""}
             )
+            continue
+
+        dgw_match = re.match(r"^Default gateway is\s+(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE)
+        if dgw_match:
+            routes.append(
+                {
+                    "subnet": "0.0.0.0/0",
+                    "protocol": "Default",
+                    "next_hop": dgw_match.group(1),
+                    "interface": "",
+                }
+            )
 
     return routes
 

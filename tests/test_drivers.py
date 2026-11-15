@@ -1795,3 +1795,179 @@ def test_offline_dataset_render_and_arp_guided_subnets(tmp_path):
     assert (ds_dir / "L2_network_diagrams.md").exists()
     assert "<REDACTED_SECRET>" in sess_log.read_text(encoding="utf-8")
     assert "$1$secretHash" not in sess_log.read_text(encoding="utf-8")
+
+
+def test_fortinet_spaces_alias_vlan_and_lldp_fallback():
+    from net_docu_crawler.drivers.fortinet import FortinetDriver
+
+    class MockFortiConn:
+        def send_command(self, cmd):
+            if cmd == "show system interface":
+                return (
+                    'config system interface\n'
+                    '    edit "GS VoIP"\n'
+                    '        set ip 10.29.25.1 255.255.255.0\n'
+                    '        set alias "VoIP VLAN"\n'
+                    '        set vlanid 25\n'
+                    '    next\n'
+                    '    edit "naf.1"\n'
+                    '        set ip 169.254.0.1 255.255.255.252\n'
+                    '    next\n'
+                    'end\n'
+                )
+            if cmd == "get router info routing-table all":
+                return "C       10.29.25.0/24 is directly connected, GS VoIP\n"
+            if cmd == "get system arp":
+                return "10.29.25.10 0 aa:bb:cc:dd:ee:ff GS VoIP\n"
+            if cmd == "diagnose snmp sysinfo lldp neighbor":
+                return "command parse error before 'sysinfo'\nReturn code -61\n"
+            if cmd == "diagnose lldp neighbor list":
+                return (
+                    "Port: lan1\n"
+                    "  Chassis ID: 00:11:22:33:44:55\n"
+                    "  System Name: genshaft-sw-mdf02\n"
+                    "  Port ID: Gi1/0/48\n"
+                    "  System Description: Cisco IOS\n"
+                )
+            return ""
+
+    drv = FortinetDriver("10.29.0.1")
+    conn = MockFortiConn()
+    l3, detail = drv.get_interfaces(conn)
+    assert l3 == [{"interface": "GS VoIP", "ip_address": "10.29.25.1 255.255.255.0", "status": "up", "protocol": "up"}]
+    assert "GS VoIP" in detail
+    assert detail["GS VoIP"]["description"] == "VoIP VLAN"
+    assert detail["GS VoIP"]["vlan"] == 25
+    assert "naf.1" not in detail
+
+    routes = drv.get_routing_table(conn)
+    assert routes[0]["interface"] == "GS VoIP"
+
+    arp = drv.get_arp_table(conn)
+    assert arp[0]["interface"] == "GS VoIP"
+
+    nbrs = drv.get_neighbors(conn)
+    assert len(nbrs) == 1
+    assert nbrs[0]["local_port"] == "lan1"
+    assert nbrs[0]["remote_device"] == "genshaft-sw-mdf02"
+
+
+def test_fortios_dhcp_config_and_reservation_enrichment():
+    from net_docu_crawler.crawler import enrich_devices_from_dhcp_reservations
+    from net_docu_crawler.migration_parsers import extract_dhcp_config
+
+    raw_cfg = (
+        "config system dhcp server\n"
+        "    edit 1\n"
+        '        set dns-server1 10.29.0.1\n'
+        "        set default-gateway 10.29.0.1\n"
+        "        set netmask 255.255.254.0\n"
+        '        set interface "internal"\n'
+        "        config ip-range\n"
+        "            edit 1\n"
+        "                set start-ip 10.29.0.50\n"
+        "                set end-ip 10.29.1.250\n"
+        "            next\n"
+        "        end\n"
+        "        config reserved-address\n"
+        "            edit 1\n"
+        "                set ip 10.29.0.10\n"
+        "                set mac 00:11:22:33:44:55\n"
+        '                set description "wlc01"\n'
+        "            next\n"
+        "        end\n"
+        "    next\n"
+        "    edit 2\n"
+        "        set status disable\n"
+        '        set interface "guest"\n'
+        "    next\n"
+        "end\n"
+    )
+    dhcp = extract_dhcp_config(raw_cfg, vendor="Fortinet")
+    assert len(dhcp["pools"]) == 1
+    assert dhcp["pools"][0]["network"] == "10.29.0.0/23"
+    assert dhcp["pools"][0]["range"] == "10.29.0.50-10.29.1.250"
+    assert dhcp["reservations"] == [
+        {"mac": "00:11:22:33:44:55", "ip": "10.29.0.10", "hostname": "wlc01", "pool": "internal"}
+    ]
+
+    devs = [
+        {"hostname": "GEN-FW-01", "ip": "10.29.0.1", "status": "success", "dhcp": dhcp},
+        {"hostname": "10.29.0.10", "ip": "10.29.0.10", "mac_address": "00:11:22:33:44:55", "status": "discovered"},
+    ]
+    enrich_devices_from_dhcp_reservations(devs)
+    assert devs[1]["hostname"] == "wlc01"
+    assert devs[1]["canonical_hostname"] == "wlc01"
+
+
+def test_cisco_default_gateway_and_prefix_backfill():
+    import parser as cli_parser
+    from net_docu_crawler.drivers.cisco import CiscoDriver
+
+    routes = cli_parser.parse_show_ip_route("Default gateway is 10.29.55.1\n", "cisco_ios")
+    assert any(r["subnet"] == "0.0.0.0/0" and r["next_hop"] == "10.29.55.1" for r in routes)
+
+    class MockCiscoConn:
+        def send_command(self, cmd):
+            if cmd == "show ip interface brief":
+                return (
+                    "Interface              IP-Address      OK? Method Status                Protocol\n"
+                    "Vlan55                 10.29.55.15     YES NVRAM  up                    up\n"
+                )
+            if cmd == "show interfaces":
+                return (
+                    "Vlan55 is up, line protocol is up\n"
+                    "  Hardware is EtherSVI, address is aabb.ccdd.eeff (bia aabb.ccdd.eeff)\n"
+                    "  Internet address is 10.29.55.15/25\n"
+                )
+            return ""
+
+    l3, _ = CiscoDriver("10.29.55.15").get_interfaces(MockCiscoConn())
+    assert l3[0]["ip_address"] == "10.29.55.15/25"
+
+
+def test_reparse_logs_dir(tmp_path):
+    import json
+
+    from net_docu_crawler.crawler import reparse_logs_dir
+
+    run_dir = tmp_path / "prod_run"
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True)
+
+    # Existing dataset has a discovered AP and a misclassified auth-failure stub
+    (run_dir / "net_docu_crawler_dataset.json").write_text(
+        json.dumps(
+            [
+                {"ip": "10.29.55.15", "hostname": "old", "vendor": "cisco_ios", "status": "success"},
+                {"ip": "10.29.55.12", "hostname": "authentication", "vendor": "fortinet", "status": "success"},
+                {"ip": "10.29.0.10", "hostname": "10.29.0.10", "status": "discovered"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (logs_dir / "10.29.55.12_raw_session.log").write_text("Password: \nLogin failed\n", encoding="utf-8")
+    (logs_dir / "10.29.55.15_raw_session.log").write_text(
+        "sw-mdf#show version\n"
+        "Cisco IOS Software, C2960X Software, Version 15.2(7)E2\n"
+        "sw-mdf uptime is 1 day\n"
+        "Model number                    : WS-C2960X-48FPS-L\n"
+        "System serial number            : FCW1234A5BC\n"
+        "sw-mdf#show ip interface brief\n"
+        "Vlan55                 10.29.55.15     YES NVRAM  up                    up\n"
+        "sw-mdf#show interfaces\n"
+        "Vlan55 is up, line protocol is up\n"
+        "  Internet address is 10.29.55.15/25\n"
+        "sw-mdf#show ip route\n"
+        "Default gateway is 10.29.55.1\n"
+        "sw-mdf#show running-config\n"
+        "hostname sw-mdf\n",
+        encoding="utf-8",
+    )
+
+    out = reparse_logs_dir(str(run_dir))
+    by_ip = {d["ip"]: d for d in out}
+    assert by_ip["10.29.55.15"]["l3_interfaces"][0]["ip_address"] == "10.29.55.15/25"
+    assert any(r["subnet"] == "0.0.0.0/0" for r in by_ip["10.29.55.15"]["routes"])
+    assert by_ip["10.29.55.12"]["status"] == "unauthenticated"
+    assert by_ip["10.29.0.10"]["status"] == "discovered"

@@ -97,6 +97,26 @@ class CiscoDriver(BaseDriver):
         for stats in ints_detail.values():
             if stats.get("mac_address"):
                 stats["mac_address"] = oui_lookup.normalize_mac(stats["mac_address"]).lower()
+
+        # Backfill /prefix masks from "Internet address is X.X.X.X/Y" in show interfaces
+        cidr_by_intf: dict[str, str] = {}
+        cur_intf: str | None = None
+        for line in sh_ints.splitlines():
+            m_hdr = re.match(r"^([A-Za-z0-9/._-]+)\s+is\s+(?:up|down|administratively)", line.strip())
+            if m_hdr:
+                cur_intf = m_hdr.group(1)
+            elif cur_intf:
+                m_addr = re.search(r"Internet address is\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+                if m_addr:
+                    cidr_by_intf[cur_intf] = m_addr.group(1)
+
+        for entry in l3_ints:
+            ip_val = str(entry.get("ip_address") or "").strip()
+            intf_name = str(entry.get("interface") or "").strip()
+            if ip_val and "/" not in ip_val and " " not in ip_val and intf_name in cidr_by_intf:
+                if cidr_by_intf[intf_name].startswith(ip_val + "/"):
+                    entry["ip_address"] = cidr_by_intf[intf_name]
+
         return l3_ints, ints_detail
 
     def get_neighbors(self, conn) -> list[dict]:

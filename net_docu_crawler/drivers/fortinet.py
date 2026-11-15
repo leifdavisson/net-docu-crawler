@@ -103,10 +103,10 @@ class FortinetDriver(BaseDriver):
             current_intf = None
             for line in raw.splitlines():
                 line = line.strip()
-                m_edit = re.match(r'edit\s+"?([A-Za-z0-9_.-]+)"?', line)
+                m_edit = re.match(r'^edit\s+"([^"]+)"$|^edit\s+(\S+)$', line)
                 if m_edit:
-                    cand = m_edit.group(1)
-                    if cand.lower().startswith(FORTIOS_VIRTUAL_PSEUDO_PREFIXES):
+                    cand = (m_edit.group(1) or m_edit.group(2) or "").strip()
+                    if not cand or cand.lower().startswith(FORTIOS_VIRTUAL_PSEUDO_PREFIXES):
                         current_intf = None
                         continue
                     current_intf = cand
@@ -118,7 +118,7 @@ class FortinetDriver(BaseDriver):
                         "speed": "N/A",
                         "duplex": "N/A",
                     }
-                elif "set ip " in line and current_intf:
+                elif line.startswith("set ip ") and current_intf:
                     parts = line.split()
                     if len(parts) >= 3 and parts[2] != "0.0.0.0":
                         current_ip = parts[2]
@@ -131,10 +131,19 @@ class FortinetDriver(BaseDriver):
                                 "protocol": "up",
                             }
                         )
-                elif "set description" in line and current_intf:
+                elif line.startswith("set description ") and current_intf:
                     interfaces_detail[current_intf]["description"] = (
                         line.split("set description", 1)[1].strip().strip('"')
                     )
+                elif line.startswith("set alias ") and current_intf:
+                    if not interfaces_detail[current_intf]["description"]:
+                        interfaces_detail[current_intf]["description"] = (
+                            line.split("set alias", 1)[1].strip().strip('"')
+                        )
+                elif line.startswith("set vlanid ") and current_intf:
+                    vlan_val = line.split("set vlanid", 1)[1].strip().strip('"')
+                    if vlan_val.isdigit():
+                        interfaces_detail[current_intf]["vlan"] = int(vlan_val)
                 elif "set status down" in line and current_intf:
                     interfaces_detail[current_intf]["status"] = "down"
                     interfaces_detail[current_intf]["protocol"] = "down"
@@ -143,42 +152,56 @@ class FortinetDriver(BaseDriver):
 
         return l3_interfaces, interfaces_detail
 
-    def get_neighbors(self, conn) -> list[dict]:
+    @staticmethod
+    def _parse_lldp_blocks(raw: str) -> list[dict]:
         neighbors = []
-        try:
-            raw = conn.send_command("diagnose snmp sysinfo lldp neighbor")
-            current: dict[str, str] = {}
-            for line in raw.splitlines():
-                line = line.strip()
-                if line.startswith("Port:"):
-                    if current.get("local_port") and current.get("remote_device"):
-                        neighbors.append(current)
-                    current = {
-                        "local_port": line.split(":", 1)[1].strip(),
-                        "remote_device": "",
-                        "remote_port": "",
-                        "remote_ip": "",
-                        "platform": "",
-                        "remote_platform": "",
-                        "device_type": "switch",
-                    }
-                elif "Chassis ID:" in line and current:
-                    current["remote_device"] = line.split(":", 1)[1].strip()
-                elif "System Name:" in line and current:
-                    sys_name = line.split(":", 1)[1].strip()
-                    if sys_name:
-                        current["remote_device"] = sys_name
-                elif "Port ID:" in line and current:
-                    current["remote_port"] = line.split(":", 1)[1].strip()
-                elif "System Description:" in line and current:
-                    desc = line.split(":", 1)[1].strip()[:60]
-                    current["platform"] = desc
-                    current["remote_platform"] = desc
-            if current.get("local_port") and current.get("remote_device"):
-                neighbors.append(current)
-        except Exception:
-            pass
+        current: dict[str, str] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("Port:"):
+                if current.get("local_port") and current.get("remote_device"):
+                    neighbors.append(current)
+                current = {
+                    "local_port": line.split(":", 1)[1].strip(),
+                    "remote_device": "",
+                    "remote_port": "",
+                    "remote_ip": "",
+                    "platform": "",
+                    "remote_platform": "",
+                    "device_type": "switch",
+                }
+            elif "Chassis ID:" in line and current:
+                current["remote_device"] = line.split(":", 1)[1].strip()
+            elif "System Name:" in line and current:
+                sys_name = line.split(":", 1)[1].strip()
+                if sys_name:
+                    current["remote_device"] = sys_name
+            elif "Port ID:" in line and current:
+                current["remote_port"] = line.split(":", 1)[1].strip()
+            elif "System Description:" in line and current:
+                desc = line.split(":", 1)[1].strip()[:60]
+                current["platform"] = desc
+                current["remote_platform"] = desc
+        if current.get("local_port") and current.get("remote_device"):
+            neighbors.append(current)
         return neighbors
+
+    def get_neighbors(self, conn) -> list[dict]:
+        for cmd in (
+            "diagnose snmp sysinfo lldp neighbor",
+            "diagnose lldp neighbor list",
+            "get switch lldp neighbors-summary",
+        ):
+            try:
+                raw = conn.send_command(cmd)
+                if not raw or "command parse error" in raw.lower():
+                    continue
+                parsed = self._parse_lldp_blocks(raw)
+                if parsed:
+                    return parsed
+            except Exception:
+                continue
+        return []
 
     def get_routing_table(self, conn) -> list[dict]:
         routes = []
@@ -186,14 +209,14 @@ class FortinetDriver(BaseDriver):
             raw = conn.send_command("get router info routing-table all")
             for line in raw.splitlines():
                 m = re.search(
-                    r"^([A-Z*>\s]+)\s+([0-9./]+)\s+(?:\[\d+/\d+\]\s+(?:via\s+([0-9.]+))?|is\s+directly\s+connected),\s+([A-Za-z0-9_.-]+)",
+                    r"^([A-Z*>\s]+)\s+([0-9./]+)\s+(?:\[\d+/\d+\]\s+(?:via\s+([0-9.]+))?|is\s+directly\s+connected),\s+(.+?)(?:,\s+\d{2}:\d{2}:\d{2}|,\s+\[\d+/\d+\])?$",
                     line.strip(),
                 )
                 if m:
                     proto = m.group(1).strip()
                     subnet = m.group(2)
                     next_hop = m.group(3) or "Direct"
-                    intf = m.group(4)
+                    intf = m.group(4).strip()
                     routes.append(
                         {
                             "subnet": subnet,
@@ -216,7 +239,7 @@ class FortinetDriver(BaseDriver):
                 if len(parts) >= 3 and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
                     mac_idx = 2 if len(parts) >= 4 and parts[1].isdigit() else 1
                     mac = oui_lookup.normalize_mac(parts[mac_idx]).lower()
-                    intf = parts[mac_idx + 1] if len(parts) > mac_idx + 1 else ""
+                    intf = " ".join(parts[mac_idx + 1 :]) if len(parts) > mac_idx + 1 else ""
                     arp_entries.append(
                         {
                             "ip": parts[0],

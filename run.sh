@@ -15,6 +15,7 @@ echo "2) Run organized crawl (--follow-subnets --max-hops 2)"
 echo "3) Retry failed hosts (--retry-failed)"
 echo "4) Update repo (git pull)"
 echo "5) Regenerate deliverables from dataset (--from-dataset)"
+echo "6) Re-parse raw session logs (--reparse-logs)"
 echo "q) Quit"
 
 if ! read -r -p "Select an option: " choice; then
@@ -46,6 +47,12 @@ case "$choice" in
             exit 0
         fi
         "$PY" net_crawler.py --from-dataset "$dataset_path"
+        ;;
+    6)
+        if ! read -r -p "Path to run directory containing logs/: " run_dir || [[ -z "$run_dir" ]]; then
+            exit 0
+        fi
+        "$PY" net_crawler.py --reparse-logs "$run_dir"
         ;;
     q|Q|"")
         exit 0
