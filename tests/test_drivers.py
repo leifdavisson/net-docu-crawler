@@ -1976,3 +1976,34 @@ def test_reparse_logs_dir(tmp_path):
     assert any(r["subnet"] == "0.0.0.0/0" for r in by_ip["10.29.55.15"]["routes"])
     assert by_ip["10.29.55.12"]["status"] == "unauthenticated"
     assert by_ip["10.29.0.10"]["status"] == "discovered"
+
+
+def test_hpprocurve_vt100_escape_cleaning():
+    from net_docu_crawler.drivers.hpprocurve import HPProCurveDriver, _CleanProCurveConn
+
+    class RawVT100Conn:
+        def send_command(self, cmd):
+            if cmd == "show system":
+                return (
+                    "\x1b[2J\x1b[?7h\x1b[1;23r\x1b[?6l\x1b[1;1H\x1b[?25l"
+                    "  System Name        : sw-core-5412\n"
+                    "  Software revision  : K.16.02.0022m\n"
+                    "  Serial Number      : SG12345678\n"
+                    "  Base MAC Addr      : aabbcc-ddeeff\n"
+                    "[24;1H"
+                )
+            if cmd == "show modules":
+                return "\x1b[24;1HChassis: 5412zl J8698A Serial Number: SG12345678\n"
+            return ""
+
+        def find_prompt(self):
+            return "\x1b[24;1Hsw-core-5412#"
+
+    proxy = _CleanProCurveConn(RawVT100Conn())
+    info = HPProCurveDriver("10.1.0.10").get_version(proxy)
+    assert info["hostname"] == "sw-core-5412"
+    assert info["firmware"] == "K.16.02.0022m"
+    assert info["serial"] == "SG12345678"
+    assert info["mac_address"] == "aa:bb:cc:dd:ee:ff"
+    assert info["model"] == "HP 5412zl"
+    assert proxy.find_prompt() == "sw-core-5412#"

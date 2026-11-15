@@ -22,7 +22,35 @@ import ipaddress
 import re
 
 import oui_lookup
+import parser as cli_parser
 from net_docu_crawler.drivers.base import BaseDriver
+
+_BARE_VT100_RE = re.compile(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])")
+
+
+def _clean_procurve_output(raw: str) -> str:
+    """Strip ESC-prefixed ANSI/VT100 sequences, bare CSI cursor codes, and CRs."""
+    if not raw:
+        return ""
+    cleaned = cli_parser.clean_cli_output(raw)
+    cleaned = _BARE_VT100_RE.sub("", cleaned)
+    return cleaned.replace("\r", "")
+
+
+class _CleanProCurveConn:
+    """Transparent connection wrapper that strips ProCurve VT100/ANSI escape codes."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def send_command(self, *args, **kwargs):
+        return _clean_procurve_output(self._conn.send_command(*args, **kwargs))
+
+    def find_prompt(self, *args, **kwargs):
+        return _clean_procurve_output(self._conn.find_prompt(*args, **kwargs)).strip()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 class HPProCurveDriver(BaseDriver):
@@ -46,10 +74,11 @@ class HPProCurveDriver(BaseDriver):
             "secret": self.secret,
             "timeout": self.timeout,
             "auth_timeout": self.timeout,
+            "ansi_escape_codes": True,
         }
         if self.session_log:
             device["session_log"] = self.session_log
-        return self.connect_netmiko(device)
+        return _CleanProCurveConn(self.connect_netmiko(device))
 
     def get_version(self, conn) -> dict:
         info = {

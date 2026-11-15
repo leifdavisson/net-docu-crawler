@@ -494,7 +494,8 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
             else:
                 cleaned.append(raw[i])
                 i += 1
-        banner = cleaned.decode("utf-8", errors="ignore").strip()
+        banner = cleaned.decode("utf-8", errors="ignore")
+        banner = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", banner).strip()
     except Exception:
         pass
     finally:
