@@ -85,14 +85,18 @@ cp credentials.example.json credentials.json
 ### 2. Run Discovery & Generate Documentation
 
 ```bash
-# Auto-detect local subnet and crawl SSH (22, 2222) + Telnet (23) + HTTP/ARP inventory
+# Auto-detect local subnet and crawl SSH (22) + Telnet (23) + HTTP/ARP inventory
 python3 net_crawler.py
 
 # Try vendor defaults first, then your site credentials
 python3 net_crawler.py --credentials credentials.example.json credentials.json --organize
 
-# Crawl specific hosts / custom ports (ip:port) AND follow connected RFC 1918 subnets
+# Crawl specific hosts / custom ports (ip:port or --ssh-ports 22 2222) AND follow connected ARP-guided subnets
 python3 net_crawler.py --targets 192.168.1.1 192.168.1.220:2222 --follow-subnets --organize
+
+# Re-parse raw logs/*_raw_session.log offline through updated drivers, or regenerate reports from dataset JSON
+python3 net_crawler.py --reparse-logs deliverables/<run_dir>/
+python3 net_crawler.py --from-dataset deliverables/<run_dir>/net_docu_crawler_dataset.json
 
 # Generate staged target-vendor migration configs + save/compare cutover baselines
 python3 net_crawler.py --targets 192.168.1.0/24 --target-vendor juniper --save-baseline baseline.json --organize

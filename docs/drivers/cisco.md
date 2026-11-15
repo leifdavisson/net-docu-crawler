@@ -61,4 +61,5 @@ privilege exec level 1 show inventory
 
 ## 4. Troubleshooting & Gotchas
 * **Nexus Prompt Formatting**: NX-OS prompts may include VDC indicators (e.g., `switch(vdc-1)#`). Netmiko automatically handles VDC prompts if `cisco_nxos` is selected.
+* **L2 Switch SVIs & Default Gateway**: When `ip routing` is disabled on L2 switches, `CiscoDriver` backfills `/prefix` masks from `show interfaces` (`Internet address is X.X.X.X/Y`) into `l3_interfaces` and maps `Default gateway is <ip>` from `show ip route` to `0.0.0.0/0`.
 * **CDP Disabled**: If `no cdp run` is active, the driver falls back to `show lldp neighbors detail`. If both are disabled, Stage 2 ARP table harvesting is used to identify adjacent switches by management MAC OUI.

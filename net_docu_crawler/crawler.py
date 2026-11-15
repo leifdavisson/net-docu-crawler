@@ -978,7 +978,9 @@ def crawl_network(
                     prior_success_devices = [
                         d
                         for d in prior_data
-                        if isinstance(d, dict) and d.get("status", "success") == "success" and d.get("ip") not in retry_ip_set
+                        if isinstance(d, dict)
+                        and d.get("status", "success") == "success"
+                        and d.get("ip") not in retry_ip_set
                     ]
                     if prior_success_devices:
                         print(
@@ -1145,9 +1147,7 @@ def crawl_network(
             hop_ips = _select_hop_targets_for_cidrs(new_cidrs, registry, scanned_ip_set)
             if not hop_ips:
                 break
-            print(
-                f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}"
-            )
+            print(f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}")
             _log_event(crawler_log, f"Hop {hop} following subnets ({len(hop_ips)} IPs): {new_cidrs}")
             _run_batch(hop_ips, {})
 
@@ -1178,8 +1178,7 @@ def crawl_network(
         if to_probe:
             with ThreadPoolExecutor(max_workers=min(max_workers, len(to_probe))) as pool:
                 http_futs = {
-                    pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d
-                    for d in to_probe
+                    pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d for d in to_probe
                 }
                 for fut in as_completed(http_futs):
                     dev = http_futs[fut]
@@ -1600,9 +1599,7 @@ class LogReplayConnection:
             m = re.match(r"^([A-Za-z0-9._-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
             if m:
                 base_prompt = m.group(1)
-                prompt_re = re.compile(
-                    rf"^{re.escape(base_prompt)}(?:\s*\([^)]+\))?\s*[#>$]\s*(.*)$"
-                )
+                prompt_re = re.compile(rf"^{re.escape(base_prompt)}(?:\s*\([^)]+\))?\s*[#>$]\s*(.*)$")
                 break
         if not prompt_re:
             return
@@ -1648,7 +1645,18 @@ class LogReplayConnection:
 
 def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
     ev = (existing_vendor or "").lower()
-    if ev in ("fortinet", "cisco_ios", "cisco_nxos", "cisco_xe", "cisco_xr", "arista_eos", "juniper_junos", "mikrotik_routeros", "opnsense", "openwrt"):
+    if ev in (
+        "fortinet",
+        "cisco_ios",
+        "cisco_nxos",
+        "cisco_xe",
+        "cisco_xr",
+        "arista_eos",
+        "juniper_junos",
+        "mikrotik_routeros",
+        "opnsense",
+        "openwrt",
+    ):
         return ev
     low = log_text.lower()
     if "fortigate" in low or "fortios" in low or "get system status" in low or "config system interface" in low:
@@ -1685,11 +1693,7 @@ def reparse_logs_dir(
     run_abs = os.path.abspath(run_dir)
     logs_dir = os.path.join(run_abs, "logs") if os.path.isdir(os.path.join(run_abs, "logs")) else run_abs
     dataset_path = os.path.join(run_abs, "net_docu_crawler_dataset.json")
-    target_out = (
-        output_dir
-        if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler"))
-        else run_abs
-    )
+    target_out = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else run_abs
 
     existing_by_ip: dict[str, dict] = {}
     existing_order: list[str] = []

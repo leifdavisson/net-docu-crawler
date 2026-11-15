@@ -1657,7 +1657,12 @@ def test_workflow_improvements(tmp_path):
             {
                 "status": "success",
                 "neighbors": [
-                    {"remote_device": "sw-01", "remote_ip": "", "remote_mac": "00:23:9c:aa:bb:cc", "device_type": "switch"},
+                    {
+                        "remote_device": "sw-01",
+                        "remote_ip": "",
+                        "remote_mac": "00:23:9c:aa:bb:cc",
+                        "device_type": "switch",
+                    },
                     {"remote_device": "ap-01", "remote_ip": "10.29.55.90", "device_type": "ap"},
                     {"remote_device": "sw-02", "remote_ip": "10.29.55.12", "device_type": "switch"},
                 ],
@@ -1804,16 +1809,16 @@ def test_fortinet_spaces_alias_vlan_and_lldp_fallback():
         def send_command(self, cmd):
             if cmd == "show system interface":
                 return (
-                    'config system interface\n'
+                    "config system interface\n"
                     '    edit "GS VoIP"\n'
-                    '        set ip 10.29.25.1 255.255.255.0\n'
+                    "        set ip 10.29.25.1 255.255.255.0\n"
                     '        set alias "VoIP VLAN"\n'
-                    '        set vlanid 25\n'
-                    '    next\n'
+                    "        set vlanid 25\n"
+                    "    next\n"
                     '    edit "naf.1"\n'
-                    '        set ip 169.254.0.1 255.255.255.252\n'
-                    '    next\n'
-                    'end\n'
+                    "        set ip 169.254.0.1 255.255.255.252\n"
+                    "    next\n"
+                    "end\n"
                 )
             if cmd == "get router info routing-table all":
                 return "C       10.29.25.0/24 is directly connected, GS VoIP\n"
@@ -1859,7 +1864,7 @@ def test_fortios_dhcp_config_and_reservation_enrichment():
     raw_cfg = (
         "config system dhcp server\n"
         "    edit 1\n"
-        '        set dns-server1 10.29.0.1\n'
+        "        set dns-server1 10.29.0.1\n"
         "        set default-gateway 10.29.0.1\n"
         "        set netmask 255.255.254.0\n"
         '        set interface "internal"\n'

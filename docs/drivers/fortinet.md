@@ -47,11 +47,11 @@ In enterprise campus and branch architectures, FortiGates frequently serve as:
 | Data Element | FortiOS CLI Command | Notes |
 | :--- | :--- | :--- |
 | **System Info & Serial** | `get system status` | Hostname, model, chassis serial, firmware version |
-| **L3 Interfaces** | `show system interface` | Physical ports, VLAN sub-interfaces, and IP addresses |
-| **Topology Neighbors** | `diagnose snmp sysinfo lldp neighbor` | LLDP neighbor chassis and port IDs |
+| **L3 Interfaces** | `show system interface` | Physical ports, VLAN sub-interfaces (including names with spaces, `set alias`, `set vlanid`), and IP addresses |
+| **Topology Neighbors** | `diagnose snmp sysinfo lldp neighbor` (fallback: `diagnose lldp neighbor list`, `get switch lldp neighbors-summary`) | LLDP neighbor chassis and port IDs |
 | **Routing Table** | `get router info routing-table all` | Active RIB table (Static, OSPF, BGP, Connected) |
 | **ARP Table** | `get system arp` | IP-to-MAC resolution table across all interfaces |
-| **Configuration Backup** | `show full-configuration` | Complete declarative FortiOS configuration |
+| **Configuration Backup & DHCP** | `show full-configuration` | Complete declarative FortiOS config including `config system dhcp server` pools & `reserved-address` entries |
 
 ## 4. Minimum Read-Only Admin Profile
 

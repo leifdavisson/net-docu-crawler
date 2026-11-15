@@ -470,9 +470,7 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                             net_str = ""
                             if anchor and cur_pool["netmask"]:
                                 try:
-                                    net_str = str(
-                                        ipaddress.IPv4Interface(f"{anchor}/{cur_pool['netmask']}").network
-                                    )
+                                    net_str = str(ipaddress.IPv4Interface(f"{anchor}/{cur_pool['netmask']}").network)
                                 except Exception:
                                     net_str = f"{anchor} {cur_pool['netmask']}"
                             pool_name = cur_pool["interface"] or f"dhcp-{cur_pool['id']}"
