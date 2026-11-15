@@ -2013,3 +2013,163 @@ def test_hpprocurve_ehttp_http_fingerprint():
     from net_docu_crawler.drivers.detector import infer_vendor_from_http
 
     assert infer_vendor_from_http({"port": 80, "scheme": "http", "server": "eHTTP v2.0", "title": ""}) == "hpprocurve"
+
+
+def test_junos18_poe_mac_and_lldp_fallback():
+    import json
+
+    from net_docu_crawler.drivers.juniper import JuniperDriver
+
+    class MockJunos18Conn:
+        def send_command(self, cmd):
+            if cmd == "show poe controller | display json":
+                return json.dumps(
+                    {
+                        "poe": [
+                            {
+                                "controller-information": [
+                                    {
+                                        "controller-maxpower": [{"data": "740W"}],
+                                        "controller-power": [{"data": "78.40W"}],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            if cmd == "show poe interface | display json":
+                return json.dumps(
+                    {
+                        "poe": [
+                            {
+                                "interface-information": [
+                                    {
+                                        "interface-name": [{"data": "ge-0/0/0"}],
+                                        "interface-status": [{"data": "ON"}],
+                                        "interface-power": [{"data": "3.2W"}],
+                                        "interface-class": [{"data": "3"}],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            if cmd == "show ethernet-switching table | display json":
+                return json.dumps(
+                    {
+                        "l2ng-l2ald-rtb-macdb": [
+                            {
+                                "l2ng-l2ald-mac-entry-vlan": [
+                                    {
+                                        "l2ng-l2-vlan-id": [{"data": "1018"}],
+                                        "l2ng-mac-entry": [
+                                            {
+                                                "l2ng-l2-mac-vlan-name": [{"data": "Vlan_1018"}],
+                                                "l2ng-l2-mac-address": [{"data": "08:9d:f4:d9:da:f0"}],
+                                                "l2ng-l2-mac-flags": [{"data": "D"}],
+                                                "l2ng-l2-mac-logical-interface": [{"data": "ge-0/2/0.0"}],
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            if cmd == "show lldp neighbors detail | display json":
+                return "syntax error, expecting <command>."
+            if cmd == "show lldp neighbors detail":
+                return "syntax error, expecting <command>."
+            if cmd == "show lldp neighbors | display json":
+                return json.dumps(
+                    {
+                        "lldp-neighbors-information": [
+                            {
+                                "lldp-neighbor-information": [
+                                    {
+                                        "lldp-local-interface": [{"data": "xe-0/0/0.0"}],
+                                        "lldp-remote-chassis-id": [{"data": "88:51:fb:79:89:00"}],
+                                        "lldp-remote-port-info": [{"data": "A1"}],
+                                        "lldp-remote-system-name": [{"data": "DO-Main-BLDG"}],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                )
+            return ""
+
+    drv = JuniperDriver("172.31.1.11")
+    conn = MockJunos18Conn()
+    poe = drv.get_poe(conn)
+    assert poe["total_power_watts"] == 740.0
+    assert poe["used_power_watts"] == 78.4
+    assert poe["available_power_watts"] == 661.6
+    assert poe["ports"]["ge-0/0/0"]["watts"] == 3.2
+
+    macs = drv.get_mac_table(conn)
+    assert len(macs) == 1
+    assert macs[0]["vlan"] == "Vlan_1018"
+    assert macs[0]["interface"] == "ge-0/2/0"
+    assert macs[0]["mac"] == "08:9d:f4:d9:da:f0"
+
+    neighs = drv.get_neighbors(conn)
+    assert len(neighs) == 1
+    assert neighs[0]["local_port"] == "xe-0/0/0"
+    assert neighs[0]["remote_device"] == "DO-Main-BLDG"
+    assert neighs[0]["remote_port"] == "A1"
+
+
+def test_hpprocurve_optics_2col_mac_and_sku_model():
+    from net_docu_crawler.drivers.hpprocurve import HPProCurveDriver
+
+    class MockProCurveConn:
+        def send_command(self, cmd):
+            if cmd == "show system":
+                return "  System Name : SW-IDF-01\n  Software revision : YA.16.01.0012\n  Serial Number : CN67G2K001\n"
+            if cmd == "show modules":
+                return "Invalid input: modules\n"
+            if cmd == "show running-config":
+                return '; J9853A Configuration Editor; Created on release #YA.16.01.0012\nhostname "SW-IDF-01"\n'
+            if cmd == "show mac-address":
+                return " Status and Counters - Port Address Table\n\n  MAC Address   Located on Port\n  ------------- ---------------\n  20d80b-934cb9 27\n"
+            if cmd == "show interfaces transceiver":
+                return " Port    Type        Product Number  Serial Number  Part Number\n A1      10GbE-SR    J8436A          DE722YS01Q     1990-3479\n"
+            return ""
+
+        def find_prompt(self):
+            return "SW-IDF-01#"
+
+    drv = HPProCurveDriver("172.31.1.41")
+    data = drv.crawl(MockProCurveConn())
+    assert data["model"] == "HP 2530-48G-PoE+ (J9853A)"
+    assert len(data["mac_table"]) == 1
+    assert data["mac_table"][0] == {"mac": "20:d8:0b:93:4c:b9", "port": "27", "vlan": "1"}
+    assert len(data["optics"]) == 1
+    assert data["optics"][0]["port"] == "A1"
+    assert data["optics"][0]["part_number"] == "J8436A"
+    assert data["optics"][0]["serial"] == "DE722YS01Q"
+
+
+def test_log_replay_junos_at_prompt_and_hpprocurve_vendor():
+    import json
+
+    from net_docu_crawler.crawler import LogReplayConnection, _infer_vendor_from_log
+
+    junos_log = (
+        "{master:0}\n"
+        "kcsos.tech@NMS_MDF_CORE_BLDG_B> show version | display json\n"
+        '{"software-information": [{"host-name": [{"data": "NMS_MDF_CORE_BLDG_B"}]}]}\n'
+        "{master:0}\n"
+        "kcsos.tech@NMS_MDF_CORE_BLDG_B> show chassis hardware\n"
+        "Item\n"
+    )
+    conn = LogReplayConnection(junos_log)
+    assert "show version | display json" in conn.commands
+    assert (
+        json.loads(conn.send_command("show version | display json"))["software-information"][0]["host-name"][0]["data"]
+        == "NMS_MDF_CORE_BLDG_B"
+    )
+    assert "show chassis hardware" in conn.commands
+    assert _infer_vendor_from_log(junos_log, "Juniper Networks") == "juniper"
+    assert _infer_vendor_from_log("DO-Main-BLDG# show system", "HP ProCurve / ArubaOS-S") == "hpprocurve"

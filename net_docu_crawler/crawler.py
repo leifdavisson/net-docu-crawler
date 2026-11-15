@@ -1597,12 +1597,14 @@ class LogReplayConnection:
         self._parse_log(log_text)
 
     def _parse_log(self, log_text: str) -> None:
-        lines = log_text.splitlines()
+        cleaned = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log_text)
+        cleaned = re.sub(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])", "", cleaned).replace("\r", "")
+        lines = cleaned.splitlines()
         base_prompt = ""
         prompt_re = None
         # Identify the device prompt prefix from the first prompt+command line
         for ln in lines:
-            m = re.match(r"^([A-Za-z0-9._-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
+            m = re.match(r"^([A-Za-z0-9._@-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
             if m:
                 base_prompt = m.group(1)
                 prompt_re = re.compile(rf"^{re.escape(base_prompt)}(?:\s*\([^)]+\))?\s*[#>$]\s*(.*)$")
@@ -1616,6 +1618,11 @@ class LogReplayConnection:
             m = prompt_re.match(ln)
             if m:
                 if cur_cmd is not None:
+                    while cur_buf and (
+                        not cur_buf[-1].strip()
+                        or re.match(r"^\{(?:master|backup|linecard):\d+\}$", cur_buf[-1].strip())
+                    ):
+                        cur_buf.pop()
                     self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
                 cmd_part = m.group(1).strip()
                 if not self.prompt and "(" not in ln.split("#", 1)[0].split(">", 1)[0]:
@@ -1626,6 +1633,10 @@ class LogReplayConnection:
             elif cur_cmd is not None:
                 cur_buf.append(ln)
         if cur_cmd is not None:
+            while cur_buf and (
+                not cur_buf[-1].strip() or re.match(r"^\{(?:master|backup|linecard):\d+\}$", cur_buf[-1].strip())
+            ):
+                cur_buf.pop()
             self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
 
     def send_command(self, command_string: str, **kwargs) -> str:
@@ -1651,35 +1662,50 @@ class LogReplayConnection:
 
 def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
     ev = (existing_vendor or "").lower()
-    if ev in (
-        "fortinet",
-        "cisco_ios",
-        "cisco_nxos",
-        "cisco_xe",
-        "cisco_xr",
-        "arista_eos",
-        "juniper_junos",
-        "mikrotik_routeros",
-        "opnsense",
-        "openwrt",
-    ):
-        return ev
+    _alias = {
+        "juniper_junos": "juniper",
+        "juniper": "juniper",
+        "cisco_ios": "cisco",
+        "cisco_xe": "cisco",
+        "cisco_nxos": "cisco",
+        "cisco_xr": "cisco",
+        "cisco": "cisco",
+        "arista_eos": "arista",
+        "arista": "arista",
+        "mikrotik_routeros": "mikrotik",
+        "mikrotik": "mikrotik",
+        "fortinet": "fortinet",
+        "opnsense": "opnsense",
+        "openwrt": "openwrt",
+        "hpprocurve": "hpprocurve",
+        "aruba": "aruba",
+        "paloalto": "paloalto",
+        "frrouting": "frrouting",
+    }
     low = log_text.lower()
     if "fortigate" in low or "fortios" in low or "get system status" in low or "config system interface" in low:
         return "fortinet"
-    if "cisco ios" in low or "show ip interface brief" in low or "show cdp neighbors detail" in low:
-        return "cisco_ios"
-    if "arista" in low or "eos" in low:
-        return "arista_eos"
     if "junos" in low or "show chassis hardware" in low:
-        return "juniper_junos"
+        return "juniper"
+    if "procurve" in low or "arubaos-s" in low or "show power-over-ethernet brief" in low or "hp j" in low:
+        return "hpprocurve"
+    if "arista" in low or "eos" in low:
+        return "arista"
     if "mikrotik" in low or "/system identity" in low:
-        return "mikrotik_routeros"
+        return "mikrotik"
     if "opnsense" in low or "/conf/config.xml" in low:
         return "opnsense"
     if "openwrt" in low or "ubus call" in low:
         return "openwrt"
-    return ev or "cisco_ios"
+    if "cisco ios" in low or "show ip interface brief" in low or "show cdp neighbors detail" in low:
+        return "cisco"
+    if ev in _alias:
+        return _alias[ev]
+    if "juniper" in ev or "junos" in ev:
+        return "juniper"
+    if "procurve" in ev or "arubaos-s" in ev or "hp " in ev:
+        return "hpprocurve"
+    return "cisco"
 
 
 def reparse_logs_dir(

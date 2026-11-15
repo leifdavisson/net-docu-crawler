@@ -370,6 +370,74 @@ class JuniperDriver(BaseDriver):
                         }
                     )
 
+        # Fallback for Junos 17.x/18.x ELS platforms where `show lldp neighbors detail` is unsupported
+        if not neighbors:
+            try:
+                raw_sum = conn.send_command("show lldp neighbors | display json")
+                data_sum = json.loads(raw_sum)
+                neigh_list = data_sum.get("lldp-neighbors-information", [{}])[0].get("lldp-neighbor-information", [])
+                for n in neigh_list:
+                    local_intf = n.get("lldp-local-interface", [{}])[0].get("data", "") or n.get(
+                        "lldp-local-port-id", [{}]
+                    )[0].get("data", "")
+                    local_port = re.sub(r"\.0$", "", local_intf.strip())
+                    remote_mac = n.get("lldp-remote-chassis-id", [{}])[0].get("data", "")
+                    remote_dev = n.get("lldp-remote-system-name", [{}])[0].get("data", "") or remote_mac or "Unknown"
+                    remote_port = n.get("lldp-remote-port-info", [{}])[0].get("data", "") or n.get(
+                        "lldp-remote-port-id", [{}]
+                    )[0].get("data", "")
+                    norm_mac = oui_lookup.normalize_mac(remote_mac or remote_port)
+                    mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
+                    dev_type = (
+                        "ap"
+                        if any(v in mac_vendor.lower() for v in ["aruba", "ubiquiti", "ruckus", "meraki"])
+                        else "switch"
+                    )
+                    plat = (
+                        f"{mac_vendor} AP"
+                        if (dev_type == "ap" and mac_vendor != "Unknown")
+                        else (mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered")
+                    )
+                    if local_port:
+                        neighbors.append(
+                            {
+                                "local_port": local_port,
+                                "remote_device": remote_dev,
+                                "remote_port": remote_port or "Unknown",
+                                "remote_ip": "",
+                                "remote_mac": remote_mac,
+                                "platform": plat,
+                                "remote_platform": plat,
+                                "device_type": dev_type,
+                            }
+                        )
+            except Exception:
+                try:
+                    raw_sum_txt = conn.send_command("show lldp neighbors")
+                    for line in raw_sum_txt.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 5 and re.match(r"^(?:ge-|xe-|et-|fe-|ae\d)", parts[0]):
+                            local_port = re.sub(r"\.0$", "", parts[0])
+                            remote_mac = parts[2]
+                            remote_port = parts[3]
+                            remote_dev = parts[4]
+                            norm_mac = oui_lookup.normalize_mac(remote_mac)
+                            mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
+                            neighbors.append(
+                                {
+                                    "local_port": local_port,
+                                    "remote_device": remote_dev,
+                                    "remote_port": remote_port,
+                                    "remote_ip": "",
+                                    "remote_mac": remote_mac,
+                                    "platform": mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered",
+                                    "remote_platform": mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered",
+                                    "device_type": "switch",
+                                }
+                            )
+                except Exception:
+                    pass
+
         return neighbors
 
     def get_stp(self, conn) -> dict:
@@ -505,15 +573,28 @@ class JuniperDriver(BaseDriver):
         try:
             raw = conn.send_command("show poe controller | display json")
             data = json.loads(raw)
-            ctrl_info = data.get("poe-controller-information", [{}])[0]
-            ctrl_entries = ctrl_info.get("poe-controller-entry", [])
-            for c in ctrl_entries:
-                max_p = c.get("maximum-power", [{}])[0].get("data", "0").replace("W", "").strip()
-                con_p = c.get("consumed-power", [{}])[0].get("data", "0").replace("W", "").strip()
-                rem_p = c.get("available-power", [{}])[0].get("data", "0").replace("W", "").strip()
-                poe["total_power_watts"] += float(max_p or 0)
-                poe["used_power_watts"] += float(con_p or 0)
-                poe["available_power_watts"] += float(rem_p or 0)
+            ctrl_entries = data.get("poe-controller-information", [{}])[0].get("poe-controller-entry", [])
+            if ctrl_entries:
+                for c in ctrl_entries:
+                    max_p = c.get("maximum-power", [{}])[0].get("data", "0").replace("W", "").strip()
+                    con_p = c.get("consumed-power", [{}])[0].get("data", "0").replace("W", "").strip()
+                    rem_p = c.get("available-power", [{}])[0].get("data", "0").replace("W", "").strip()
+                    poe["total_power_watts"] += float(max_p or 0)
+                    poe["used_power_watts"] += float(con_p or 0)
+                    poe["available_power_watts"] += float(rem_p or 0)
+            else:
+                # Junos 18.x+ EX schema: {"poe": [{"controller-information": [...]}]}
+                ctrl_info_list = data.get("poe", [{}])[0].get("controller-information", [])
+                for c in ctrl_info_list:
+                    max_p = c.get("controller-maxpower", [{}])[0].get("data", "0").replace("W", "").strip()
+                    con_p = c.get("controller-power", [{}])[0].get("data", "0").replace("W", "").strip()
+                    rem_p = c.get("controller-available-power", [{}])[0].get("data", "").replace("W", "").strip()
+                    tot_v = float(max_p or 0)
+                    used_v = float(con_p or 0)
+                    avail_v = float(rem_p) if rem_p else max(0.0, round(tot_v - used_v, 2))
+                    poe["total_power_watts"] += tot_v
+                    poe["used_power_watts"] += used_v
+                    poe["available_power_watts"] += avail_v
         except Exception:
             try:
                 raw_txt = conn.send_command("show poe controller")
@@ -540,17 +621,32 @@ class JuniperDriver(BaseDriver):
             raw_if = conn.send_command("show poe interface | display json")
             data_if = json.loads(raw_if)
             entries = data_if.get("poe-interface-information", [{}])[0].get("poe-interface-entry", [])
-            for e in entries:
-                if_name = e.get("interface-name", [{}])[0].get("data", "").strip()
-                pwr = e.get("power-consumed", [{}])[0].get("data", "0").replace("W", "").strip()
-                status = e.get("power-status", [{}])[0].get("data", "").strip()
-                p_cls = e.get("interface-class", [{}])[0].get("data", "").strip()
-                if if_name:
-                    poe["ports"][if_name] = {
-                        "status": status or "ON",
-                        "watts": float(pwr or 0),
-                        "class": p_cls,
-                    }
+            if entries:
+                for e in entries:
+                    if_name = e.get("interface-name", [{}])[0].get("data", "").strip()
+                    pwr = e.get("power-consumed", [{}])[0].get("data", "0").replace("W", "").strip()
+                    status = e.get("power-status", [{}])[0].get("data", "").strip()
+                    p_cls = e.get("interface-class", [{}])[0].get("data", "").strip()
+                    if if_name:
+                        poe["ports"][if_name] = {
+                            "status": status or "ON",
+                            "watts": float(pwr or 0),
+                            "class": p_cls,
+                        }
+            else:
+                # Junos 18.x+ EX schema: {"poe": [{"interface-information": [...]}]}
+                entries_v2 = data_if.get("poe", [{}])[0].get("interface-information", [])
+                for e in entries_v2:
+                    if_name = e.get("interface-name", [{}])[0].get("data", "").strip()
+                    pwr = e.get("interface-power", [{}])[0].get("data", "0").replace("W", "").strip()
+                    status = e.get("interface-status", [{}])[0].get("data", "").strip()
+                    p_cls = e.get("interface-class", [{}])[0].get("data", "").strip()
+                    if if_name:
+                        poe["ports"][if_name] = {
+                            "status": status or "ON",
+                            "watts": float(pwr or 0),
+                            "class": p_cls,
+                        }
         except Exception:
             try:
                 raw_if_txt = conn.send_command("show poe interface")
@@ -574,23 +670,47 @@ class JuniperDriver(BaseDriver):
             data = json.loads(raw)
             table_info = data.get("ethernet-switching-table-information", [{}])[0]
             mac_entries = table_info.get("ethernet-switching-table-entry", [])
-            for e in mac_entries:
-                mac_raw = e.get("mac-address", [{}])[0].get("data", "")
-                if_raw = e.get("logical-interface", [{}])[0].get("data", "")
-                vlan = e.get("vlan-name", [{}])[0].get("data", "")
-                mtype = e.get("mac-type", [{}])[0].get("data", "dynamic").lower()
-                if mac_raw and if_raw:
-                    port = if_raw.split(".")[0]
-                    norm_mac = oui_lookup.normalize_mac(mac_raw).lower()
-                    entries.append(
-                        {
-                            "vlan": vlan or "default",
-                            "mac": norm_mac,
-                            "type": mtype,
-                            "interface": port,
-                            "vendor": oui_lookup.lookup_oui(norm_mac),
-                        }
-                    )
+            if mac_entries:
+                for e in mac_entries:
+                    mac_raw = e.get("mac-address", [{}])[0].get("data", "")
+                    if_raw = e.get("logical-interface", [{}])[0].get("data", "")
+                    vlan = e.get("vlan-name", [{}])[0].get("data", "")
+                    mtype = e.get("mac-type", [{}])[0].get("data", "dynamic").lower()
+                    if mac_raw and if_raw:
+                        port = if_raw.split(".")[0]
+                        norm_mac = oui_lookup.normalize_mac(mac_raw).lower()
+                        entries.append(
+                            {
+                                "vlan": vlan or "default",
+                                "mac": norm_mac,
+                                "type": mtype,
+                                "interface": port,
+                                "vendor": oui_lookup.lookup_oui(norm_mac),
+                            }
+                        )
+            else:
+                # Junos ELS (l2ng) schema: {"l2ng-l2ald-rtb-macdb": [{"l2ng-l2ald-mac-entry-vlan": [...]}]}
+                vlan_blocks = data.get("l2ng-l2ald-rtb-macdb", [{}])[0].get("l2ng-l2ald-mac-entry-vlan", [])
+                for vb in vlan_blocks:
+                    vlan_id = vb.get("l2ng-l2-vlan-id", [{}])[0].get("data", "")
+                    for e in vb.get("l2ng-mac-entry", []):
+                        mac_raw = e.get("l2ng-l2-mac-address", [{}])[0].get("data", "")
+                        if_raw = e.get("l2ng-l2-mac-logical-interface", [{}])[0].get("data", "")
+                        vlan = e.get("l2ng-l2-mac-vlan-name", [{}])[0].get("data", "") or vlan_id
+                        flags = e.get("l2ng-l2-mac-flags", [{}])[0].get("data", "D").upper()
+                        mtype = "static" if "S" in flags else "dynamic"
+                        if mac_raw and if_raw:
+                            port = if_raw.split(".")[0]
+                            norm_mac = oui_lookup.normalize_mac(mac_raw).lower()
+                            entries.append(
+                                {
+                                    "vlan": vlan or "default",
+                                    "mac": norm_mac,
+                                    "type": mtype,
+                                    "interface": port,
+                                    "vendor": oui_lookup.lookup_oui(norm_mac),
+                                }
+                            )
         except Exception:
             try:
                 raw_txt = conn.send_command("show ethernet-switching table")

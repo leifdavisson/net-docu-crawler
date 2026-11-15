@@ -27,6 +27,42 @@ from net_docu_crawler.drivers.base import BaseDriver
 
 _BARE_VT100_RE = re.compile(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])")
 
+_PROCURVE_SKU_MODELS: dict[str, str] = {
+    "J8697A": "HP 5406zl (J8697A)",
+    "J8698A": "HP 5412zl (J8698A)",
+    "J9085A": "HP 2610-24 (J9085A)",
+    "J9086A": "HP 2610-24/12PWR (J9086A)",
+    "J9087A": "HP 2610-24-PWR (J9087A)",
+    "J9088A": "HP 2610-48 (J9088A)",
+    "J9089A": "HP 2610-48-PWR (J9089A)",
+    "J9623A": "HP 2620-24 (J9623A)",
+    "J9624A": "HP 2620-24-PPoE+ (J9624A)",
+    "J9625A": "HP 2620-24-PoE+ (J9625A)",
+    "J9626A": "HP 2620-48 (J9626A)",
+    "J9627A": "HP 2620-48-PoE+ (J9627A)",
+    "J9772A": "HP 2530-48G-PoE+ (J9772A)",
+    "J9773A": "HP 2530-24G-PoE+ (J9773A)",
+    "J9774A": "HP 2530-8G-PoE+ (J9774A)",
+    "J9775A": "HP 2530-48G (J9775A)",
+    "J9776A": "HP 2530-24G (J9776A)",
+    "J9777A": "HP 2530-8G (J9777A)",
+    "J9853A": "HP 2530-48G-PoE+ (J9853A)",
+    "J9854A": "HP 2530-24G-PoE+ (J9854A)",
+    "J9855A": "HP 2530-48G (J9855A)",
+    "J9856A": "HP 2530-24G (J9856A)",
+}
+
+
+def _extract_model_from_config(raw_config: str) -> str:
+    """Extract HP/Aruba J/JL SKU from `show running-config` header comment."""
+    if not raw_config:
+        return ""
+    m = re.search(r";\s*(J[L]?\d{4}[A-Z])\s+Configuration Editor", raw_config, re.IGNORECASE)
+    if not m:
+        return ""
+    sku = m.group(1).upper()
+    return _PROCURVE_SKU_MODELS.get(sku, f"HP Switch ({sku})")
+
 
 def _clean_procurve_output(raw: str) -> str:
     """Strip ESC-prefixed ANSI/VT100 sequences, bare CSI cursor codes, and CRs."""
@@ -131,6 +167,14 @@ class HPProCurveDriver(BaseDriver):
             pass
 
         return info
+
+    def crawl(self, conn) -> dict:
+        data = super().crawl(conn)
+        if data.get("model") in ("", "HP Switch", "Unknown"):
+            sku_model = _extract_model_from_config(data.get("raw_config", ""))
+            if sku_model:
+                data["model"] = sku_model
+        return data
 
     def get_interfaces(self, conn) -> tuple[list, dict]:
         l3_interfaces = []
@@ -389,11 +433,16 @@ class HPProCurveDriver(BaseDriver):
         try:
             raw = conn.send_command("show mac-address")
             for line in raw.splitlines():
-                m_mac = re.match(r"^\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)\s+(\S+)\s+(\S+)", line)
-                if m_mac and not ("MAC Address" in line or "---" in line):
+                if "MAC Address" in line or "---" in line:
+                    continue
+                m_mac = re.match(
+                    r"^\s*([0-9a-fA-F]{6}-[0-9a-fA-F]{6}|(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2})\s+(\S+)(?:\s+(\S+))?",
+                    line,
+                )
+                if m_mac:
                     mac = oui_lookup.normalize_mac(m_mac.group(1)).lower()
                     port = m_mac.group(2)
-                    vlan = m_mac.group(3)
+                    vlan = m_mac.group(3) or "1"
                     mac_table.append({"mac": mac, "port": port, "vlan": vlan})
         except Exception:
             pass
@@ -456,10 +505,17 @@ class HPProCurveDriver(BaseDriver):
         try:
             raw = conn.send_command("show interfaces transceiver")
             for line in raw.splitlines():
+                if (
+                    not line.strip()
+                    or "---" in line
+                    or "Port" in line
+                    or "Transceiver" in line
+                    or "Invalid input" in line
+                ):
+                    continue
                 m_opt = re.match(
-                    r"^\s*(\S+)\s+(SFP\S*|QSFP\S*|XFP\S*)\s+(\S+)\s+",
+                    r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(\S+)\s+([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+)?",
                     line,
-                    re.IGNORECASE,
                 )
                 if m_opt:
                     optics.append(
@@ -467,6 +523,7 @@ class HPProCurveDriver(BaseDriver):
                             "port": m_opt.group(1),
                             "type": m_opt.group(2),
                             "part_number": m_opt.group(3),
+                            "serial": m_opt.group(4) or "",
                             "status": "present",
                         }
                     )

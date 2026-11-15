@@ -384,3 +384,53 @@ def test_blueprint_up_only_link_errors_and_optic_serials(tmp_path):
     assert "Input Errors: `12`, CRCs: `3`" in live_txt
     assert "GigabitEthernet1/0/2" not in live_txt
     assert "| **SW-EDGE-01** | `Gi1/0/12` | `GLC-SX-MMD` | `FNS18120999` |" in bp_txt
+
+
+def test_port_utilization_filters_zero_port_and_asset_inventory_types(tmp_path):
+    import csv
+
+    devices = {
+        "10.1.0.1": {
+            "hostname": "DO-Main-BLDG",
+            "status": "success",
+            "device_type": "switch",
+            "model": "HP 5412zl (J8698A)",
+            "l3_interfaces": [{"interface": f"VLAN{i}", "ip_address": f"10.1.{i}.1/24"} for i in range(6)],
+            "routes": [{"subnet": f"10.2.{i}.0/24", "next_hop": "10.1.0.2"} for i in range(12)],
+            "interfaces_detail": {
+                "A1": {"status": "up"},
+                "A2": {"status": "down"},
+            },
+        },
+        "10.1.0.225": {
+            "hostname": "10.1.0.225",
+            "status": "unsupported",
+            "device_type": "display",
+            "model": "Apple AirPlay Display",
+            "interfaces_detail": {},
+        },
+        "10.1.0.180": {
+            "hostname": "10.1.0.180",
+            "status": "unsupported",
+            "device_type": "av_control",
+            "model": "Extron AV Controller",
+            "interfaces_detail": {},
+        },
+    }
+    live_path = str(tmp_path / "live_report.md")
+    csv_path = str(tmp_path / "asset_inventory.csv")
+    report_generator.generate_network_analysis_report(devices, output_path=live_path)
+    report_generator.generate_asset_inventory(devices, output_path=csv_path)
+
+    with open(live_path, encoding="utf-8") as f:
+        live_txt = f.read()
+    util_section = live_txt.split("### Interface Port Utilization Summary")[1].split("### ")[0]
+    assert "| DO-Main-BLDG | 1 | 2 | 50.0% |" in util_section
+    assert "| 10.1.0.225 |" not in util_section
+    assert "| 10.1.0.180 |" not in util_section
+
+    with open(csv_path, encoding="utf-8") as f:
+        rows = {r["IP Address"]: r for r in csv.DictReader(f)}
+    assert rows["10.1.0.1"]["Role"] == "Core"
+    assert rows["10.1.0.225"]["Device Type"] == "Display"
+    assert rows["10.1.0.180"]["Device Type"] == "AV Control"

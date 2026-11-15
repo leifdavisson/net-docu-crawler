@@ -295,7 +295,17 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
                     role = "WLC"
                 elif custom_dev_type == "firewall":
                     role = "Perimeter Security"
-                elif "core" in hostname_lower or "c9500" in model_lower or "4500" in model_lower:
+                elif (
+                    "core" in hostname_lower
+                    or "c9500" in model_lower
+                    or "4500" in model_lower
+                    or "5412" in model_lower
+                    or "5406" in model_lower
+                    or (
+                        custom_dev_type in ("", "switch")
+                        and (len(dev.get("l3_interfaces", [])) >= 5 or len(dev.get("routes", [])) >= 10)
+                    )
+                ):
                     role = "Core"
                 elif "dist" in hostname_lower or "c3850" in model_lower or "c9300" in model_lower:
                     role = "Distribution"
@@ -322,6 +332,9 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
                     or "router" in hostname_lower
                 ):
                     dev_type = "Router"
+                elif custom_dev_type and custom_dev_type not in ("switch", "unknown"):
+                    _custom_labels = {"av_control": "AV Control", "ups": "UPS", "nas": "NAS", "iot": "IoT"}
+                    dev_type = _custom_labels.get(custom_dev_type, custom_dev_type.replace("_", " ").title())
 
                 status = dev.get("status", "success")
                 if status in ("unauthenticated", "unsupported", "discovered"):
@@ -1013,9 +1026,13 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("| Switch Hostname | Connected Ports | Total Ports | Utilization % |")
     lines.append("| --- | --- | --- | --- |")
     for ip, dev in devices.items():
-        hostname = dev.get("hostname") or ip
+        if dev.get("status", "success") != "success":
+            continue
         ints_detail = dev.get("interfaces_detail", {})
         total = len(ints_detail)
+        if total == 0:
+            continue
+        hostname = dev.get("hostname") or ip
         connected = 0
         for _name, stats in ints_detail.items():
             if stats.get("status") == "up":
