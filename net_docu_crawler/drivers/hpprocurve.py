@@ -74,7 +74,6 @@ class HPProCurveDriver(BaseDriver):
             "secret": self.secret,
             "timeout": self.timeout,
             "auth_timeout": self.timeout,
-            "ansi_escape_codes": True,
         }
         if self.session_log:
             device["session_log"] = self.session_log
