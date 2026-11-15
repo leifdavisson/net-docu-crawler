@@ -333,82 +333,17 @@ def crawl_target(
     session_log: str = "",
     log_file: str = "",
 ) -> dict | None:
-    msg_probe = f"Probing target: {ip}..."
-    print(f"\n[*] {msg_probe}")
-    _log_event(log_file, msg_probe)
-
-    # Tier 1 & 2: Pre-identification
-    vendor_cand, banner = detect_vendor_range(ip, timeout=float(timeout))
-    det_msg = f"Detection for {ip}: vendor='{vendor_cand}', banner={repr(banner[:40]) if banner else 'none'}"
-    print(f"[+] {det_msg}")
-    _log_event(log_file, det_msg)
-
-    # Determine which drivers to attempt in order
-    if vendor_cand in VENDOR_DRIVER_MAP:
-        driver_classes = [VENDOR_DRIVER_MAP[vendor_cand]]
-    elif ip.endswith(".253"):
-        driver_classes = [AristaDriver, CiscoDriver]
-    elif ip.endswith(".252"):
-        driver_classes = [FortinetDriver, CiscoDriver]
-    else:
-        driver_classes = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
-
-    _log_event(log_file, f"Attempting drivers for {ip}: {[d.__name__ for d in driver_classes]}")
-
-    # Prioritize matching credentials to avoid rapid-fire failed logins / AAA lockouts
-    sorted_creds = list(credentials)
-    if vendor_cand == "opnsense" or ip == "192.168.1.1":
-        sorted_creds.sort(key=lambda c: 0 if "192.168.1.1" in c.get("name", "") and c.get("username") == "root" else 1)
-    elif vendor_cand == "cisco" or ip.endswith(".250"):
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "Cisco" else 1)
-    elif vendor_cand == "juniper" or ip.endswith(".3"):
-        sorted_creds.sort(
-            key=lambda c: 0 if c.get("username") == "root" else (1 if c.get("username") == "admin" else 2)
-        )
-    elif vendor_cand in ("frrouting", "openwrt") or ip.endswith(".254"):
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
-    else:
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
-
-    for driver_cls in driver_classes:
-        for cred in sorted_creds:
-            user = cred.get("username", "")
-            pwd = cred.get("password", "")
-            secret = cred.get("secret", "")
-            if not user or not pwd:
-                continue
-
-            _log_event(log_file, f"Connecting to {ip} with {driver_cls.__name__} (User: {user})...")
-            try:
-                driver = driver_cls(
-                    ip=ip,
-                    username=user,
-                    password=pwd,
-                    secret=secret,
-                    timeout=timeout,
-                    session_log=session_log,
-                )
-                conn = driver.connect()
-                succ_msg = f"Successfully connected to {ip} with {driver_cls.__name__} (User: {user})"
-                print(f"[+] {succ_msg}")
-                _log_event(log_file, succ_msg)
-                data = driver.crawl(conn)
-                conn.disconnect()
-                _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
-                return data
-            except Exception as e:
-                err_msg = str(e).lower()
-                _log_event(
-                    log_file, f"Connection attempt failed on {ip} with {driver_cls.__name__} (User: {user}): {e}"
-                )
-                if "auth" in err_msg or "password" in err_msg:
-                    continue
-                else:
-                    break
-
-    fail_msg = f"Could not authenticate or connect to {ip}"
-    print(f"[-] {fail_msg}")
-    _log_event(log_file, fail_msg)
+    """Compatibility wrapper delegating single-target SSH crawls to `crawl_target_with_ports()`."""
+    res = crawl_target_with_ports(
+        ip=ip,
+        credentials=credentials,
+        timeout=timeout,
+        session_log=session_log,
+        log_file=log_file,
+        open_ports=[(22, "ssh")],
+    )
+    if res and res.get("status") == "success":
+        return res
     return None
 
 
@@ -817,11 +752,12 @@ def extract_followable_subnets(
     devices: list[dict],
     allow_cgnat: bool = False,
     allow_public: bool = False,
+    include_routes: bool = True,
     min_prefix: int = 22,
     max_prefix: int = 30,
 ) -> list[str]:
     """
-    Extract connected/routed IPv4 subnets from crawled devices (`l3_interfaces` and `routes`).
+    Extract connected IPv4 subnets from crawled devices (`l3_interfaces`, plus `routes` when `include_routes=True`).
     Enforces a strict RFC 1918 boundary by default: skips 0.0.0.0/0, loopback, link-local,
     multicast, CGNAT (100.64.0.0/10 unless `allow_cgnat`), and public IPs (unless `allow_public`).
     """
@@ -861,10 +797,44 @@ def extract_followable_subnets(
     for dev in devices:
         for iface in dev.get("l3_interfaces", []):
             _consider(iface.get("ip_address", ""))
-        for route in dev.get("routes", []):
-            _consider(route.get("subnet", ""))
+        if include_routes:
+            for route in dev.get("routes", []):
+                _consider(route.get("subnet", ""))
 
     return discovered
+
+
+def _select_hop_targets_for_cidrs(
+    cidrs: list[str],
+    registry: DeviceRegistry,
+    scanned_ip_set: set[str],
+) -> list[str]:
+    """
+    Use harvested ARP tables to target known-live hosts inside connected subnets
+    instead of blindly scanning 250+ dead IPs per VLAN. Falls back to full CIDR
+    expansion only when no ARP entries exist for a given subnet.
+    """
+    selected: list[str] = []
+    seen: set[str] = set(scanned_ip_set)
+    arp_ips = list(registry.global_arp.keys())
+
+    for cidr in cidrs:
+        try:
+            net = ipaddress.IPv4Network(cidr, strict=False)
+        except ValueError:
+            continue
+        arp_hits = [ip for ip in arp_ips if ipaddress.IPv4Address(ip) in net]
+        if arp_hits:
+            for ip in arp_hits:
+                if ip not in seen:
+                    seen.add(ip)
+                    selected.append(ip)
+        else:
+            for ip in expand_targets([cidr]):
+                if ip not in seen:
+                    seen.add(ip)
+                    selected.append(ip)
+    return selected
 
 
 def extract_neighbor_ips(
@@ -957,6 +927,7 @@ def crawl_network(
     snmp: bool = False,
     snmp_community: str = "public",
     follow_subnets: bool = False,
+    follow_routes: bool = False,
     follow_neighbors: bool = True,
     max_hops: int = 1,
     allow_cgnat: bool = False,
@@ -1049,7 +1020,7 @@ def crawl_network(
 
     # Expand any CIDR subnets and ip:port targets
     expanded_targets, explicit_ports = parse_target_specs(targets, ssh_ports=ssh_ports, telnet_ports=telnet_ports)
-    eff_ssh_ports = ssh_ports if ssh_ports is not None else [22, 2222]
+    eff_ssh_ports = ssh_ports if ssh_ports is not None else [22]
     eff_telnet_ports = telnet_ports if telnet_ports is not None else [23]
 
     raw_devices: list[dict] = []
@@ -1164,16 +1135,19 @@ def crawl_network(
                 raw_devices,
                 allow_cgnat=allow_cgnat,
                 allow_public=allow_public_subnets,
+                include_routes=follow_routes,
             )
             new_cidrs = [c for c in candidate_cidrs if c not in scanned_cidrs]
             if not new_cidrs:
                 break
             scanned_cidrs.update(new_cidrs)
-            hop_ips = [ip for ip in expand_targets(new_cidrs) if ip not in scanned_ip_set]
+            hop_ips = _select_hop_targets_for_cidrs(new_cidrs, registry, scanned_ip_set)
             if not hop_ips:
                 break
-            print(f"[+] Hop {hop}: following {len(new_cidrs)} routed subnet(s): {new_cidrs}")
-            _log_event(crawler_log, f"Hop {hop} following subnets: {new_cidrs}")
+            print(
+                f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}"
+            )
+            _log_event(crawler_log, f"Hop {hop} following subnets ({len(hop_ips)} IPs): {new_cidrs}")
             _run_batch(hop_ips, {})
 
     # ARP-only host inventory: include local ARP-visible hosts with no open SSH/Telnet ports
@@ -1252,6 +1226,63 @@ def crawl_network(
                     dev["mgmt_method"] = "SNMP"
                     dev["status"] = "unsupported"
 
+    return render_deliverables_from_dataset(
+        raw_devices=raw_devices,
+        registry=registry,
+        run_output_dir=run_output_dir,
+        targets=targets,
+        is_organized=is_organized,
+        sanitize_passwords=sanitize_passwords,
+        target_vendor=target_vendor,
+        save_baseline=save_baseline,
+        compare_baseline=compare_baseline,
+        logs_dir=logs_dir,
+    )
+
+
+def _sanitize_session_logs(logs_dir: str):
+    """Redact credentials/secrets from raw Netmiko/Paramiko session transcripts when --sanitize-passwords is enabled."""
+    if not logs_dir or not os.path.isdir(logs_dir):
+        return
+    for fname in os.listdir(logs_dir):
+        if not fname.endswith("_raw_session.log"):
+            continue
+        fpath = os.path.join(logs_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="ignore") as f:
+                raw_txt = f.read()
+            cleaned = sanitize_raw_config(raw_txt)
+            if cleaned != raw_txt:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(cleaned)
+        except Exception:
+            pass
+
+
+def render_deliverables_from_dataset(
+    raw_devices: list[dict],
+    registry: DeviceRegistry | None = None,
+    run_output_dir: str = "docs/net_docu_crawler",
+    targets: list[str] | None = None,
+    is_organized: bool = False,
+    sanitize_passwords: bool = False,
+    target_vendor: str = "",
+    save_baseline: str = "",
+    compare_baseline: str = "",
+    logs_dir: str = "",
+) -> list[dict]:
+    """
+    Resolve topology links, optionally sanitize secrets (including raw session logs),
+    export JSON/failed_hosts.json, and generate all Markdown/CSV/script deliverables.
+    Can be called live after `crawl_network()` or offline via `--from-dataset`.
+    """
+    os.makedirs(run_output_dir, exist_ok=True)
+    if registry is None:
+        registry = DeviceRegistry()
+        for dev in raw_devices:
+            if isinstance(dev, dict):
+                registry.register_device(dev)
+
     # Cross-resolve neighbor IPs/personas from crawled devices & Global ARP, then stitch topology edges
     crawled_by_ip = {d["ip"]: d for d in raw_devices if d.get("ip")}
     crawled_by_host = {}
@@ -1293,16 +1324,17 @@ def crawl_network(
             )
 
     confirmed_count = sum(1 for lk in registry.links if lk["status"] == "confirmed")
-    print(f"\n[+] Successfully crawled {len(raw_devices)} network devices!")
+    print(f"\n[+] Processed {len(raw_devices)} network devices!")
     print(f"[+] Unique devices in registry: {len(registry.devices)}")
     print(f"[+] Discovered topology links: {len(registry.links)} ({confirmed_count} bidirectional confirmed)")
 
-    # Optional security sanitization of secrets in configs
+    # Optional security sanitization of secrets in configs and raw session logs
     if sanitize_passwords:
-        print("[+] Sanitizing passwords and pre-shared keys in configuration backups...")
+        print("[+] Sanitizing passwords and pre-shared keys in configuration backups and session logs...")
         for dev in raw_devices:
             if dev.get("raw_config"):
                 dev["raw_config"] = sanitize_raw_config(dev["raw_config"])
+        _sanitize_session_logs(logs_dir or os.path.join(run_output_dir, "logs"))
 
     # Save consolidated raw crawl JSON
     json_path = os.path.join(run_output_dir, "net_docu_crawler_dataset.json")
@@ -1334,10 +1366,11 @@ def crawl_network(
     devices_dict = {dev["ip"]: dev for dev in registry.devices.values()}
 
     # Determine scope label
+    t_list = targets or []
     scope_label = (
-        targets[0]
-        if len(targets) == 1
-        else ("192.168.1.0/24" if any("192.168.1." in t for t in targets) else "Multi-Target Campus")
+        t_list[0]
+        if len(t_list) == 1
+        else ("192.168.1.0/24" if any("192.168.1." in t for t in t_list) else "Multi-Target Campus")
     )
 
     # 1. Master Migration Blueprint (Network_Analysis.md)
@@ -1459,6 +1492,38 @@ def crawl_network(
     return raw_devices
 
 
+def render_from_dataset_file(
+    dataset_path: str,
+    output_dir: str = "",
+    sanitize_passwords: bool = False,
+    target_vendor: str = "",
+    save_baseline: str = "",
+    compare_baseline: str = "",
+) -> list[dict]:
+    """
+    Offline mode (`--from-dataset`): load an existing `net_docu_crawler_dataset.json`
+    and re-run topology resolution + all deliverable generators with zero network traffic.
+    """
+    with open(dataset_path, encoding="utf-8") as f:
+        raw_devices = json.load(f)
+    if not isinstance(raw_devices, list):
+        raise ValueError(f"Expected JSON list in dataset {dataset_path}, got {type(raw_devices).__name__}")
+    target_dir = (
+        output_dir
+        if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler"))
+        else os.path.dirname(os.path.abspath(dataset_path))
+    )
+    print(f"[+] Loaded {len(raw_devices)} device record(s) from {dataset_path} (offline render -> {target_dir})")
+    return render_deliverables_from_dataset(
+        raw_devices=raw_devices,
+        run_output_dir=target_dir,
+        sanitize_passwords=sanitize_passwords,
+        target_vendor=target_vendor,
+        save_baseline=save_baseline,
+        compare_baseline=compare_baseline,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Net-Docu-Crawler Multi-Vendor Network Discovery")
     parser.add_argument(
@@ -1503,8 +1568,8 @@ def main():
         "--ssh-ports",
         nargs="+",
         type=int,
-        default=[22, 2222],
-        help="SSH ports to probe during subnet discovery (default: 22 2222)",
+        default=[22],
+        help="SSH ports to probe during subnet discovery (default: 22)",
     )
     parser.add_argument(
         "--telnet-ports",
@@ -1537,7 +1602,12 @@ def main():
     parser.add_argument(
         "--follow-subnets",
         action="store_true",
-        help="Follow connected/routed RFC 1918 subnets discovered from crawled routers/firewalls",
+        help="Follow directly connected RFC 1918 subnets discovered from crawled routers/firewalls",
+    )
+    parser.add_argument(
+        "--follow-routes",
+        action="store_true",
+        help="When --follow-subnets is enabled, also follow non-connected routing-table subnets",
     )
     parser.add_argument(
         "--no-follow-neighbors",
@@ -1596,6 +1666,11 @@ def main():
         help="Path to failed_hosts.json from a prior run to retry unauthenticated hosts only",
     )
     parser.add_argument(
+        "--from-dataset",
+        default="",
+        help="Offline mode: regenerate all deliverables from an existing net_docu_crawler_dataset.json",
+    )
+    parser.add_argument(
         "--validate-credentials",
         action="store_true",
         help="Validate --credentials JSON file(s) and exit without running a crawl",
@@ -1619,6 +1694,18 @@ def main():
 
     t_start = time.time()
     try:
+        if args.from_dataset:
+            render_from_dataset_file(
+                dataset_path=args.from_dataset,
+                output_dir=args.output_dir,
+                sanitize_passwords=args.sanitize_passwords,
+                target_vendor=args.target_vendor,
+                save_baseline=args.save_baseline,
+                compare_baseline=args.compare_baseline,
+            )
+            print(f"\n[+] Offline deliverable regeneration completed in {time.time() - t_start:.2f} seconds")
+            return
+
         crawl_network(
             targets=args.targets,
             credentials_path=args.credentials,
@@ -1634,6 +1721,7 @@ def main():
             snmp=args.snmp,
             snmp_community=args.snmp_community,
             follow_subnets=args.follow_subnets,
+            follow_routes=args.follow_routes,
             follow_neighbors=not args.no_follow_neighbors,
             max_hops=args.max_hops,
             allow_cgnat=args.allow_cgnat,

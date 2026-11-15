@@ -1043,7 +1043,7 @@ def test_detect_local_subnets_and_default_ssh_2222():
     ):
         assert detect_local_subnets() == ["192.168.50.0/24"]
 
-    # Default scan_host_ports checks [22, 2222] for SSH and [23] for Telnet
+    # Default scan_host_ports checks [22] for SSH and [23] for Telnet; explicit ssh_ports=[22, 2222] checks both
     probed = []
 
     def fake_probe(ip, port, timeout=0.8):
@@ -1051,8 +1051,14 @@ def test_detect_local_subnets_and_default_ssh_2222():
         return port == 2222
 
     with patch("net_docu_crawler.drivers.detector.probe_tcp_port", side_effect=fake_probe):
-        res = scan_host_ports("10.0.0.5")
-        assert (10, 0) != res
+        default_res = scan_host_ports("10.0.0.5")
+        assert ("10.0.0.5", 22) in probed
+        assert ("10.0.0.5", 2222) not in probed
+        assert ("10.0.0.5", 23) in probed
+        assert default_res == []
+
+        probed.clear()
+        res = scan_host_ports("10.0.0.5", ssh_ports=[22, 2222])
         assert ("10.0.0.5", 22) in probed
         assert ("10.0.0.5", 2222) in probed
         assert ("10.0.0.5", 23) in probed
@@ -1737,3 +1743,55 @@ def test_workflow_improvements(tmp_path):
     assert "10.29.0.33" not in l3_path.read_text(encoding="utf-8")
     assert "10.29.0.33" not in bom_path.read_text(encoding="utf-8")
     assert "GEN-FW-01" in bom_path.read_text(encoding="utf-8")
+
+
+def test_offline_dataset_render_and_arp_guided_subnets(tmp_path):
+    """Verify connected-only subnet extraction, ARP-guided hop selection, offline --from-dataset, and session log sanitization."""
+    import json
+
+    from net_docu_crawler.crawler import (
+        _select_hop_targets_for_cidrs,
+        extract_followable_subnets,
+        render_from_dataset_file,
+    )
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    devs = [
+        {
+            "hostname": "GEN-FW-01",
+            "ip": "10.29.0.1",
+            "vendor": "Fortinet",
+            "model": "FortiGate-100F",
+            "serial": "FG100F01",
+            "mac_address": "00:09:0f:09:00:01",
+            "device_type": "firewall",
+            "status": "success",
+            "l3_interfaces": [{"interface": "port1", "ip_address": "10.29.55.1/24", "status": "up"}],
+            "routes": [{"subnet": "10.99.0.0/24", "protocol": "Static", "next_hop": "10.29.0.254", "interface": "wan"}],
+            "arp_table": [{"ip": "10.29.55.10", "mac": "00:23:9c:aa:bb:cc"}],
+            "interfaces_detail": {"port1": {"status": "up"}},
+            "neighbors": [],
+            "raw_config": "enable secret 5 $1$secretHash\n",
+        }
+    ]
+    assert extract_followable_subnets(devs, include_routes=False) == ["10.29.55.0/24"]
+    assert extract_followable_subnets(devs, include_routes=True) == ["10.29.55.0/24", "10.99.0.0/24"]
+
+    reg = DeviceRegistry()
+    reg.register_device(devs[0])
+    hop_targets = _select_hop_targets_for_cidrs(["10.29.55.0/24"], reg, {"10.29.0.1"})
+    assert hop_targets == ["10.29.55.10"]
+
+    ds_dir = tmp_path / "site_run"
+    logs_dir = ds_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    ds_file = ds_dir / "net_docu_crawler_dataset.json"
+    ds_file.write_text(json.dumps(devs), encoding="utf-8")
+    sess_log = logs_dir / "10.29.0.1_raw_session.log"
+    sess_log.write_text("GEN-FW-01# show run\nenable secret 5 $1$secretHash\n", encoding="utf-8")
+
+    render_from_dataset_file(str(ds_file), sanitize_passwords=True)
+    assert (ds_dir / "Network_Analysis.md").exists()
+    assert (ds_dir / "L2_network_diagrams.md").exists()
+    assert "<REDACTED_SECRET>" in sess_log.read_text(encoding="utf-8")
+    assert "$1$secretHash" not in sess_log.read_text(encoding="utf-8")

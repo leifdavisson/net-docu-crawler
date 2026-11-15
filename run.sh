@@ -14,6 +14,7 @@ echo "1) Validate credentials.json"
 echo "2) Run organized crawl (--follow-subnets --max-hops 2)"
 echo "3) Retry failed hosts (--retry-failed)"
 echo "4) Update repo (git pull)"
+echo "5) Regenerate deliverables from dataset (--from-dataset)"
 echo "q) Quit"
 
 if ! read -r -p "Select an option: " choice; then
@@ -39,6 +40,12 @@ case "$choice" in
         ;;
     4)
         git pull
+        ;;
+    5)
+        if ! read -r -p "Path to net_docu_crawler_dataset.json: " dataset_path || [[ -z "$dataset_path" ]]; then
+            exit 0
+        fi
+        "$PY" net_crawler.py --from-dataset "$dataset_path"
         ;;
     q|Q|"")
         exit 0

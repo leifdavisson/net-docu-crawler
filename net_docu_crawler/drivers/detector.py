@@ -74,7 +74,7 @@ def scan_host_ports(
     timeout: float = 0.8,
 ) -> list[tuple[int, str]]:
     """Probes a single host for open SSH and Telnet ports, returning [(port, protocol)]."""
-    ssh_list = ssh_ports if ssh_ports is not None else [22, 2222]
+    ssh_list = ssh_ports if ssh_ports is not None else [22]
     telnet_list = telnet_ports if telnet_ports is not None else [23]
     open_services: list[tuple[int, str]] = []
     for p in ssh_list:
