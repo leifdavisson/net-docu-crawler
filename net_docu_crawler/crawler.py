@@ -619,6 +619,10 @@ def crawl_target_with_ports(
             )
         elif vendor_cand in ("frrouting", "openwrt"):
             sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
+        elif vendor_cand == "hpprocurve":
+            sorted_creds.sort(
+                key=lambda c: 0 if c.get("username") == "manager" else (1 if c.get("username") == "admin" else 2)
+            )
         else:
             sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
 
