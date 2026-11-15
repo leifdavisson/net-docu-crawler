@@ -2896,10 +2896,68 @@ def generate_cutover_validation_script(
         print(f"[-] Error writing cutover validation script: {e}")
 
 
-def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv"):
+def _recommend_replacement_sku(dev: dict, total_ports: int, poe_budget_w: float, target_vendor: str = "juniper") -> str:
+    """Recommend a replacement hardware SKU for the target vendor (defaults to Juniper)."""
+    tv = (target_vendor or "juniper").strip().lower()
+    dtype = (dev.get("device_type") or "switch").lower()
+    model_l = (dev.get("model") or "").lower()
+    host_l = (dev.get("hostname") or "").lower()
+    has_poe = poe_budget_w > 0 or bool((dev.get("poe") or {}).get("ports"))
+    is_core = (
+        "core" in host_l
+        or "5412" in model_l
+        or "5406" in model_l
+        or "ex4600" in model_l
+        or len(dev.get("l3_interfaces", []) or []) >= 5
+        or len(dev.get("routes", []) or []) >= 10
+    )
+
+    if tv in ("cisco", "cisco_ios", "cisco_xe"):
+        if dtype == "firewall":
+            return "FPR-1120"
+        if dtype == "router":
+            return "C8300-1N1S-4T2X"
+        if is_core:
+            return "C9500-48Y4C" if not has_poe else "C9300-48P"
+        if total_ports <= 28:
+            return "C9200L-24P-4X" if has_poe else "C9200L-24T-4X"
+        return "C9200L-48P-4X" if has_poe else "C9200L-48T-4X"
+
+    if tv in ("arista", "arista_eos"):
+        if is_core:
+            return "DCS-7050SX3-48YC8"
+        if total_ports <= 28:
+            return "CCS-720XP-24ZY4" if has_poe else "CCS-720XP-24Y6"
+        return "CCS-720XP-48ZC2" if has_poe else "CCS-720XP-48Y6"
+
+    if tv in ("hpprocurve", "procurve", "hp", "aruba"):
+        if is_core:
+            return "Aruba CX 6300M 48G PoE+" if has_poe else "Aruba CX 8325-48Y8C"
+        if total_ports <= 28:
+            return "Aruba CX 6200F 24G PoE+" if has_poe else "Aruba CX 6200F 24G"
+        return "Aruba CX 6200F 48G PoE+" if has_poe else "Aruba CX 6200F 48G"
+
+    # Default: Juniper Networks
+    if dtype == "firewall":
+        return "SRX345" if total_ports <= 16 else "SRX1500"
+    if dtype == "router":
+        return "MX204"
+    if is_core:
+        if "ex4600" in model_l or (not has_poe and len(dev.get("optics", []) or []) >= 8):
+            return "EX4600-40F"
+        return "EX4400-48P" if has_poe else "EX4650-48Y"
+    if total_ports <= 12:
+        return "EX2300-C-12P" if has_poe else "EX2300-C-12T"
+    if total_ports <= 28:
+        return "EX3400-24P" if has_poe else "EX3400-24T"
+    return "EX3400-48P" if has_poe else "EX3400-48T"
+
+
+def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv", target_vendor="juniper"):
     """
     Generate a hardware sizing & Bill-of-Materials (BOM) CSV aggregating per-device
-    port counts, PoE wattage budgets/draw, and SFP/SFP+/QSFP transceiver totals.
+    port counts, PoE wattage budgets/draw, SFP/SFP+/QSFP transceiver totals, and
+    recommended replacement SKUs (defaulting to Juniper).
     """
     fields = [
         "Hostname",
@@ -2914,6 +2972,7 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv")
         "PoE Active Ports",
         "Optics Count",
         "Optics Breakdown",
+        "Recommended SKU",
     ]
     try:
         infra_devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
@@ -2934,6 +2993,7 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv")
                     otype = str(opt.get("type") or opt.get("part_number") or "SFP").strip()
                     opt_counts[otype] = opt_counts.get(otype, 0) + 1
                 opt_str = "; ".join(f"{k}:{v}" for k, v in sorted(opt_counts.items())) or "None"
+                rec_sku = _recommend_replacement_sku(dev, total_ports, tot_w, target_vendor=target_vendor)
                 writer.writerow(
                     {
                         "Hostname": dev.get("hostname") or ip,
@@ -2948,6 +3008,7 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv")
                         "PoE Active Ports": poe_ports,
                         "Optics Count": len(optics),
                         "Optics Breakdown": opt_str,
+                        "Recommended SKU": rec_sku,
                     }
                 )
         print(f"BOM & hardware sizing CSV successfully written to {output_path}")
@@ -2957,14 +3018,14 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv")
 
 def generate_target_migration_configs(
     devices,
-    target_vendor="cisco",
+    target_vendor="juniper",
     output_path="target_migration_configs.md",
 ):
     """
     Generate vendor-neutral staged CLI configuration snippets for migrating
-    mixed-vendor devices onto a single target vendor (`cisco`, `juniper`, `arista`, `hpprocurve`).
+    mixed-vendor devices onto a single target vendor (`juniper`, `cisco`, `arista`, `hpprocurve`).
     """
-    tv = (target_vendor or "cisco").strip().lower()
+    tv = (target_vendor or "juniper").strip().lower()
     lines = [
         f"# Target Vendor Migration Configs (`{tv}`)",
         "",

@@ -310,7 +310,7 @@ def test_bom_sizing_and_target_vendor_migration_configs(tmp_path):
     with open(junos_path, encoding="utf-8") as f:
         junos_txt = f.read()
 
-    assert "SW-2920-24G,192.168.1.220,HPProCurve,J9727A,switch,2,1,370.0,45.2,1,2,SFP-SX:2" in bom_txt
+    assert "SW-2920-24G,192.168.1.220,HPProCurve,J9727A,switch,2,1,370.0,45.2,1,2,SFP-SX:2,EX2300-C-12P" in bom_txt
     assert "set system host-name SW-2920-24G" in junos_txt
     assert "set interfaces 1 unit 0 family ethernet-switching vlan members 10" in junos_txt
 

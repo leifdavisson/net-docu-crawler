@@ -1568,7 +1568,11 @@ def render_deliverables_from_dataset(
     print(f"[+] Generated configuration translation guide: {trans_path}")
 
     bom_path = os.path.join(run_output_dir, "bom_hardware_sizing.csv")
-    report_generator.generate_bom_hardware_sizing(devices_dict, output_path=bom_path)
+    report_generator.generate_bom_hardware_sizing(
+        devices_dict,
+        output_path=bom_path,
+        target_vendor=target_vendor or "juniper",
+    )
     print(f"[+] Generated BOM & hardware sizing CSV: {bom_path}")
 
     if target_vendor:
