@@ -1619,3 +1619,121 @@ def test_transceiver_serials_and_link_errors_across_drivers():
         "Transceiver in 1/1/49\n  Type : SFP+SR\n  Part Number : J9150D\n  Serial Number : AR998877\n"
     )
     assert ArubaDriver("10.0.0.5", "u", "p").get_optics(a_conn)[0]["serial"] == "AR998877"
+
+
+def test_workflow_improvements(tmp_path):
+    """Verify HTTP title sanitization, neighbor IP extraction, ARP MAC lookup, retry-failed merge, and infra filtering."""
+    import json
+
+    from net_docu_crawler.crawler import _sanitize_http_model_label, crawl_network, extract_neighbor_ips
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+    from report_generator import generate_bom_hardware_sizing, generate_l2_diagram, generate_l3_diagram
+
+    assert _sanitize_http_model_label({"title": "index.html", "server": "webserver"}) == ""
+    assert _sanitize_http_model_label({"title": "113c8d7f23ad525e42fdc1ab2a14803d"}) == ""
+    assert _sanitize_http_model_label({"title": "401 Authorization Required"}) == ""
+    assert _sanitize_http_model_label({"title": "EX2200-24P-4G Web UI"}) == "EX2200-24P-4G Web UI"
+
+    reg = DeviceRegistry()
+    reg.register_device(
+        {
+            "hostname": "GEN-FW-01",
+            "ip": "10.29.0.1",
+            "serial": "FW123",
+            "mac_address": "00:09:0f:09:00:01",
+            "arp_table": [{"ip": "10.29.55.10", "mac": "00:23:9c:aa:bb:cc"}],
+        }
+    )
+    assert reg.get_arp_mac("10.29.55.10") == "00:23:9c:aa:bb:cc"
+
+    nbr_ips = extract_neighbor_ips(
+        [
+            {
+                "status": "success",
+                "neighbors": [
+                    {"remote_device": "sw-01", "remote_ip": "", "remote_mac": "00:23:9c:aa:bb:cc", "device_type": "switch"},
+                    {"remote_device": "ap-01", "remote_ip": "10.29.55.90", "device_type": "ap"},
+                    {"remote_device": "sw-02", "remote_ip": "10.29.55.12", "device_type": "switch"},
+                ],
+            }
+        ],
+        registry=reg,
+    )
+    assert nbr_ips == ["10.29.55.10", "10.29.55.12"]
+
+    # Retry-failed merge preserves prior success devices from sibling dataset
+    run_dir = tmp_path / "prior_run"
+    run_dir.mkdir()
+    (run_dir / "net_docu_crawler_dataset.json").write_text(
+        json.dumps(
+            [
+                {
+                    "hostname": "GEN-FW-01",
+                    "ip": "10.29.0.1",
+                    "vendor": "Fortinet",
+                    "model": "FortiGate-100F",
+                    "serial": "FG100F01",
+                    "mac_address": "00:09:0f:09:00:01",
+                    "device_type": "firewall",
+                    "status": "success",
+                    "l3_interfaces": [{"interface": "port1", "ip_address": "10.29.0.1/23", "status": "up"}],
+                    "interfaces_detail": {"port1": {"status": "up"}},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    failed_file = run_dir / "failed_hosts.json"
+    failed_file.write_text(json.dumps([{"ip": "10.29.55.51", "status": "unauthenticated"}]), encoding="utf-8")
+    creds_file = tmp_path / "creds.json"
+    creds_file.write_text('[{"name": "admin", "username": "admin", "password": "pw"}]', encoding="utf-8")
+
+    with (
+        patch("net_docu_crawler.crawler.scan_subnet_ports", return_value={}),
+        patch("net_docu_crawler.crawler.get_arp_table_entries", return_value={}),
+    ):
+        merged = crawl_network(
+            targets=["10.29.0.1/23"],
+            credentials_path=[str(creds_file)],
+            output_dir=str(tmp_path / "merged_out"),
+            organize=False,
+            retry_failed=str(failed_file),
+        )
+        assert any(d.get("hostname") == "GEN-FW-01" and d.get("status") == "success" for d in merged)
+
+    # Infra-only filtering in L2, L3, and BOM
+    sample_devs = {
+        "10.29.0.1": {
+            "hostname": "GEN-FW-01",
+            "ip": "10.29.0.1",
+            "vendor": "Fortinet",
+            "model": "FortiGate-100F",
+            "device_type": "firewall",
+            "status": "success",
+            "l3_interfaces": [{"interface": "port1", "ip_address": "10.29.0.1/23", "status": "up"}],
+            "interfaces_detail": {"port1": {"status": "up"}},
+            "neighbors": [],
+        },
+        "10.29.0.33": {
+            "hostname": "10.29.0.33",
+            "ip": "10.29.0.33",
+            "vendor": "Hikvision",
+            "model": "Camera",
+            "device_type": "camera",
+            "status": "unsupported",
+            "l3_interfaces": [],
+            "interfaces_detail": {},
+            "neighbors": [],
+        },
+    }
+    l2_path = tmp_path / "L2.md"
+    l3_path = tmp_path / "L3.md"
+    bom_path = tmp_path / "bom.csv"
+    generate_l2_diagram(sample_devs, str(l2_path))
+    generate_l3_diagram(sample_devs, str(l3_path))
+    generate_bom_hardware_sizing(sample_devs, str(bom_path))
+
+    assert "10.29.0.33" not in l2_path.read_text(encoding="utf-8")
+    assert "10.29.0.33" not in l3_path.read_text(encoding="utf-8")
+    assert "10.29.0.33" not in bom_path.read_text(encoding="utf-8")
+    assert "GEN-FW-01" in bom_path.read_text(encoding="utf-8")

@@ -249,6 +249,18 @@ def get_unique_devices(devices):
     return {ip: unique_devices[ip] for ip in sorted(unique_devices.keys(), key=ip_sort_key)}
 
 
+_INFRA_DEVICE_TYPES = frozenset({"switch", "router", "firewall", "ap", "wlc", "wireless", "gateway", "bridge"})
+
+
+def _is_network_infra(dev: dict) -> bool:
+    """Return True if a device record represents crawled network infrastructure rather than a passive endpoint."""
+    status = str(dev.get("status", "success")).strip().lower()
+    if status != "success":
+        return False
+    dtype = str(dev.get("device_type") or dev.get("device_persona") or "switch").strip().lower()
+    return dtype in _INFRA_DEVICE_TYPES
+
+
 def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
     """
     Generates the authoritative Asset Inventory CSV.
@@ -344,6 +356,7 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
     Generates the L2/Physical Network Diagram using Mermaid.js.
     Shows switch stacks, APs, uplinks, fiber paths, and STP states.
     """
+    devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
     lines = [
         "# Layer 2 & Physical Network Diagrams",
         "",
@@ -645,6 +658,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
     Generates L3 logical and routing topologies using Mermaid.js mindmap.
     Lists subnets, SVIs, VLANs, and VRFs.
     """
+    devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
     # 1. Build adjacency list of the bipartite graph
     adj = {}  # node -> set of neighbors
     subnets = set()
@@ -2885,10 +2899,11 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv")
         "Optics Breakdown",
     ]
     try:
+        infra_devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
-            for ip, dev in devices.items():
+            for ip, dev in infra_devices.items():
                 ints_detail = dev.get("interfaces_detail", {}) or {}
                 total_ports = len(ints_detail)
                 active_ports = sum(1 for d in ints_detail.values() if str(d.get("status", "")).lower() == "up")

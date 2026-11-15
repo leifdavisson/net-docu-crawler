@@ -282,6 +282,12 @@ class DeviceRegistry:
 
             return device_id
 
+    def get_arp_mac(self, ip: str) -> str:
+        """Return a previously harvested ARP MAC address for `ip`, or '' if unknown."""
+        with self._lock:
+            entry = self.global_arp.get(ip)
+            return entry.get("mac", "") if entry else ""
+
     def resolve_neighbor_ip(self, neighbor_mac: str = "", neighbor_name: str = "") -> str | None:
         """
         Resolves a neighbor's IPv4 address when LLDP only provides a MAC address or system name (e.g. Junos).

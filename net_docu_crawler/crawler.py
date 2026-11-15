@@ -528,6 +528,56 @@ def build_partial_device_record(
     }
 
 
+_GENERIC_HTTP_LABELS = frozenset(
+    {
+        "index",
+        "index.html",
+        "index.htm",
+        "home",
+        "login",
+        "welcome",
+        "webserver",
+        "web server",
+        "http",
+        "https",
+        "nginx",
+        "apache",
+        "lighttpd",
+        "boa",
+        "mini_httpd",
+        "thttpd",
+        "400 bad request",
+        "401 unauthorized",
+        "401 authorization required",
+        "403 forbidden",
+        "404 not found",
+        "error",
+        "redirect",
+        "document moved",
+    }
+)
+
+
+def _sanitize_http_model_label(fp: dict | None) -> str:
+    """Extract a meaningful hardware/product label from an HTTP/TLS fingerprint, filtering generic web titles."""
+    if not fp:
+        return ""
+    for candidate in (fp.get("title"), fp.get("server"), fp.get("cert_cn")):
+        val = str(candidate or "").strip()
+        if not val:
+            continue
+        low = val.lower()
+        if low in _GENERIC_HTTP_LABELS:
+            continue
+        if low.startswith(("401 ", "403 ", "404 ", "500 ", "502 ", "503 ")):
+            continue
+        # Reject 16+ char pure hex hashes (e.g. session/CSRF/MD5 page titles)
+        if len(val) >= 16 and re.fullmatch(r"[0-9a-fA-F]+", val):
+            continue
+        return val[:60]
+    return ""
+
+
 def crawl_target_with_ports(
     ip: str,
     credentials: list[dict],
@@ -555,6 +605,8 @@ def crawl_target_with_ports(
     last_banner = ""
     last_port, last_transport = ports_to_try[0]
     last_app_class: tuple[str, str] | None = None
+    cached_http_fp: dict | None = None
+    http_probed = False
     saw_auth_failure = False
 
     for port, transport in ports_to_try:
@@ -575,9 +627,12 @@ def crawl_target_with_ports(
         if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
             vendor_cand = hint_norm
         elif vendor_cand == "unknown":
-            http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5)) if http_fingerprint else None
-            if http_fp:
-                _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {http_fp}")
+            if http_fingerprint and not http_probed:
+                cached_http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
+                http_probed = True
+                if cached_http_fp:
+                    _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {cached_http_fp}")
+            http_fp = cached_http_fp
             http_vendor = infer_vendor_from_http(http_fp)
             if http_vendor != "unknown":
                 vendor_cand = http_vendor
@@ -612,25 +667,19 @@ def crawl_target_with_ports(
 
         if vendor_cand in VENDOR_DRIVER_MAP:
             driver_classes = [VENDOR_DRIVER_MAP[vendor_cand]]
-        elif ip.endswith(".253"):
-            driver_classes = [AristaDriver, CiscoDriver]
-        elif ip.endswith(".252"):
-            driver_classes = [FortinetDriver, CiscoDriver]
         else:
             driver_classes = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
 
         sorted_creds = list(credentials)
-        if vendor_cand == "opnsense" or ip == "192.168.1.1":
-            sorted_creds.sort(
-                key=lambda c: 0 if "192.168.1.1" in c.get("name", "") and c.get("username") == "root" else 1
-            )
-        elif vendor_cand == "cisco" or ip.endswith(".250"):
-            sorted_creds.sort(key=lambda c: 0 if c.get("username") == "Cisco" else 1)
-        elif vendor_cand == "juniper" or ip.endswith(".3"):
+        if vendor_cand == "opnsense":
+            sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
+        elif vendor_cand == "cisco":
+            sorted_creds.sort(key=lambda c: 0 if c.get("username") in ("Cisco", "admin") else 1)
+        elif vendor_cand == "juniper":
             sorted_creds.sort(
                 key=lambda c: 0 if c.get("username") == "root" else (1 if c.get("username") == "admin" else 2)
             )
-        elif vendor_cand in ("frrouting", "openwrt") or ip.endswith(".254"):
+        elif vendor_cand in ("frrouting", "openwrt"):
             sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
         else:
             sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
@@ -748,7 +797,7 @@ def crawl_target_with_ports(
     fail_msg = f"Could not authenticate or connect to {ip} (recording partial inventory status={status})"
     print(f"[-] {fail_msg}")
     _log_event(log_file, fail_msg)
-    return build_partial_device_record(
+    partial = build_partial_device_record(
         ip=ip,
         mac=host_mac,
         vendor=last_vendor,
@@ -759,6 +808,9 @@ def crawl_target_with_ports(
         device_type=last_app_class[0] if last_app_class else "unknown",
         model_override=last_app_class[1] if last_app_class else "",
     )
+    if http_probed:
+        partial["_http_fp"] = cached_http_fp
+    return partial
 
 
 def extract_followable_subnets(
@@ -815,6 +867,55 @@ def extract_followable_subnets(
     return discovered
 
 
+def extract_neighbor_ips(
+    devices: list[dict],
+    registry: DeviceRegistry | None = None,
+    allow_cgnat: bool = False,
+    allow_public: bool = False,
+) -> list[str]:
+    """
+    Extract unique management IPv4 addresses of CDP/LLDP infrastructure neighbors
+    from crawled devices (using explicit `remote_ip` or `registry.resolve_neighbor_ip()`).
+    Enforces RFC 1918 boundary unless `allow_cgnat` / `allow_public` is set.
+    """
+    cgnat_net = ipaddress.IPv4Network("100.64.0.0/10")
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    for dev in devices:
+        if dev.get("status", "success") != "success":
+            continue
+        for nbr in dev.get("neighbors", []):
+            if str(nbr.get("device_type", "")).lower() == "ap":
+                continue
+            cand_ip = str(nbr.get("remote_ip", "")).strip()
+            if not cand_ip and registry is not None:
+                cand_ip = (
+                    registry.resolve_neighbor_ip(
+                        neighbor_mac=nbr.get("remote_mac", ""),
+                        neighbor_name=nbr.get("remote_device", ""),
+                    )
+                    or ""
+                )
+            if not cand_ip or cand_ip in seen:
+                continue
+            try:
+                addr = ipaddress.IPv4Address(cand_ip)
+            except ValueError:
+                continue
+            if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+                continue
+            if addr in cgnat_net:
+                if not (allow_cgnat or allow_public):
+                    continue
+            elif not addr.is_private and not allow_public:
+                continue
+            seen.add(cand_ip)
+            discovered.append(cand_ip)
+
+    return discovered
+
+
 def compute_organized_output_dir(
     targets: list[str],
     base_dir: str = "deliverables",
@@ -856,6 +957,7 @@ def crawl_network(
     snmp: bool = False,
     snmp_community: str = "public",
     follow_subnets: bool = False,
+    follow_neighbors: bool = True,
     max_hops: int = 1,
     allow_cgnat: bool = False,
     allow_public_subnets: bool = False,
@@ -866,6 +968,7 @@ def crawl_network(
     compare_baseline: str = "",
     retry_failed: str = "",
 ) -> list[dict]:
+    prior_success_devices: list[dict] = []
     if retry_failed:
         with open(retry_failed, encoding="utf-8") as f:
             failed_entries = json.load(f)
@@ -892,6 +995,25 @@ def crawl_network(
         if not targets:
             print("[!] No retryable hosts found in failed_hosts.json.")
             return []
+
+        sibling_dataset = os.path.join(os.path.dirname(os.path.abspath(retry_failed)), "net_docu_crawler_dataset.json")
+        if os.path.isfile(sibling_dataset):
+            try:
+                with open(sibling_dataset, encoding="utf-8") as df:
+                    prior_data = json.load(df)
+                retry_ip_set = set(retry_ips)
+                if isinstance(prior_data, list):
+                    prior_success_devices = [
+                        d
+                        for d in prior_data
+                        if isinstance(d, dict) and d.get("status", "success") == "success" and d.get("ip") not in retry_ip_set
+                    ]
+                    if prior_success_devices:
+                        print(
+                            f"[+] Merging {len(prior_success_devices)} previously succeeded device(s) from {sibling_dataset}."
+                        )
+            except Exception as exc:
+                print(f"[!] Could not load prior dataset {sibling_dataset} for merge: {exc}")
 
     credentials, cred_warnings, cred_errors = load_and_validate_credentials(credentials_path)
     for w in cred_warnings:
@@ -934,6 +1056,12 @@ def crawl_network(
     registry = DeviceRegistry()
     scanned_ip_set: set[str] = set()
     scanned_cidrs: set[str] = {t.strip() for t in targets if "/" in t}
+
+    for prior_dev in prior_success_devices:
+        registry.register_device(prior_dev)
+        raw_devices.append(prior_dev)
+        if prior_dev.get("ip"):
+            scanned_ip_set.add(prior_dev["ip"])
 
     def _run_batch(batch_ips: list[str], batch_explicit: dict[str, list[tuple[int, str]]]):
         if not batch_ips:
@@ -983,6 +1111,7 @@ def crawl_network(
                     session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
                     log_file=crawler_log,
                     open_ports=open_ports_map.get(ip),
+                    mac=registry.get_arp_mac(ip),
                     http_fingerprint=http_fingerprint,
                     vendor_hint=vendor_hint,
                     try_all_creds=try_all_creds,
@@ -1007,6 +1136,26 @@ def crawl_network(
                 registry.release_crawl(ip)
 
     _run_batch(expanded_targets, explicit_ports)
+
+    # Neighbor-first discovery: crawl CDP/LLDP management IPs discovered on crawled infrastructure
+    if follow_neighbors and not retry_failed:
+        nbr_hops = max(1, max_hops)
+        for hop in range(1, nbr_hops + 1):
+            nbr_ips = [
+                ip
+                for ip in extract_neighbor_ips(
+                    raw_devices,
+                    registry=registry,
+                    allow_cgnat=allow_cgnat,
+                    allow_public=allow_public_subnets,
+                )
+                if ip not in scanned_ip_set
+            ]
+            if not nbr_ips:
+                break
+            print(f"[+] Neighbor Hop {hop}: queuing {len(nbr_ips)} CDP/LLDP neighbor IP(s): {nbr_ips}")
+            _log_event(crawler_log, f"Neighbor Hop {hop} queuing IPs: {nbr_ips}")
+            _run_batch(nbr_ips, {})
 
     # Optional multi-hop routed subnet discovery (--follow-subnets)
     if follow_subnets and max_hops > 0:
@@ -1049,26 +1198,36 @@ def crawl_network(
     # Enrich partial/ARP-discovered hosts via read-only HTTP/HTTPS banner & TLS cert fingerprinting
     partial_devs = [d for d in raw_devices if d.get("status") in ("discovered", "unauthenticated", "unsupported")]
     if http_fingerprint and partial_devs:
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(partial_devs))) as pool:
-            http_futs = {
-                pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d for d in partial_devs
-            }
-            for fut in as_completed(http_futs):
-                dev = http_futs[fut]
-                try:
-                    fp = fut.result()
-                except Exception:
-                    fp = None
-                if not fp:
-                    continue
-                label = fp.get("title") or fp.get("server") or fp.get("cert_cn") or ""
-                if label and (dev.get("model") in ("Unknown", "") or dev.get("model", "").endswith(" Device")):
-                    dev["model"] = label[:60]
-                if dev.get("status") == "discovered":
-                    scheme = fp["scheme"].upper()
-                    port = fp["port"]
-                    dev["mgmt_method"] = scheme if port in (80, 443) else f"{scheme}:{port}"
-                    dev["status"] = "unsupported"
+        to_probe = [d for d in partial_devs if "_http_fp" not in d]
+        probed_results: dict[int, dict | None] = {}
+        if to_probe:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(to_probe))) as pool:
+                http_futs = {
+                    pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d
+                    for d in to_probe
+                }
+                for fut in as_completed(http_futs):
+                    dev = http_futs[fut]
+                    try:
+                        probed_results[id(dev)] = fut.result()
+                    except Exception:
+                        probed_results[id(dev)] = None
+
+        for dev in partial_devs:
+            fp = dev.pop("_http_fp", None) if "_http_fp" in dev else probed_results.get(id(dev))
+            if not fp:
+                continue
+            label = _sanitize_http_model_label(fp)
+            if label and (dev.get("model") in ("Unknown", "") or dev.get("model", "").endswith(" Device")):
+                dev["model"] = label
+            if dev.get("status") == "discovered":
+                scheme = fp["scheme"].upper()
+                port = fp["port"]
+                dev["mgmt_method"] = scheme if port in (80, 443) else f"{scheme}:{port}"
+                dev["status"] = "unsupported"
+    else:
+        for dev in partial_devs:
+            dev.pop("_http_fp", None)
 
     # Optional SNMP sysDescr / sysName enrichment (--snmp)
     if snmp and partial_devs:
@@ -1381,6 +1540,11 @@ def main():
         help="Follow connected/routed RFC 1918 subnets discovered from crawled routers/firewalls",
     )
     parser.add_argument(
+        "--no-follow-neighbors",
+        action="store_true",
+        help="Disable automatic crawling of CDP/LLDP neighbor management IPs discovered on crawled devices",
+    )
+    parser.add_argument(
         "--max-hops",
         type=int,
         default=1,
@@ -1470,6 +1634,7 @@ def main():
             snmp=args.snmp,
             snmp_community=args.snmp_community,
             follow_subnets=args.follow_subnets,
+            follow_neighbors=not args.no_follow_neighbors,
             max_hops=args.max_hops,
             allow_cgnat=args.allow_cgnat,
             allow_public_subnets=args.allow_public_subnets,
