@@ -1890,6 +1890,25 @@ def reparse_logs_dir(
     )
 
 
+def format_duration(seconds: float) -> str:
+    """Format elapsed seconds with a human-readable days/hours/minutes breakdown when >= 60s."""
+    total = max(0.0, float(seconds))
+    if total < 60:
+        return f"{total:.2f} seconds"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days >= 1:
+        parts.append(f"{int(days)}d")
+    if hours >= 1 or parts:
+        parts.append(f"{int(hours)}h")
+    if minutes >= 1 or parts:
+        parts.append(f"{int(minutes)}m")
+    parts.append(f"{secs:.2f}s")
+    return f"{total:.2f} seconds ({' '.join(parts)})"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Net-Docu-Crawler Multi-Vendor Network Discovery")
     parser.add_argument(
@@ -2096,7 +2115,7 @@ def main():
                 save_baseline=args.save_baseline,
                 compare_baseline=args.compare_baseline,
             )
-            print(f"\n[+] Offline log re-parse completed in {time.time() - t_start:.2f} seconds")
+            print(f"\n[+] Offline log re-parse completed in {format_duration(time.time() - t_start)}")
             return
 
         if args.from_dataset:
@@ -2108,7 +2127,7 @@ def main():
                 save_baseline=args.save_baseline,
                 compare_baseline=args.compare_baseline,
             )
-            print(f"\n[+] Offline deliverable regeneration completed in {time.time() - t_start:.2f} seconds")
+            print(f"\n[+] Offline deliverable regeneration completed in {format_duration(time.time() - t_start)}")
             return
 
         crawl_network(
@@ -2144,7 +2163,7 @@ def main():
         )
     except ValueError:
         sys.exit(1)
-    print(f"\n[+] Total crawl and documentation runtime: {time.time() - t_start:.2f} seconds")
+    print(f"\n[+] Total crawl and documentation runtime: {format_duration(time.time() - t_start)}")
 
 
 if __name__ == "__main__":

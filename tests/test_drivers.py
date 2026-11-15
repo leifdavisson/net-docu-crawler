@@ -2305,3 +2305,12 @@ def test_smart_follow_subnets_arp_only_mgmt_and_zero_arp_pruning():
     )
     assert "10.250.2.2" in pruned_targets
     assert all(not ip.startswith("10.99.99.") for ip in pruned_targets)
+
+
+def test_format_duration_breakdown():
+    from net_docu_crawler.crawler import format_duration
+
+    assert format_duration(42.5) == "42.50 seconds"
+    assert format_duration(95.4) == "95.40 seconds (1m 35.40s)"
+    assert format_duration(3725.0) == "3725.00 seconds (1h 2m 5.00s)"
+    assert format_duration(90061.5) == "90061.50 seconds (1d 1h 1m 1.50s)"
