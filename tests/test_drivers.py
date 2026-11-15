@@ -2268,9 +2268,9 @@ def test_smart_follow_subnets_arp_only_mgmt_and_zero_arp_pruning():
                 {"interface": "EMPTY_VLAN", "ip_address": "10.99.99.1/24", "status": "up"},
             ],
             "arp_table": [
-                {"ip": "10.250.6.2", "mac": "00:23:9c:11:22:33"},  # Juniper infra
-                {"ip": "10.250.6.50", "mac": "00:03:93:aa:bb:cc"},  # Apple endpoint
-                {"ip": "10.6.90.20", "mac": "f4:0f:24:11:22:33"},  # Apple endpoint
+                {"ip": "10.250.6.2", "mac": "00:23:9c:11:22:33", "vendor": "Juniper Networks"},
+                {"ip": "10.250.6.50", "mac": "00:03:93:aa:bb:cc", "vendor": "Apple"},
+                {"ip": "10.6.90.20", "mac": "f4:0f:24:11:22:33", "vendor": "Apple"},
             ],
         }
     ]
