@@ -129,6 +129,7 @@ When executed with `--organize` (or into `docs/net_docu_crawler/`), the crawler 
 * **[Junior Operator Playbook (Zero-Knowledge Beginner Guide)](docs/junior_operator_playbook.md)**: Beginner-friendly step-by-step walkthrough for technicians who only know basic IP concepts.
 * **[Agent & Contributor Architecture Guide](AGENTS.md)**: Operational guardrails, zero-blast-radius rules, and code architecture.
 * **[Driver Command Reference](docs/drivers/overview.md)**: Supported read-only CLI command matrices and transport notes for all 12 supported network operating systems.
+* **[Manual Page (`net-crawler(1)`)](docs/man/net-crawler.1)**: Full CLI reference (`man -l docs/man/net-crawler.1`).
 * **[Virtual Lab & Driver Roadmap](docs/proxmox_lab_and_driver_roadmap.md)**: Architecture and setup for virtualized multi-vendor Proxmox VE testbeds.
 
 ---
