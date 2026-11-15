@@ -2245,3 +2245,63 @@ def test_juniper_skips_poe_on_non_poe_models_and_syntax_error():
     poe2 = drv2.get_poe(SyntaxErrConn())
     assert poe2["total_power_watts"] == 0.0
     assert calls_err == ["show poe controller | display json", "show poe controller"]
+
+
+def test_smart_follow_subnets_arp_only_mgmt_and_zero_arp_pruning():
+    from net_docu_crawler.crawler import _select_hop_targets_for_cidrs, extract_followable_subnets
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    devs = [
+        {
+            "hostname": "CORE-SW",
+            "ip": "10.1.0.1",
+            "vendor": "HP ProCurve / ArubaOS-S",
+            "model": "HP 5412zl",
+            "serial": "SG123",
+            "mac_address": "88:51:fb:79:89:00",
+            "device_type": "switch",
+            "status": "success",
+            "l3_interfaces": [
+                {"interface": "MGMT_VLAN", "ip_address": "10.250.6.1/24", "status": "up"},
+                {"interface": "STUDENT_WIFI", "ip_address": "10.6.90.1/24", "status": "up"},
+                {"interface": "P2P_UPLINK", "ip_address": "10.250.2.1/30", "status": "up"},
+                {"interface": "EMPTY_VLAN", "ip_address": "10.99.99.1/24", "status": "up"},
+            ],
+            "arp_table": [
+                {"ip": "10.250.6.2", "mac": "00:23:9c:11:22:33"},  # Juniper infra
+                {"ip": "10.250.6.50", "mac": "00:03:93:aa:bb:cc"},  # Apple endpoint
+                {"ip": "10.6.90.20", "mac": "f4:0f:24:11:22:33"},  # Apple endpoint
+            ],
+        }
+    ]
+    # mgmt_only keeps MGMT_VLAN and /30 P2P_UPLINK, drops STUDENT_WIFI and EMPTY_VLAN
+    mgmt_cidrs = extract_followable_subnets(devs, include_routes=False, mgmt_only=True)
+    assert mgmt_cidrs == ["10.250.6.0/24", "10.250.2.0/30"]
+
+    # subnet_include / subnet_exclude filtering
+    inc_cidrs = extract_followable_subnets(
+        devs, include_routes=False, subnet_include=["10.250.0.0/16"], subnet_exclude=["10.250.2.0/30"]
+    )
+    assert inc_cidrs == ["10.250.6.0/24"]
+
+    reg = DeviceRegistry()
+    reg.register_device(devs[0])
+
+    # arp_only=True skips Apple endpoints and never expands empty /24 or /30
+    arp_targets = _select_hop_targets_for_cidrs(
+        ["10.250.6.0/24", "10.6.90.0/24", "10.99.99.0/24", "10.250.2.0/30"],
+        reg,
+        {"10.1.0.1"},
+        arp_only=True,
+    )
+    assert arp_targets == ["10.250.6.2"]
+
+    # arp_only=False prunes empty /24 (10.99.99.0/24) when global_arp exists, but keeps /30 P2P
+    pruned_targets = _select_hop_targets_for_cidrs(
+        ["10.99.99.0/24", "10.250.2.0/30"],
+        reg,
+        {"10.1.0.1", "10.250.2.1"},
+        arp_only=False,
+    )
+    assert "10.250.2.2" in pruned_targets
+    assert all(not ip.startswith("10.99.99.") for ip in pruned_targets)

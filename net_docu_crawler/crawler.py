@@ -755,6 +755,51 @@ def crawl_target_with_ports(
     return partial
 
 
+_MGMT_IFACE_RE = re.compile(
+    r"(?:mgmt|manage|infra|switch|sw[_-]|core|dist|loopback|^lo0|p2p|transit|uplink|default_vlan|^vlan\.?1$)",
+    re.IGNORECASE,
+)
+
+_NON_INFRA_OUI_KEYWORDS: tuple[str, ...] = (
+    "apple",
+    "dell",
+    "lenovo",
+    "intel",
+    "samsung",
+    "google",
+    "sonos",
+    "roku",
+    "crestron",
+    "extron",
+    "hikvision",
+    "axis",
+    "brother",
+    "canon",
+    "epson",
+    "xerox",
+    "ricoh",
+    "lexmark",
+    "polycom",
+    "yealink",
+    "grandstream",
+    "ring",
+    "nest",
+    "raspberry",
+    "microsoft",
+    "vmware",
+)
+
+
+def _parse_cidr_list(raw_cidrs: list[str] | None) -> list[ipaddress.IPv4Network]:
+    nets: list[ipaddress.IPv4Network] = []
+    for raw in raw_cidrs or []:
+        try:
+            nets.append(ipaddress.IPv4Network(raw.strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
 def extract_followable_subnets(
     devices: list[dict],
     allow_cgnat: bool = False,
@@ -762,6 +807,9 @@ def extract_followable_subnets(
     include_routes: bool = True,
     min_prefix: int = 22,
     max_prefix: int = 30,
+    mgmt_only: bool = False,
+    subnet_include: list[str] | None = None,
+    subnet_exclude: list[str] | None = None,
 ) -> list[str]:
     """
     Extract connected IPv4 subnets from crawled devices (`l3_interfaces`, plus `routes` when `include_routes=True`).
@@ -769,10 +817,12 @@ def extract_followable_subnets(
     multicast, CGNAT (100.64.0.0/10 unless `allow_cgnat`), and public IPs (unless `allow_public`).
     """
     cgnat_net = ipaddress.IPv4Network("100.64.0.0/10")
+    include_nets = _parse_cidr_list(subnet_include)
+    exclude_nets = _parse_cidr_list(subnet_exclude)
     discovered: list[str] = []
     seen: set[str] = set()
 
-    def _consider(raw_cidr: str):
+    def _consider(raw_cidr: str, iface_name: str = ""):
         s = (raw_cidr or "").strip()
         if not s or s == "0.0.0.0/0":
             return
@@ -796,6 +846,12 @@ def extract_followable_subnets(
                 return
         elif not net.is_private and not allow_public:
             return
+        if mgmt_only and net.prefixlen < 30 and not _MGMT_IFACE_RE.search(iface_name or ""):
+            return
+        if include_nets and not any(net.overlaps(inc) for inc in include_nets):
+            return
+        if exclude_nets and any(net.overlaps(exc) for exc in exclude_nets):
+            return
         key = str(net)
         if key not in seen:
             seen.add(key)
@@ -803,10 +859,10 @@ def extract_followable_subnets(
 
     for dev in devices:
         for iface in dev.get("l3_interfaces", []):
-            _consider(iface.get("ip_address", ""))
+            _consider(iface.get("ip_address", ""), iface.get("interface", ""))
         if include_routes:
             for route in dev.get("routes", []):
-                _consider(route.get("subnet", ""))
+                _consider(route.get("subnet", ""), route.get("interface", ""))
 
     return discovered
 
@@ -815,15 +871,20 @@ def _select_hop_targets_for_cidrs(
     cidrs: list[str],
     registry: DeviceRegistry,
     scanned_ip_set: set[str],
+    arp_only: bool = False,
 ) -> list[str]:
     """
     Use harvested ARP tables to target known-live hosts inside connected subnets
-    instead of blindly scanning 250+ dead IPs per VLAN. Falls back to full CIDR
-    expansion only when no ARP entries exist for a given subnet.
+    instead of blindly scanning 250+ dead IPs per VLAN.
+    When `arp_only=True`, never falls back to full CIDR sweeps and skips known
+    non-infrastructure endpoint OUIs (Apple, printers, cameras, AV controllers).
+    When `arp_only=False` and ARP tables exist, prunes empty `/24`–`/22` subnets
+    while still allowing `/29`–`/30` transit links.
     """
     selected: list[str] = []
     seen: set[str] = set(scanned_ip_set)
     arp_ips = list(registry.global_arp.keys())
+    has_global_arp = bool(arp_ips)
 
     for cidr in cidrs:
         try:
@@ -833,9 +894,28 @@ def _select_hop_targets_for_cidrs(
         arp_hits = [ip for ip in arp_ips if ipaddress.IPv4Address(ip) in net]
         if arp_hits:
             for ip in arp_hits:
-                if ip not in seen:
-                    seen.add(ip)
-                    selected.append(ip)
+                if ip in seen:
+                    continue
+                if arp_only:
+                    arp_entry = registry.global_arp.get(ip)
+                    if isinstance(arp_entry, dict):
+                        oui_l = str(arp_entry.get("vendor") or "").lower()
+                        if not oui_l or oui_l == "unknown":
+                            mac = str(arp_entry.get("mac") or "")
+                            oui_l = oui_lookup.lookup_oui(mac).lower() if mac else ""
+                    elif isinstance(arp_entry, str) and arp_entry:
+                        oui_l = oui_lookup.lookup_oui(arp_entry).lower()
+                    else:
+                        oui_l = ""
+                    if oui_l and any(k in oui_l for k in _NON_INFRA_OUI_KEYWORDS):
+                        continue
+                seen.add(ip)
+                selected.append(ip)
+        elif arp_only:
+            continue
+        elif has_global_arp and net.prefixlen < 29:
+            # Zero-ARP subnet pruning: avoid sweeping 254+ dead IPs on empty VLANs
+            continue
         else:
             for ip in expand_targets([cidr]):
                 if ip not in seen:
@@ -934,6 +1014,10 @@ def crawl_network(
     snmp: bool = False,
     snmp_community: str = "public",
     follow_subnets: bool = False,
+    follow_arp_only: bool = False,
+    mgmt_subnets_only: bool = False,
+    subnet_include: list[str] | None = None,
+    subnet_exclude: list[str] | None = None,
     follow_routes: bool = False,
     follow_neighbors: bool = True,
     max_hops: int = 1,
@@ -1137,20 +1221,28 @@ def crawl_network(
             _log_event(crawler_log, f"Neighbor Hop {hop} queuing IPs: {nbr_ips}")
             _run_batch(nbr_ips, {})
 
-    # Optional multi-hop routed subnet discovery (--follow-subnets)
-    if follow_subnets and max_hops > 0:
+    # Optional multi-hop routed subnet discovery (--follow-subnets / --follow-arp-only)
+    if (follow_subnets or follow_arp_only) and max_hops > 0:
         for hop in range(1, max_hops + 1):
             candidate_cidrs = extract_followable_subnets(
                 raw_devices,
                 allow_cgnat=allow_cgnat,
                 allow_public=allow_public_subnets,
                 include_routes=follow_routes,
+                mgmt_only=mgmt_subnets_only,
+                subnet_include=subnet_include,
+                subnet_exclude=subnet_exclude,
             )
             new_cidrs = [c for c in candidate_cidrs if c not in scanned_cidrs]
             if not new_cidrs:
                 break
             scanned_cidrs.update(new_cidrs)
-            hop_ips = _select_hop_targets_for_cidrs(new_cidrs, registry, scanned_ip_set)
+            hop_ips = _select_hop_targets_for_cidrs(
+                new_cidrs,
+                registry,
+                scanned_ip_set,
+                arp_only=follow_arp_only,
+            )
             if not hop_ips:
                 break
             print(f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}")
@@ -1876,7 +1968,29 @@ def main():
     parser.add_argument(
         "--follow-subnets",
         action="store_true",
-        help="Follow directly connected RFC 1918 subnets discovered from crawled routers/firewalls",
+        help="Follow directly connected RFC 1918 subnets discovered from crawled routers/firewalls (prunes empty /24+ subnets when ARP tables exist)",
+    )
+    parser.add_argument(
+        "--follow-arp-only",
+        action="store_true",
+        help="Only follow live ARP-discovered infrastructure IPs inside connected subnets (never sweeps empty subnets; skips known endpoint OUIs)",
+    )
+    parser.add_argument(
+        "--mgmt-subnets-only",
+        action="store_true",
+        help="When following subnets, restrict to management/infrastructure/transit SVIs and /30-/31 P2P links",
+    )
+    parser.add_argument(
+        "--subnet-include",
+        nargs="+",
+        default=None,
+        help="Only follow subnets overlapping these CIDRs (e.g. --subnet-include 10.250.0.0/16 172.31.0.0/16)",
+    )
+    parser.add_argument(
+        "--subnet-exclude",
+        nargs="+",
+        default=None,
+        help="Exclude subnets overlapping these CIDRs when following subnets",
     )
     parser.add_argument(
         "--follow-routes",
@@ -2012,6 +2126,10 @@ def main():
             snmp=args.snmp,
             snmp_community=args.snmp_community,
             follow_subnets=args.follow_subnets,
+            follow_arp_only=args.follow_arp_only,
+            mgmt_subnets_only=args.mgmt_subnets_only,
+            subnet_include=args.subnet_include,
+            subnet_exclude=args.subnet_exclude,
             follow_routes=args.follow_routes,
             follow_neighbors=not args.no_follow_neighbors,
             max_hops=args.max_hops,
