@@ -439,29 +439,33 @@ def build_partial_device_record(
     else:
         model = "Unknown"
 
-    return {
-        "ip": ip,
-        "status": status,
-        "mgmt_method": mgmt_method,
-        "vendor": resolved_vendor,
-        "device_type": device_type,
-        "device_persona": "appliance" if device_type in ("av_control", "camera", "display") else "unknown",
-        "hostname": ip,
-        "model": model,
-        "serial": "Unknown",
-        "firmware": "Unknown",
-        "mac_address": mac.lower() if mac else "",
-        "l3_interfaces": [],
-        "interfaces_detail": {},
-        "neighbors": [],
-        "routes": [],
-        "arp_table": [],
-        "mac_table": [],
-        "vlans": {},
-        "stp": {"enabled": False, "is_root": False, "vlans": {}},
-        "services": {"dns_servers": [], "ntp_servers": [], "radius_servers": [], "tacacs_servers": []},
-        "raw_config": "",
-    }
+    from net_docu_crawler.schema import stamp_schema_v2
+
+    return stamp_schema_v2(
+        {
+            "ip": ip,
+            "status": status,
+            "mgmt_method": mgmt_method,
+            "vendor": resolved_vendor,
+            "device_type": device_type,
+            "device_persona": "appliance" if device_type in ("av_control", "camera", "display") else "unknown",
+            "hostname": ip,
+            "model": model,
+            "serial": "Unknown",
+            "firmware": "Unknown",
+            "mac_address": mac.lower() if mac else "",
+            "l3_interfaces": [],
+            "interfaces_detail": {},
+            "neighbors": [],
+            "routes": [],
+            "arp_table": [],
+            "mac_table": [],
+            "vlans": {},
+            "stp": {"enabled": False, "is_root": False, "vlans": {}},
+            "services": {"dns_servers": [], "ntp_servers": [], "radius_servers": [], "tacacs_servers": []},
+            "raw_config": "",
+        }
+    )
 
 
 _GENERIC_HTTP_LABELS = frozenset(
@@ -606,7 +610,10 @@ def crawl_target_with_ports(
         if vendor_cand in VENDOR_DRIVER_MAP:
             driver_classes = [VENDOR_DRIVER_MAP[vendor_cand]]
         else:
-            driver_classes = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
+            cred_vendors = [str(c.get("vendor") or "").strip().lower() for c in credentials if c.get("vendor")]
+            preferred = [VENDOR_DRIVER_MAP[v] for v in cred_vendors if v in VENDOR_DRIVER_MAP]
+            default_order = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
+            driver_classes = list(dict.fromkeys(preferred + default_order))
 
         sorted_creds = list(credentials)
         if vendor_cand == "opnsense":
@@ -1324,6 +1331,43 @@ def crawl_network(
                     dev["mgmt_method"] = "SNMP"
                     dev["status"] = "unsupported"
 
+        # SNMPv2c GetBulk MIB fallback for unauthenticated infrastructure hosts
+        from net_docu_crawler.snmp_collector import collect_snmp_fallback
+
+        unauth_infra = [d for d in partial_devs if d.get("status") == "unauthenticated"]
+        if unauth_infra:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(unauth_infra))) as pool:
+                fb_futs = {
+                    pool.submit(collect_snmp_fallback, d["ip"], community=snmp_community, timeout=min(float(timeout), 2.0)): d
+                    for d in unauth_infra
+                }
+                for fut in as_completed(fb_futs):
+                    dev = fb_futs[fut]
+                    try:
+                        fb = fut.result() or {}
+                    except Exception:
+                        fb = {}
+                    if fb.get("interfaces_detail"):
+                        dev["interfaces_detail"] = fb["interfaces_detail"]
+                        dev["mgmt_method"] = "SNMPv2c-Fallback"
+                    if fb.get("lldp_remote_names"):
+                        dev.setdefault("neighbors", []).extend(
+                            [
+                                {
+                                    "local_port": f"ifIndex-{n.get('index', '')}",
+                                    "remote_device": n.get("remote_device", ""),
+                                    "remote_port": "",
+                                    "remote_ip": "",
+                                    "remote_mac": "",
+                                    "platform": "",
+                                    "device_type": "switch",
+                                    "link_confidence": "one-way",
+                                }
+                                for n in fb["lldp_remote_names"]
+                                if n.get("remote_device")
+                            ]
+                        )
+
     return render_deliverables_from_dataset(
         raw_devices=raw_devices,
         registry=registry,
@@ -1411,6 +1455,53 @@ def enrich_devices_from_dhcp_reservations(raw_devices: list[dict]) -> list[dict]
     return raw_devices
 
 
+def parse_target_vendor_spec(raw_spec: str) -> dict[str, str]:
+    """
+    Parse `--target-vendor` into a persona->vendor map.
+    Supports:
+      - '' / 'none' / 'discovery' -> {} (pure discovery, no target configs)
+      - 'juniper' -> {'default': 'juniper'}
+      - 'switch=juniper,ap=aruba,firewall=fortinet' -> {'switch': 'juniper', 'ap': 'aruba', 'firewall': 'fortinet'}
+    """
+    spec = (raw_spec or "").strip().lower()
+    if not spec or spec in ("none", "discovery", "unknown", "tbd"):
+        return {}
+    aliases = {
+        "junos": "juniper",
+        "juniper": "juniper",
+        "cisco": "cisco",
+        "ios": "cisco",
+        "ios-xe": "cisco",
+        "meraki": "meraki",
+        "arista": "arista",
+        "eos": "arista",
+        "aruba": "aruba",
+        "hp": "hpprocurve",
+        "procurve": "hpprocurve",
+        "hpprocurve": "hpprocurve",
+        "fortinet": "fortinet",
+        "fortigate": "fortinet",
+    }
+    if "=" not in spec:
+        mapped = aliases.get(spec)
+        if not mapped:
+            print(f"[!] Warning: Unrecognized --target-vendor '{raw_spec}'. Skipping target config generation.")
+            return {}
+        return {"default": mapped}
+
+    out: dict[str, str] = {}
+    for part in spec.split(","):
+        if "=" not in part:
+            continue
+        persona, vend = [x.strip().lower() for x in part.split("=", 1)]
+        mapped = aliases.get(vend)
+        if mapped and persona:
+            out[persona] = mapped
+        elif vend:
+            print(f"[!] Warning: Unrecognized vendor '{vend}' for persona '{persona}' in --target-vendor.")
+    return out
+
+
 def render_deliverables_from_dataset(
     raw_devices: list[dict],
     registry: DeviceRegistry | None = None,
@@ -1445,6 +1536,9 @@ def render_deliverables_from_dataset(
                 crawled_by_host[h_key.lower()] = d
                 crawled_by_host[h_key.split(".")[0].lower()] = d
 
+    registry.reconcile_reciprocal_neighbors(raw_devices)
+    registry.links.clear()
+
     for device_data in raw_devices:
         local_host = device_data.get("hostname") or device_data.get("ip", "")
         for nbr in device_data.get("neighbors", []):
@@ -1469,12 +1563,30 @@ def render_deliverables_from_dataset(
                     nbr["platform"] = plat_label
                     nbr["remote_platform"] = plat_label
 
+            n_type = (nbr.get("device_type") or "").lower()
+            l_class = "infra_uplink" if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge")) else "edge_endpoint"
             registry.add_bidirectional_link(
                 local_node=local_host,
                 local_port=nbr.get("local_port", ""),
                 remote_node=nbr.get("remote_device", ""),
                 remote_port=nbr.get("remote_port", ""),
+                link_class=l_class,
             )
+
+    from net_docu_crawler.correlator import correlate_dataset
+    from net_docu_crawler.quality_gates import evaluate_quality_gates, write_quality_report
+
+    correlate_dataset(raw_devices)
+    quality_report = evaluate_quality_gates(raw_devices)
+    manifest_dir = os.path.join(run_output_dir, "00_manifest")
+    norm_dir = os.path.join(run_output_dir, "02_normalized")
+    corr_dir = os.path.join(run_output_dir, "03_correlated")
+    mig_dir = os.path.join(run_output_dir, "04_migration")
+    rep_dir = os.path.join(run_output_dir, "05_reports")
+    for d in (manifest_dir, norm_dir, corr_dir, mig_dir, rep_dir):
+        os.makedirs(d, exist_ok=True)
+    write_quality_report(quality_report, manifest_dir)
+    print(f"[+] Quality Gates: {'PASS' if quality_report['passed'] else 'FAIL'} (see {os.path.join(manifest_dir, 'data_quality_report.md')})")
 
     confirmed_count = sum(1 for lk in registry.links if lk["status"] == "confirmed")
     print(f"\n[+] Processed {len(raw_devices)} network devices!")
@@ -1544,7 +1656,7 @@ def render_deliverables_from_dataset(
     print(f"[+] Generated network analysis report: {rep_path}")
 
     inv_path = os.path.join(run_output_dir, "asset_inventory.csv")
-    report_generator.generate_asset_inventory(devices_dict, output_path=inv_path)
+    report_generator.generate_asset_inventory(devices_dict, output_path=inv_path, infra_only=True)
     print(f"[+] Generated asset inventory CSV: {inv_path}")
 
     cable_path = os.path.join(run_output_dir, "migration_cabling_matrix.csv")
@@ -1575,12 +1687,25 @@ def render_deliverables_from_dataset(
     )
     print(f"[+] Generated BOM & hardware sizing CSV: {bom_path}")
 
-    if target_vendor:
-        target_cfg_path = os.path.join(run_output_dir, f"target_migration_{target_vendor.lower()}.md")
-        report_generator.generate_target_migration_configs(
-            devices_dict, target_vendor=target_vendor, output_path=target_cfg_path
-        )
-        print(f"[+] Generated target vendor migration configs ({target_vendor}): {target_cfg_path}")
+    target_map = parse_target_vendor_spec(target_vendor)
+    if target_map:
+        for persona_key, tv in target_map.items():
+            suffix = tv if persona_key == "default" else f"{persona_key}_{tv}"
+            target_cfg_path = os.path.join(run_output_dir, f"target_migration_{suffix}.md")
+            scoped_devs = (
+                devices_dict
+                if persona_key == "default"
+                else {
+                    ip: d
+                    for ip, d in devices_dict.items()
+                    if (d.get("device_persona") or d.get("device_type", "")).lower() == persona_key
+                }
+            )
+            if scoped_devs:
+                report_generator.generate_target_migration_configs(
+                    scoped_devs, target_vendor=tv, output_path=target_cfg_path
+                )
+                print(f"[+] Generated target vendor migration configs ({suffix}): {target_cfg_path}")
 
     if save_baseline:
         report_generator.save_baseline_state(devices_dict, output_path=save_baseline)
@@ -1631,20 +1756,25 @@ def render_deliverables_from_dataset(
                 except Exception:
                     pass
 
-        # Mirror deliverables to docs/net_docu_crawler for backward compatibility
-        legacy_dir = "docs/net_docu_crawler"
-        os.makedirs(legacy_dir, exist_ok=True)
-        for fname in os.listdir(run_output_dir):
-            src_f = os.path.join(run_output_dir, fname)
-            dst_f = os.path.join(legacy_dir, fname)
-            if os.path.isfile(src_f):
-                shutil.copy2(src_f, dst_f)
-            elif os.path.isdir(src_f) and fname == "logs":
-                os.makedirs(dst_f, exist_ok=True)
-                for l_file in os.listdir(src_f):
-                    l_src = os.path.join(src_f, l_file)
-                    if os.path.isfile(l_src):
-                        shutil.copy2(l_src, os.path.join(dst_f, l_file))
+    # Mirror key deliverables into layered subdirectories (02_normalized, 04_migration, 05_reports)
+    _layer_copies = [
+        (json_path, os.path.join(norm_dir, "devices.json")),
+        (inv_path, os.path.join(mig_dir, "asset_inventory.csv")),
+        (cable_path, os.path.join(mig_dir, "cabling_matrix.csv")),
+        (bom_path, os.path.join(mig_dir, "bom_hardware_sizing.csv")),
+        (smoke_path, os.path.join(mig_dir, "validate_cutover.sh")),
+        (blueprint_path, os.path.join(rep_dir, "Network_Analysis.md")),
+        (l2_path, os.path.join(rep_dir, "L2_network_diagrams.md")),
+        (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
+        (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
+    ]
+    for src_p, dst_p in _layer_copies:
+        if os.path.isfile(src_p):
+            shutil.copy2(src_p, dst_p)
+
+    report_generator.export_layered_csvs(raw_devices, registry, run_output_dir, source_logs_dir=logs_dir)
+
+    # Run directory already holds deliverables/<Subnet>_<TimeStamp>_<domain>/; do not mirror into docs/net_docu_crawler/
 
     return raw_devices
 
@@ -1890,7 +2020,7 @@ def reparse_logs_dir(
         target_vendor=target_vendor,
         save_baseline=save_baseline,
         compare_baseline=compare_baseline,
-        logs_dir=logs_dir if sanitize_passwords else "",
+        logs_dir=logs_dir,
     )
 
 

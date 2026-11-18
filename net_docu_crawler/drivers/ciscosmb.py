@@ -313,11 +313,15 @@ class CiscoSMBDriver(BaseDriver):
                 m_m = re.match(r"^\s*(\d+)\s+([0-9a-fA-F:.-]+)\s+(\S+)\s+", line)
                 if m_m:
                     vlan, mac_raw, port = m_m.groups()
+                    mac = oui_lookup.normalize_mac(mac_raw).lower()
                     macs.append(
                         {
-                            "mac": oui_lookup.normalize_mac(mac_raw).lower(),
+                            "mac": mac,
+                            "interface": port,
                             "port": port,
                             "vlan": vlan,
+                            "type": "dynamic",
+                            "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
         except Exception:

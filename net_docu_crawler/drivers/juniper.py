@@ -170,13 +170,14 @@ class JuniperDriver(BaseDriver):
 
                 # Only include physical switch/router interfaces (ge-*, xe-*, et-*, ae*) in physical port detail
                 if re.match(r"^(?:ge-|xe-|et-|fe-|ae\d|irb)", name):
+                    default_speed = "10Gb/s" if name.startswith("xe-") else ("40Gb/s" if name.startswith("et-") else ("100Mb/s" if name.startswith("fe-") else "1Gb/s"))
                     interfaces_detail[name] = {
                         "status": oper_status,
                         "protocol": oper_status,
                         "admin_status": admin_status,
                         "description": "",
                         "mac_address": "",
-                        "speed": "1Gb/s",
+                        "speed": default_speed,
                         "duplex": "Full",
                     }
 
@@ -384,9 +385,11 @@ class JuniperDriver(BaseDriver):
                     local_port = re.sub(r"\.0$", "", local_intf.strip())
                     remote_mac = n.get("lldp-remote-chassis-id", [{}])[0].get("data", "")
                     remote_dev = n.get("lldp-remote-system-name", [{}])[0].get("data", "") or remote_mac or "Unknown"
-                    remote_port = n.get("lldp-remote-port-info", [{}])[0].get("data", "") or n.get(
-                        "lldp-remote-port-id", [{}]
-                    )[0].get("data", "")
+                    remote_port = (
+                        n.get("lldp-remote-port-description", [{}])[0].get("data", "")
+                        or n.get("lldp-remote-port-info", [{}])[0].get("data", "")
+                        or n.get("lldp-remote-port-id", [{}])[0].get("data", "")
+                    )
                     norm_mac = oui_lookup.normalize_mac(remote_mac or remote_port)
                     mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
                     dev_type = (
@@ -442,11 +445,45 @@ class JuniperDriver(BaseDriver):
         return neighbors
 
     def get_stp(self, conn) -> dict:
-        stp = {"enabled": False, "is_root": False, "root_bridge": "", "vlans": {}}
+        stp = {
+            "enabled": False,
+            "is_root": False,
+            "protocol": "Unknown",
+            "root_bridge": "",
+            "bridge_id": "",
+            "bridge_priority": "",
+            "root_cost": "",
+            "root_port": "",
+            "vlans": {},
+        }
         try:
             raw = conn.send_command("show spanning-tree bridge | display json")
             if raw.strip().startswith("{"):
                 data = json.loads(raw)
+                # Junos ELS schema: {"stp-bridge": [{"protocol": [...], "cist-bridge-parameters": [...]}]}
+                stp_bridge = data.get("stp-bridge", [])
+                if stp_bridge:
+                    blk = stp_bridge[0]
+                    stp["enabled"] = True
+                    stp["protocol"] = blk.get("protocol", [{}])[0].get("data", "RSTP")
+                    cist = blk.get("cist-bridge-parameters", [{}])[0]
+                    rb = cist.get("root-bridge", [{}])[0]
+                    rb_prio = rb.get("bridge-priority", [{}])[0].get("data", "")
+                    rb_mac = rb.get("bridge-mac", [{}])[0].get("data", "")
+                    if rb_mac:
+                        stp["root_bridge"] = f"{rb_prio}.{rb_mac}".strip(".") if rb_prio else rb_mac
+                    stp["root_cost"] = cist.get("root-cost", [{}])[0].get("data", "")
+                    stp["root_port"] = cist.get("root-port", [{}])[0].get("data", "")
+                    tb = cist.get("this-bridge", [{}])[0]
+                    tb_prio = tb.get("bridge-priority", [{}])[0].get("data", "")
+                    tb_mac = tb.get("bridge-mac", [{}])[0].get("data", "")
+                    if tb_prio:
+                        stp["bridge_priority"] = tb_prio
+                    if tb_mac:
+                        stp["bridge_id"] = f"{tb_prio}.{tb_mac}".strip(".") if tb_prio else tb_mac
+                    if rb_mac and tb_mac and rb_mac.lower() == tb_mac.lower():
+                        stp["is_root"] = True
+                    return stp
                 stp_info = data.get("stp-bridge-parameters-information", [])
                 if stp_info:
                     stp["enabled"] = True
@@ -462,8 +499,23 @@ class JuniperDriver(BaseDriver):
             low = raw_txt.lower()
             if "stp bridge parameters" in low or "enabled protocol" in low:
                 stp["enabled"] = True
+                m_proto = re.search(r"Enabled protocol\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                if m_proto:
+                    stp["protocol"] = m_proto.group(1).strip()
                 m_root = re.search(r"Root ID\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
                 m_bridge = re.search(r"Bridge ID\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                m_cost = re.search(r"Root cost\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                m_port = re.search(r"Root port\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+                if m_root:
+                    stp["root_bridge"] = m_root.group(1).strip()
+                if m_bridge:
+                    stp["bridge_id"] = m_bridge.group(1).strip()
+                    if "." in stp["bridge_id"]:
+                        stp["bridge_priority"] = stp["bridge_id"].split(".", 1)[0]
+                if m_cost:
+                    stp["root_cost"] = m_cost.group(1).strip()
+                if m_port:
+                    stp["root_port"] = m_port.group(1).strip()
                 if "this bridge is the root" in low or (m_root and m_bridge and m_root.group(1) == m_bridge.group(1)):
                     stp["is_root"] = True
         except Exception:
@@ -572,7 +624,8 @@ class JuniperDriver(BaseDriver):
     def get_poe(self, conn) -> dict:
         poe = {"total_power_watts": 0.0, "used_power_watts": 0.0, "available_power_watts": 0.0, "ports": {}}
         model_l = getattr(self, "_model", "").lower()
-        if model_l.startswith(("ex4600", "ex4650", "ex9200", "qfx", "mx", "srx", "ptx", "acx")):
+        if model_l.startswith(("ex4600", "ex4650", "ex9200", "qfx", "ex4500", "ex4550", "mx", "srx", "ptx", "acx")):
+            poe["poe_supported"] = False
             return poe
         try:
             raw = conn.send_command("show poe controller | display json")
@@ -667,6 +720,15 @@ class JuniperDriver(BaseDriver):
             except Exception:
                 pass
 
+        if poe["total_power_watts"] > 0 or poe["ports"]:
+            poe["poe_supported"] = True
+        poe["poe_capable_ports"] = len(poe["ports"])
+        poe["poe_enabled_ports"] = sum(
+            1 for p in poe["ports"].values() if str(p.get("status", "")).upper() != "DISABLED"
+        )
+        poe["poe_delivering_ports"] = sum(
+            1 for p in poe["ports"].values() if float(p.get("watts", 0.0) or 0.0) > 0
+        )
         return poe
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -938,3 +1000,66 @@ class JuniperDriver(BaseDriver):
             return conn.send_command("show configuration | display set")
         except Exception:
             return conn.send_command("show configuration")
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        ops: dict[str, dict] = {}
+        try:
+            raw_es = conn.send_command("show ethernet-switching interfaces | display json")
+            if raw_es and raw_es.strip().startswith("{"):
+                data = json.loads(raw_es)
+                for entry in data.get("l2ng-l2ald-iff-interface-information", [{}])[0].get("l2ng-l2ald-iff-interface-entry", []):
+                    iname = (entry.get("l2ng-l2ald-iff-interface-name", [{}])[0].get("data") or "").split(".")[0]
+                    if not iname:
+                        continue
+                    mode = (entry.get("l2ng-l2ald-iff-port-mode", [{}])[0].get("data") or "").lower()
+                    if mode in ("access", "trunk"):
+                        ops.setdefault(iname, {})["mode"] = mode
+        except Exception:
+            pass
+
+        try:
+            raw_lacp = conn.send_command("show lacp interfaces | display json")
+            if raw_lacp and raw_lacp.strip().startswith("{"):
+                data = json.loads(raw_lacp)
+                for grp_blk in data.get("lacp-interface-information-list", [{}])[0].get("lacp-interface-information", []):
+                    ae_name = grp_blk.get("lag-lacp-header", [{}])[0].get("aggregate-name", [{}])[0].get("data", "")
+                    for p_ent in grp_blk.get("lag-lacp-state", []):
+                        pname = p_ent.get("name", [{}])[0].get("data", "")
+                        if pname and ae_name:
+                            ops.setdefault(pname, {})["lag_group"] = ae_name
+                            role = (p_ent.get("lacp-activity", [{}])[0].get("data") or "").lower()
+                            if role in ("active", "passive"):
+                                ops[pname]["lacp_mode"] = role
+        except Exception:
+            pass
+
+        try:
+            raw_stp = conn.send_command("show spanning-tree interface | display json")
+            if raw_stp and raw_stp.strip().startswith("{"):
+                data = json.loads(raw_stp)
+                for stp_blk in data.get("stp-interface-information", []):
+                    for p_ent in stp_blk.get("stp-interface-entry", []):
+                        pname = (p_ent.get("interface-name", [{}])[0].get("data") or "").split(".")[0]
+                        if not pname:
+                            continue
+                        role = p_ent.get("port-role", [{}])[0].get("data", "")
+                        state = p_ent.get("port-state", [{}])[0].get("data", "")
+                        if role:
+                            ops.setdefault(pname, {})["stp_role"] = role
+                        if state:
+                            ops.setdefault(pname, {})["stp_state"] = state
+        except Exception:
+            pass
+
+        try:
+            raw_dot1x = conn.send_command("show dot1x interface | display json")
+            if raw_dot1x and raw_dot1x.strip().startswith("{"):
+                data = json.loads(raw_dot1x)
+                for d_ent in data.get("dot1x-interface-information", [{}])[0].get("interface", []):
+                    pname = (d_ent.get("interface-name", [{}])[0].get("data") or "").split(".")[0]
+                    if pname:
+                        ops.setdefault(pname, {})["auth_policy"] = "dot1x"
+        except Exception:
+            pass
+
+        return ops

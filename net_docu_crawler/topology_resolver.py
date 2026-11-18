@@ -324,6 +324,7 @@ class DeviceRegistry:
         remote_node: str,
         remote_port: str,
         link_type: str = "physical",
+        link_class: str = "infra_uplink",
     ):
         """
         Stitches a connection between two nodes. Normalizes hostnames and interface names so
@@ -334,6 +335,10 @@ class DeviceRegistry:
             node_b, _ = normalize_hostname(remote_node)
             port_a = normalize_interface(local_port)
             port_b = normalize_interface(remote_port)
+            if port_a.lower() in ("unknown", "n/a", "-"):
+                port_a = ""
+            if port_b.lower() in ("unknown", "n/a", "-"):
+                port_b = ""
 
             if not node_a or not node_b:
                 return
@@ -367,6 +372,8 @@ class DeviceRegistry:
                     if not existing["port_b"] and c_port_b:
                         existing["port_b"] = c_port_b
                     existing["status"] = "confirmed"
+                    if link_class == "infra_uplink":
+                        existing["link_class"] = "infra_uplink"
                     return
 
             self.links.append(
@@ -377,5 +384,112 @@ class DeviceRegistry:
                     "port_b": c_port_b,
                     "status": "unidirectional",
                     "type": link_type,
+                    "link_class": link_class,
                 }
             )
+
+    def resolve_canonical_hostname(self, raw_name: str, remote_mac: str = "", remote_ip: str = "") -> str:
+        """
+        Resolve a potentially truncated or FQDN neighbor name (e.g. 'NMS_MDF_CORE_BL')
+        to a registered device's canonical hostname ('NMS_MDF_CORE_BLDG_B').
+        """
+        short, _ = normalize_hostname(raw_name)
+        if remote_ip and remote_ip in self.ip_to_device_id:
+            dev = self.devices.get(self.ip_to_device_id[remote_ip])
+            if dev and dev.get("hostname"):
+                return dev["hostname"]
+        if remote_mac:
+            m_clean = oui_lookup.normalize_mac(remote_mac).lower().strip()
+            if m_clean in self.mac_to_device_id:
+                dev = self.devices.get(self.mac_to_device_id[m_clean])
+                if dev and dev.get("hostname"):
+                    return dev["hostname"]
+        if short:
+            low = short.lower()
+            for dev in self.devices.values():
+                ch = (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
+                if ch and ch.lower() == low:
+                    return ch
+            if len(low) >= 12:
+                prefix_matches = [
+                    (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
+                    for dev in self.devices.values()
+                    if (dev.get("canonical_hostname") or dev.get("hostname") or "").strip().lower().startswith(low)
+                ]
+                if len(prefix_matches) == 1:
+                    return prefix_matches[0]
+        return short or raw_name
+
+    def reconcile_reciprocal_neighbors(self, raw_devices: list[dict]) -> None:
+        """
+        Write resolved reciprocal `remote_port`, canonical `remote_device`, and
+        `link_confidence` ('two-way' | 'one-way' | 'INFERRED') back into each device's `neighbors` list.
+        """
+        by_host = {}
+        for dev in raw_devices:
+            if dev.get("status", "success") != "success":
+                continue
+            h, _ = normalize_hostname(dev.get("hostname") or dev.get("ip", ""))
+            if h:
+                by_host[h.lower()] = dev
+
+        with self._lock:
+            for dev in raw_devices:
+                local_host, _ = normalize_hostname(dev.get("hostname") or dev.get("ip", ""))
+                for nbr in dev.get("neighbors", []):
+                    canon_r = self.resolve_canonical_hostname(
+                        nbr.get("remote_device", ""),
+                        remote_mac=nbr.get("remote_mac", ""),
+                        remote_ip=nbr.get("remote_ip", ""),
+                    )
+                    if canon_r:
+                        nbr["remote_device"] = canon_r
+                    l_port = normalize_interface(nbr.get("local_port", ""))
+                    r_host, _ = normalize_hostname(nbr.get("remote_device", ""))
+                    r_port = normalize_interface(nbr.get("remote_port", ""))
+                    if r_port.lower() in ("unknown", "n/a", "-"):
+                        r_port = ""
+
+                    matched_link = None
+                    for lk in self.links:
+                        a_match = lk["node_a"].lower() == local_host.lower() and lk["node_b"].lower() == r_host.lower()
+                        b_match = lk["node_b"].lower() == local_host.lower() and lk["node_a"].lower() == r_host.lower()
+                        if a_match and lk["port_a"].lower() == l_port.lower():
+                            matched_link = (lk, lk["port_b"])
+                            break
+                        if b_match and lk["port_b"].lower() == l_port.lower():
+                            matched_link = (lk, lk["port_a"])
+                            break
+
+                    if matched_link:
+                        lk, resolved_remote_port = matched_link
+                        if not r_port and resolved_remote_port:
+                            nbr["remote_port"] = resolved_remote_port
+                        nbr["link_confidence"] = "two-way" if lk["status"] == "confirmed" else "one-way"
+                    else:
+                        nbr.setdefault("link_confidence", "one-way")
+
+                    # Synthesize reverse neighbor on peer if peer is crawled and lacks an entry on r_port
+                    peer_dev = by_host.get(r_host.lower())
+                    if peer_dev and r_port and l_port:
+                        peer_ints = {normalize_interface(k).lower(): k for k in (peer_dev.get("interfaces_detail") or {})}
+                        if r_port.lower() in peer_ints:
+                            peer_port_exact = peer_ints[r_port.lower()]
+                            already = any(
+                                normalize_interface(pn.get("local_port", "")).lower() == r_port.lower()
+                                for pn in peer_dev.get("neighbors", [])
+                            )
+                            if not already:
+                                peer_dev.setdefault("neighbors", []).append(
+                                    {
+                                        "local_port": peer_port_exact,
+                                        "remote_device": local_host,
+                                        "remote_port": l_port,
+                                        "remote_ip": dev.get("ip", ""),
+                                        "remote_mac": dev.get("mac_address", ""),
+                                        "platform": f"{dev.get('vendor', '')} {dev.get('model', '')}".strip(),
+                                        "remote_platform": f"{dev.get('vendor', '')} {dev.get('model', '')}".strip(),
+                                        "device_type": dev.get("device_type", "switch"),
+                                        "link_confidence": "INFERRED",
+                                    }
+                                )

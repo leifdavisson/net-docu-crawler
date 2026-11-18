@@ -261,7 +261,7 @@ def _is_network_infra(dev: dict) -> bool:
     return dtype in _INFRA_DEVICE_TYPES
 
 
-def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
+def generate_asset_inventory(devices, output_path="asset_inventory.csv", infra_only: bool = False):
     """
     Generates the authoritative Asset Inventory CSV.
     Fields: Hostname, IP Address, MAC Address, Device Type, Model + Firmware, Serial Number, Role, Mgmt Method
@@ -283,6 +283,11 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv"):
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for ip, dev in devices.items():
+                if infra_only and (
+                    dev.get("status") in ("unauthenticated", "unsupported", "discovered")
+                    or not _is_network_infra(dev)
+                ):
+                    continue
                 model_lower = dev.get("model", "").lower()
                 hostname_lower = dev.get("hostname", "").lower()
                 custom_dev_type = dev.get("device_type", "").lower()
@@ -377,7 +382,7 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         "",
         "## Physical Connectivity Diagram",
         "```mermaid",
-        "graph TD",
+        "flowchart LR",
         "  %% Style configurations",
         "  classDef core fill:#3399ff,stroke:#0066cc,stroke-width:2px,color:#fff;",
         "  classDef dist fill:#85c1e9,stroke:#2e86c1,stroke-width:2px;",
@@ -401,6 +406,8 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
 
     # Pre-populate IDs for all scanned devices
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         nid = f"sw_{sw_counter}"
         node_ids[ip] = nid
@@ -409,11 +416,18 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         defined_nodes.add(hostname)
         sw_counter += 1
 
-    # 1. Define nodes and their styles
+    # 1. Define nodes and their styles (omit 0-link standalone devices when topology has >=10 devices)
+    linked_ips = {ip for ip, dev in devices.items() if dev.get("neighbors")}
+    standalone_devs = []
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
+        if len(devices) >= 10 and ip not in linked_ips:
+            standalone_devs.append((dev.get("hostname") or ip, ip, dev.get("model") or "Unknown"))
+            continue
         hostname = dev.get("hostname") or ip
         model = dev.get("model") or "Unknown"
-        is_root = dev.get("stp", {}).get("is_root", False)
+        is_root = bool(dev.get("stp", {}).get("is_verified_campus_root", False))
 
         node_id = node_ids[ip]
         # Node label with Model
@@ -434,7 +448,14 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             lines.append(f"  class {node_id} firewall;")
         elif dev_type == "router":
             lines.append(f"  class {node_id} router;")
-        elif "core" in hn_lower or "c9500" in model_lower:
+        elif (
+            "core" in hn_lower
+            or "c9500" in model_lower
+            or "5412" in model_lower
+            or "5406" in model_lower
+            or "ex4600" in model_lower
+            or len(dev.get("l3_interfaces", [])) >= 5
+        ):
             lines.append(f"  class {node_id} core;")
         elif "dist" in hn_lower or "c3850" in model_lower or "c9300" in model_lower:
             lines.append(f"  class {node_id} dist;")
@@ -447,27 +468,18 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
     # 2. Draw connections from neighbors
     connections = {}
     external_nodes_defined = set()
-    for ip, dev in devices.items():
-        hostname = dev.get("hostname") or ip
-        neighbors = dev.get("neighbors", [])
+    from net_docu_crawler.schema import infer_site_code
 
-        # Parse channel groups from raw config
-        channel_map = {}
-        cfg = dev.get("raw_config", "")
-        if cfg:
-            blocks = cfg.split("interface ")
-            for block in blocks[1:]:
-                block_lines = block.splitlines()
-                if not block_lines:
-                    continue
-                intf_name = block_lines[0].split()[0].strip()
-                for bl in block_lines[1:]:
-                    if bl.strip() == "!":
-                        break
-                    cg_match = re.search(r"channel-group\s+(\d+)", bl)
-                    if cg_match:
-                        channel_map[intf_name] = f"Po{cg_match.group(1)}"
-                        break
+    node_site = {}
+    for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
+        hostname = dev.get("hostname") or ip
+        nid = node_ids[ip]
+        node_site[nid] = dev.get("site_code") or infer_site_code(hostname)
+        neighbors = dev.get("neighbors", [])
+        dev_ports = dev.get("ports") or {}
+        ports_ci = {str(k).lower(): v for k, v in dev_ports.items()}
 
         for n in neighbors:
             remote_host = (n.get("remote_device") or "").strip().strip('"').strip("'")
@@ -483,6 +495,9 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                     break
 
             node_b = matched_remote or remote_host
+            n_type = (n.get("device_type") or "").lower()
+            if node_b not in defined_nodes and n_type not in ("switch", "router", "firewall", "wlc", "bridge"):
+                continue
 
             # Ensure safe ID exists for node_b
             if node_b in hostname_to_node_id:
@@ -536,7 +551,9 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                     break
 
             speed_val = get_link_speed(local_port, dev.get("interfaces_detail", {}))
-            po_name = channel_map.get(local_port, "")
+            cport = dev_ports.get(local_port) or ports_ci.get(local_port.lower()) or {}
+            lag_val = str(cport.get("lag_id") or "").strip()
+            po_name = lag_val if lag_val.lower() not in ("", "none", "unknown") else ""
 
             connections[key].append(
                 {
@@ -578,7 +595,15 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             label = f"{pos[0]} ({local_ports_str})"
         else:
             # Physical ports only
-            label = ", ".join(sorted(list(set([lk["local_port"] for lk in links]))))
+            port_pairs = []
+            for lk in links:
+                lp = lk["local_port"]
+                rp = lk["remote_port"]
+                if rp and rp.lower() not in ("unknown", "n/a", "-"):
+                    port_pairs.append(f"{lp} ↔ {rp}")
+                else:
+                    port_pairs.append(lp)
+            label = ", ".join(sorted(set(port_pairs)))
 
         clean_label = label.replace('"', '\\"')
 
@@ -610,6 +635,50 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             "* **Dashed Red Lines**: STP Blocking (`BLK`) links.",
             "* **Double Solid Lines**: Active forwarding links (line thickness indicates speed).",
             "",
+        ]
+    )
+
+    if len(defined_nodes) > 20 and connections:
+        # Group edges by site_code for readable per-site Mermaid diagrams
+        site_edges: dict[str, list[tuple[tuple[str, str], list[dict]]]] = {}
+        for edge_key, edge_links in connections.items():
+            s_a = node_site.get(edge_key[0])
+            s_b = node_site.get(edge_key[1])
+            for sc in sorted({s for s in (s_a, s_b) if s}):
+                site_edges.setdefault(sc, []).append((edge_key, edge_links))
+        if len(site_edges) >= 2:
+            # Capture node definitions/classes from the main diagram lines
+            def_map: dict[str, list[str]] = {}
+            for ln in lines:
+                m_def = re.match(r"^\s+((?:sw|ext)_\d+)\[", ln)
+                if m_def:
+                    def_map.setdefault(m_def.group(1), []).append(ln)
+                m_cls = re.match(r"^\s+class\s+((?:sw|ext)_\d+)\s+", ln)
+                if m_cls:
+                    def_map.setdefault(m_cls.group(1), []).append(ln)
+            lines.append("## Site-Scoped Layer 2 Topologies")
+            for sc in sorted(site_edges.keys()):
+                edges_for_site = site_edges[sc]
+                touched = sorted({n for ek, _ in edges_for_site for n in ek})
+                lines.extend([f"### Site `{sc}` Layer 2 Topology", "```mermaid", "flowchart LR"])
+                for ln in lines[6:14]:
+                    lines.append(ln)
+                for nid in touched:
+                    lines.extend(def_map.get(nid, [f'  {nid}["{nid}"]']))
+                for (id_a, id_b), e_links in edges_for_site:
+                    port_pairs = []
+                    for lk in e_links:
+                        lp, rp = lk["local_port"], lk["remote_port"]
+                        if rp and rp.lower() not in ("unknown", "n/a", "-"):
+                            port_pairs.append(f"{lp} ↔ {rp}")
+                        else:
+                            port_pairs.append(lp)
+                    lbl = ", ".join(sorted(set(port_pairs))).replace('"', '\\"')
+                    lines.append(f'  {id_a} ==>|"{lbl}"| {id_b}')
+                lines.extend(["```", ""])
+
+    lines.extend(
+        [
             "## Wireless Overlay Layout",
             "Discovered Wireless Access Points connected to switches:",
         ]
@@ -658,9 +727,30 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
     else:
         lines.append("\nNo wireless access points were directly discovered via LLDP/CDP neighbor tables.")
 
+    if standalone_devs:
+        lines.extend(
+            [
+                "",
+                "## Standalone / Unlinked Infrastructure Switches",
+                "Switches with no discovered CDP/LLDP neighbor links (omitted from the Mermaid graph above for readability):",
+                "",
+                "| Hostname | Management IP | Model |",
+                "| :--- | :--- | :--- |",
+            ]
+        )
+        for shost, sip, smodel in standalone_devs:
+            lines.append(f"| **{shost}** | `{sip}` | `{smodel}` |")
+
     try:
+        from net_docu_crawler.diagram_validator import validate_mermaid_block
+
+        full_md = "\n".join(lines)
+        for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
+            errs = validate_mermaid_block(m_blk)
+            if errs:
+                print(f"[!] Mermaid syntax warning in {output_path}: {errs[0]}")
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write(full_md)
         print(f"L2 Diagrams successfully written to {output_path}")
     except Exception as e:
         print(f"Error generating L2 diagram file: {e}")
@@ -668,72 +758,79 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
 
 def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
     """
-    Generates L3 logical and routing topologies using Mermaid.js mindmap.
-    Lists subnets, SVIs, VLANs, and VRFs.
+    Generates L3 logical and routing topologies using Mermaid.js.
+    Consumes `correlator.build_l3_svi_table()` for authoritative VLAN/SVI/subnet joins.
     """
+    from net_docu_crawler.correlator import build_l3_svi_table
+
     devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
-    # 1. Build adjacency list of the bipartite graph
-    adj = {}  # node -> set of neighbors
+    svi_rows = build_l3_svi_table(list(devices.values()))
+    svi_lookup: dict[tuple[str, str], dict] = {}
+    subnet_vlan_names: dict[str, set[str]] = {}
+    for row in svi_rows:
+        hn = row.get("source_device") or row.get("hostname", "")
+        iname = str(row.get("svi_interface") or "").lower()
+        svi_lookup[(hn, iname)] = row
+        sub = row.get("prefix_cidr") or row.get("subnet") or ""
+        vid = row.get("vlan_id") or ""
+        vname = row.get("vlan_name") or ""
+        if sub and (vid or vname):
+            lbl = f"VLAN {vid}: {vname}".strip(": ") if vid else vname
+            subnet_vlan_names.setdefault(sub, set()).add(lbl)
+
+    # Identify L3 routing gateways vs single-SVI L2 management switches when >20 infra devices exist
+    l3_gateway_hosts: set[str] = set()
+    mgmt_only_count = 0
+    for ip, dev in devices.items():
+        hn = dev.get("hostname") or ip
+        l3_ints = dev.get("l3_interfaces", []) or []
+        has_dyn_or_static = any(
+            str(r.get("protocol") or "").lower() not in ("connected", "local", "direct", "access-internal", "access")
+            and str(r.get("subnet") or "") != "0.0.0.0/0"
+            for r in (dev.get("routes") or [])
+        )
+        is_core = (
+            "core" in hn.lower()
+            or "5412" in str(dev.get("model", "")).lower()
+            or "ex4600" in str(dev.get("model", "")).lower()
+            or dev.get("device_persona") in ("router", "firewall")
+        )
+        if len(devices) <= 20 or len(l3_ints) >= 2 or has_dyn_or_static or is_core:
+            l3_gateway_hosts.add(hn)
+        else:
+            mgmt_only_count += 1
+
+    # 1. Build adjacency list of the bipartite graph (scoped to l3_gateway_hosts when >20 devices)
+    adj = {}
     subnets = set()
     device_nodes = set()
-    subnet_vlan_names = {}  # subnet_cidr -> set of vlan names
-
-    # Pre-parse VLAN names and config IP masks for all devices
-    device_vlan_maps = {}
     device_config_ips = {}
     for ip, dev in devices.items():
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
-        vlan_names = {}
-        if cfg:
-            matches = re.finditer(r"^vlan\s+(\d+)\s*[\r\n]+(?:\s+name\s+(\S+))?", cfg, re.MULTILINE | re.IGNORECASE)
-            for match in matches:
-                vlan_id = match.group(1)
-                name = match.group(2)
-                if name:
-                    vlan_names[vlan_id] = name.strip()
-        device_vlan_maps[hostname] = vlan_names
         device_config_ips[hostname] = parse_interface_ips_from_config(cfg) if cfg else {}
-
-    for ip, dev in devices.items():
-        hostname = dev.get("hostname") or ip
+        if hostname not in l3_gateway_hosts:
+            continue
         device_nodes.add(hostname)
-        if hostname not in adj:
-            adj[hostname] = set()
+        adj.setdefault(hostname, set())
 
-        l3_ints = dev.get("l3_interfaces", [])
-        vlan_names = device_vlan_maps.get(hostname, {})
-        cfg_ips = device_config_ips.get(hostname, {})
-        for intf in l3_ints:
+        for intf in dev.get("l3_interfaces", []) or []:
             intf_ip = intf.get("ip_address")
             intf_name = intf.get("interface", "")
             if not intf_ip or intf_ip in ["unassigned", "down", "up", "unset"]:
                 continue
 
             norm_intf = normalize_interface_name(intf_name)
-            _cfg_ip, cfg_mask = cfg_ips.get(norm_intf, (None, None))
+            _cfg_ip, cfg_mask = device_config_ips[hostname].get(norm_intf, (None, None))
             clean_ip, net = parse_interface_network(intf_ip, cfg_mask)
             if not net or clean_ip.startswith(("127.", "128.0.")):
                 continue
 
             clean_ip_base = f"{net.network}/{net.prefixlen}"
             subnets.add(clean_ip_base)
-
-            if clean_ip_base not in adj:
-                adj[clean_ip_base] = set()
-
+            adj.setdefault(clean_ip_base, set())
             adj[hostname].add(clean_ip_base)
             adj[clean_ip_base].add(hostname)
-
-            # Extract VLAN ID to map name
-            vlan_match = re.search(r"(?:vlan|vl)\s*(\d+)", intf_name, re.IGNORECASE)
-            if vlan_match:
-                vlan_id = vlan_match.group(1)
-                vname = vlan_names.get(vlan_id)
-                if vname:
-                    if clean_ip_base not in subnet_vlan_names:
-                        subnet_vlan_names[clean_ip_base] = set()
-                    subnet_vlan_names[clean_ip_base].add(vname)
 
     diagram_lines = []
     if not adj:
@@ -763,7 +860,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             vnames = subnet_vlan_names.get(sub, set())
             vname_suffix = f" ({'/'.join(sorted(vnames))})" if vnames else ""
             label = f"{sub}{vname_suffix}"
-            safe_label = label.replace('"', '\\"')
+            safe_label = label.replace('"', "'")
             diagram_lines.append(f'  {node_id}(["{safe_label}"])')
             diagram_lines.append(f"  class {node_id} subnet;")
 
@@ -793,13 +890,26 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
         "\n".join(diagram_lines),
         "```",
         "",
-        "## Authoritative VLAN, Subnet & SVI Map",
-        "",
-        "| Switch Hostname | Interface / VLAN | VLAN Name | Description | SVI IP Address | Subnet Range | Interface Status |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if mgmt_only_count > 0:
+        lines.extend(
+            [
+                f"> [!NOTE] Scoped to **{len(l3_gateway_hosts)}** L3 routing gateways / core switches; **{mgmt_only_count}** single-SVI L2 management switches omitted from the Mermaid graph above (all SVIs remain listed in the table below).",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Authoritative VLAN, Subnet & SVI Map",
+            "",
+            "| Switch Hostname | Interface / SVI | VLAN ID | VLAN Name | Description | SVI IP Address | Subnet Range | Interface Status |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         l3_ints = dev.get("l3_interfaces", [])
         ints_detail = dev.get("interfaces_detail", {})
@@ -816,20 +926,23 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
                     desc = stats.get("description", "")
                     break
 
-            # Get VLAN name
-            vlan_name = "N/A"
-            vlan_match = re.search(r"(?:vlan|vl)\s*(\d+)", intf_name, re.IGNORECASE)
-            if vlan_match:
-                vlan_id = vlan_match.group(1)
-                vlan_name = device_vlan_maps.get(hostname, {}).get(vlan_id, "N/A")
+            svi_row = svi_lookup.get((hostname, str(intf_name or "").lower()), {})
+            vlan_id_str = svi_row.get("vlan_id") or ""
+            vlan_name = svi_row.get("vlan_name") or ""
+            if not vlan_id_str:
+                vlan_match = re.search(r"(?:vlan\.?|vl|irb\.)0*(\d+)", str(intf_name or ""), re.IGNORECASE)
+                if vlan_match:
+                    vlan_id_str = vlan_match.group(1)
+            if not vlan_name and vlan_id_str:
+                vlan_name = (dev.get("vlans") or {}).get(vlan_id_str, {}).get("name", "")
 
             _cfg_ip, cfg_mask = device_config_ips.get(hostname, {}).get(norm_name, (None, None))
             clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
             if clean_ip.startswith(("127.", "128.0.")):
                 continue
-            subnet_range = f"{net.network}/{net.prefixlen}" if net else "N/A"
+            subnet_range = svi_row.get("prefix_cidr") or svi_row.get("subnet") or (f"{net.network}/{net.prefixlen}" if net else "N/A")
             lines.append(
-                f"| {hostname} | {intf_name} | {vlan_name} | {desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
+                f"| {hostname} | {intf_name} | {vlan_id_str or 'N/A'} | {vlan_name or 'N/A'} | {desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
             )
 
     lines.extend(
@@ -843,6 +956,8 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
     # Search running config for VRFs
     vrf_found = False
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
         # Look for "vrf definition X" or "ip vrf X"
@@ -869,6 +984,8 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
 
     has_routes = False
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         routes = dev.get("routes", [])
         if routes:
@@ -896,17 +1013,34 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
 
             sorted_routes.sort(key=route_sort_key)
 
+            omitted_host_routes = 0
             for rt in sorted_routes:
+                sub = rt["subnet"]
+                proto_l = str(rt["protocol"] or "").lower()
+                if proto_l in ("local", "access-internal", "access") and sub.endswith("/32"):
+                    omitted_host_routes += 1
+                    continue
                 lines.append(
-                    f"| {hostname} | `{rt['subnet']}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |"
+                    f"| {hostname} | `{sub}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |"
+                )
+            if omitted_host_routes:
+                lines.append(
+                    f"| {hostname} | *({omitted_host_routes} `/32` Access-internal DHCP/subscriber host routes omitted)* | Access-internal | - | - |"
                 )
 
     if not has_routes:
         lines.append("\nNo routing table entries were parsed or simulated for the scanned devices.")
 
     try:
+        from net_docu_crawler.diagram_validator import validate_mermaid_block
+
+        full_md = "\n".join(lines)
+        for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
+            errs = validate_mermaid_block(m_blk)
+            if errs:
+                print(f"[!] Mermaid syntax warning in {output_path}: {errs[0]}")
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+            f.write(full_md)
         print(f"L3 Diagrams successfully written to {output_path}")
     except Exception as e:
         print(f"Error generating L3 diagram file: {e}")
@@ -974,6 +1108,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     errors_found = []
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         ints_detail = dev.get("interfaces_detail", {})
 
@@ -1047,6 +1183,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     stp_blocked_lines = []
     audited_switches = 0
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         stp = dev.get("stp", {})
         dev_type = dev.get("device_type", "switch").lower()
@@ -1087,6 +1225,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("\n### Configured Interface Descriptions & Port Naming")
     desc_found = False
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         ints_detail = dev.get("interfaces_detail", {})
 
@@ -1119,6 +1259,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     ip_subnets = []
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         raw_config = dev.get("raw_config", "")
         config_ips = parse_interface_ips_from_config(raw_config) if raw_config else {}
@@ -1181,6 +1323,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("\n### Active Routing Protocols")
     routes_summary = {}
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         routes = dev.get("routes", [])
         protocols = list(set([get_route_details(r)["protocol"] for r in routes]))
@@ -1198,6 +1342,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("\n### Complete Routing Tables")
     has_routes_any = False
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         routes = dev.get("routes", [])
         if routes:
@@ -1236,6 +1382,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("| --- | --- | --- | --- | --- |")
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         services = dev.get("services", {})
         dns = ", ".join(services.get("dns_servers", [])) or "None"
@@ -1282,6 +1430,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     lines.append("| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |")
     lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         poe = dev.get("poe", {}) or {}
         tot_w = float(poe.get("total_power_watts", 0.0) or 0.0)
@@ -1295,6 +1445,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     peer_rows = []
     fhrp_rows = []
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         for p in dev.get("routing_peers", []) or []:
             peer_rows.append(
@@ -1322,6 +1474,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     dhcp_res_count = 0
     dhcp_relay_rows = []
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         dhcp = dev.get("dhcp", {}) or {}
         for pool in dhcp.get("pools", []) or []:
@@ -1346,6 +1500,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     # 5d. Per-Port L2 Intent Summary
     port_summary_rows = []
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         pp = dev.get("port_profiles", {}) or {}
         if not pp:
@@ -1388,6 +1544,8 @@ def generate_best_practices_report(devices, output_path="Cisco Best Practices.md
     ]
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
         mgmt_method = dev.get("mgmt_method", "SSH")
@@ -1496,9 +1654,20 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
         "Source Port",
         "Description",
         "Status",
+        "Admin Status",
+        "Mode",
         "VLAN",
+        "Access VLAN",
+        "Voice VLAN",
+        "Native VLAN",
+        "Allowed VLANs",
+        "LAG Group",
+        "LACP Mode",
         "Speed",
         "Duplex",
+        "PoE Draw (W)",
+        "Edge MAC Count",
+        "Hygiene Disposition",
         "Neighbor Hostname",
         "Neighbor Port",
         "Neighbor Platform",
@@ -1515,7 +1684,14 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
             for ip, dev in devices.items():
                 hostname = dev.get("hostname") or ip
                 ints_detail = dev.get("interfaces_detail", {})
+                port_profiles = dev.get("port_profiles", {}) or {}
                 neighbors = dev.get("neighbors", [])
+
+                # Pre-map port_profiles by normalized interface name
+                norm_profiles = {
+                    normalize_interface_name(p_name): p_data
+                    for p_name, p_data in port_profiles.items()
+                }
 
                 # Pre-map neighbors by local interface name (normalized)
                 neighbor_map = {}
@@ -1525,14 +1701,56 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
                         neighbor_map[normalize_interface_name(lp)] = n
 
                 for name, stats in ints_detail.items():
+                    if str(name).strip().lower() in ("irb", "vlan", "lo", "lo0"):
+                        continue
                     desc = stats.get("description", "")
                     status = stats.get("status", "down")
-                    vlan = stats.get("vlan", "")
                     speed = stats.get("speed", "")
                     duplex = stats.get("duplex", "")
 
-                    # Look up neighbor
                     norm_name = normalize_interface_name(name)
+                    profile = port_profiles.get(name) or norm_profiles.get(norm_name) or {}
+                    cport = (dev.get("ports") or {}).get(name) or {}
+
+                    admin_status = cport.get("admin_state") or stats.get("admin_status") or "unknown"
+                    mode = cport.get("mode") or profile.get("mode") or ""
+                    access_vlan = str(cport.get("access_vlan") or profile.get("access_vlan") or "").strip()
+                    voice_vlan = str(cport.get("voice_vlan") or profile.get("voice_vlan") or "").strip()
+                    native_vlan = str(cport.get("native_vlan") or profile.get("native_vlan") or "").strip()
+                    if native_vlan == "unknown":
+                        native_vlan = ""
+                    allowed_raw = (
+                        cport.get("allowed_vlans")
+                        or profile.get("allowed_vlans")
+                        or profile.get("trunk_allowed_vlans")
+                        or []
+                    )
+                    if isinstance(allowed_raw, list):
+                        allowed_vlans = ",".join(str(v) for v in allowed_raw if str(v).strip())
+                    else:
+                        allowed_vlans = str(allowed_raw).strip()
+                    lag_group = str(cport.get("lag_id") or profile.get("lag_group") or "").strip()
+                    if lag_group in ("none", "unknown"):
+                        lag_group = ""
+                    lacp_mode = str(cport.get("lacp_mode") or profile.get("lacp_mode") or "").strip()
+                    if lacp_mode in ("none", "unknown"):
+                        lacp_mode = ""
+                    poe_draw = cport.get("poe_draw_watts", "")
+                    edge_macs = cport.get("edge_mac_count", "")
+                    hygiene = cport.get("hygiene_disposition", "")
+
+                    vlan = str(stats.get("vlan") or "").strip()
+                    if not vlan:
+                        if mode == "trunk" and allowed_vlans:
+                            vlan = f"Trunk ({allowed_vlans})"
+                        elif mode == "trunk" and native_vlan:
+                            vlan = f"Trunk (native {native_vlan})"
+                        elif access_vlan:
+                            vlan = access_vlan
+                        elif allowed_vlans:
+                            vlan = allowed_vlans
+
+                    # Look up neighbor
                     neighbor = neighbor_map.get(norm_name)
 
                     neigh_host = ""
@@ -1549,9 +1767,20 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
                             "Source Port": name,
                             "Description": desc,
                             "Status": status,
+                            "Admin Status": admin_status,
+                            "Mode": mode,
                             "VLAN": vlan,
+                            "Access VLAN": access_vlan,
+                            "Voice VLAN": voice_vlan,
+                            "Native VLAN": native_vlan,
+                            "Allowed VLANs": allowed_vlans,
+                            "LAG Group": lag_group,
+                            "LACP Mode": lacp_mode,
                             "Speed": speed,
                             "Duplex": duplex,
+                            "PoE Draw (W)": poe_draw,
+                            "Edge MAC Count": edge_macs,
+                            "Hygiene Disposition": hygiene,
                             "Neighbor Hostname": neigh_host,
                             "Neighbor Port": neigh_port,
                             "Neighbor Platform": neigh_plat,
@@ -1581,11 +1810,13 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
         "Resolved IP",
         "Resolved Hostname / Identity",
         "Device Persona / Role",
+        "Resolution Confidence",
     ]
 
     mac_to_ip = {}
     mac_to_host = {}
     mac_to_role = {}
+    dhcp_macs = set()
 
     for ip, dev in devices.items():
         dev_host = dev.get("hostname") or ip
@@ -1602,6 +1833,15 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
             if a_ip and a_mac:
                 mac_to_ip[a_mac] = a_ip
 
+        for res in (dev.get("dhcp") or {}).get("reservations", []) or []:
+            r_mac = (res.get("mac") or "").lower()
+            if r_mac:
+                dhcp_macs.add(r_mac)
+                if res.get("ip") and r_mac not in mac_to_ip:
+                    mac_to_ip[r_mac] = res["ip"]
+                if res.get("hostname") and r_mac not in mac_to_host:
+                    mac_to_host[r_mac] = res["hostname"]
+
         for nbr in dev.get("neighbors", []):
             r_mac = (nbr.get("remote_mac") or "").lower()
             r_host = nbr.get("remote_device") or ""
@@ -1616,10 +1856,30 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
     seen_port_mac = set()
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         mac_table = dev.get("mac_table", [])
+        dev_ports = dev.get("ports") or {}
+        ports_ci = {str(k).lower(): v for k, v in dev_ports.items()}
+        profs_ci = {str(k).lower(): v for k, v in (dev.get("port_profiles") or {}).items()}
+        norm_dev_ports = {normalize_interface_name(k).lower(): v for k, v in dev_ports.items()}
         for entry in mac_table:
-            port = entry.get("interface", "")
+            port = entry.get("interface") or entry.get("port") or ""
+            norm_p = normalize_interface_name(port).lower()
+            cport = (
+                dev_ports.get(port)
+                or ports_ci.get(port.lower())
+                or norm_dev_ports.get(norm_p)
+                or profs_ci.get(port.lower())
+                or {}
+            )
+            if (
+                cport.get("mode") == "trunk"
+                or cport.get("neighbor_type") in ("switch", "router", "firewall")
+                or port.lower().startswith(("ae", "po", "trk"))
+            ):
+                continue
             vlan = str(entry.get("vlan", "1"))
             mac = (entry.get("mac") or "").lower()
             mtype = entry.get("type", "dynamic")
@@ -1642,6 +1902,11 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
                 else:
                     res_role = "Network Endpoint"
 
+            res_conf = (
+                "CORRELATED_DHCP"
+                if mac in dhcp_macs
+                else ("CORRELATED_ARP" if res_ip else ("INFERRED_OUI" if vendor and vendor != "Unknown" else "UNRESOLVED"))
+            )
             seen_port_mac.add((hostname, port, mac))
             rows.append(
                 {
@@ -1655,6 +1920,7 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
                     "Resolved IP": res_ip or "N/A (DHCP / Unrouted)",
                     "Resolved Hostname / Identity": res_host or "N/A",
                     "Device Persona / Role": res_role,
+                    "Resolution Confidence": res_conf,
                 }
             )
 
@@ -1664,6 +1930,20 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
             a_mac = (arp.get("mac") or "").lower()
             a_intf = arp.get("interface", "")
             if not a_mac or not a_intf or a_ip == ip or a_mac == "incomplete":
+                continue
+            a_norm = normalize_interface_name(a_intf).lower()
+            a_cport = (
+                dev_ports.get(a_intf)
+                or ports_ci.get(a_intf.lower())
+                or norm_dev_ports.get(a_norm)
+                or profs_ci.get(a_intf.lower())
+                or {}
+            )
+            if (
+                a_cport.get("mode") == "trunk"
+                or a_cport.get("neighbor_type") in ("switch", "router", "firewall")
+                or a_intf.lower().startswith(("ae", "po", "trk"))
+            ):
                 continue
             if (hostname, a_intf, a_mac) in seen_port_mac:
                 continue
@@ -1697,6 +1977,7 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
                     "Resolved IP": a_ip,
                     "Resolved Hostname / Identity": res_host or "N/A",
                     "Device Persona / Role": res_role,
+                    "Resolution Confidence": "CORRELATED_ARP",
                 }
             )
 
@@ -1716,63 +1997,116 @@ def generate_protocol_translation(devices, output_path="cisco_to_target_translat
     Generates Cisco-to-Target Feature Mapping & Protocol Translation Matrix.
     """
     lines = [
-        "# Cisco-to-Target Protocol Translation & Mapping Matrix",
+        "# Cross-Vendor Protocol Translation & Mapping Matrix",
         "",
-        "This report outlines proprietary or Cisco-specific protocols detected on your network switches, and provides the standard target equivalent features required during migration.",
+        "This report outlines proprietary or vendor-specific protocols detected on your network switches, and provides the standard target equivalent features required during migration.",
         "",
     ]
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
 
-        lines.append(f"## Switch: {hostname} ({ip})")
-        lines.append("| Cisco Configured Feature | Target Standard Equivalent | Migration Recommendation / Notes |")
-        lines.append("| --- | --- | --- |")
+        lines.append(f"## Switch: {hostname} ({ip}) — {dev.get('vendor', 'Unknown')}")
+        lines.append("| Source Construct | Source Evidence (Ports / VLANs / IPs) | Target Standard Equivalent | Validation Gate |")
+        lines.append("| --- | --- | --- | --- |")
 
         features_found = 0
+        vendor_l = str(dev.get("vendor") or "").lower()
+        ports_map = dev.get("ports") or {}
+        acc_ports = [p for p, d in ports_map.items() if d.get("mode") == "access"]
+        trk_ports = [p for p, d in ports_map.items() if d.get("mode") == "trunk"]
+        voice_vlans = sorted({str(d.get("voice_vlan")) for d in ports_map.values() if d.get("voice_vlan")})
+        relays = (dev.get("dhcp") or {}).get("relays") or []
+        stp = dev.get("stp") or {}
 
-        if cfg:
+        if "procurve" in vendor_l or "hp" in vendor_l or "aruba" in vendor_l:
+            if acc_ports or trk_ports:
+                lines.append(
+                    f"| **HP/Aruba `untagged` / `tagged` VLANs** | {len(acc_ports)} access, {len(trk_ports)} trunk ports | Target Access / Trunk Port Profiles | Per-VLAN MAC learning |"
+                )
+                features_found += 1
+            if voice_vlans:
+                lines.append(
+                    f"| **HP/Aruba `voice` VLAN** | VLAN(s): {', '.join(voice_vlans)} | Target Voice VLAN + LLDP-MED | Phone DHCP & voice VLAN check |"
+                )
+                features_found += 1
+            if relays:
+                lines.append(
+                    f"| **HP/Aruba `ip helper-address`** | {len(relays)} relay binding(s) | Target SVI DHCP Relay | Client DHCP lease test |"
+                )
+                features_found += 1
+            if stp.get("enabled") is False:
+                lines.append(
+                    "| **⚠️ STP Disabled on Source Switch** | `STP Enabled: No` | Enable RSTP (802.1w) / MSTP (802.1s) on target | Loop-free topology check |"
+                )
+                features_found += 1
+        elif "juniper" in vendor_l:
+            all_trks = [p for p, d in ports_map.items() if d.get("allowed_vlans_raw") == "all"]
+            if acc_ports or trk_ports:
+                ev = f"{len(acc_ports)} access, {len(trk_ports)} trunk" + (f" ({len(all_trks)} using `all`)" if all_trks else "")
+                lines.append(
+                    f"| **Junos `family ethernet-switching`** | {ev} | Target Access / Trunk Port Profiles (explicit VLANs) | Compare source vs target port objects |"
+                )
+                features_found += 1
+            if voice_vlans:
+                lines.append(
+                    f"| **Junos `switch-options voip`** | Voice VLAN(s): {', '.join(voice_vlans)} | Target Voice VLAN + LLDP-MED | Phone DHCP & voice VLAN check |"
+                )
+                features_found += 1
+            if relays:
+                lines.append(
+                    f"| **Junos `irb.*` + `dhcp-relay`** | {len(relays)} relay binding(s) | Target SVI + DHCP Relay | Gateway & DHCP lease test |"
+                )
+                features_found += 1
+            if stp.get("root_scope") == "isolated_self_root":
+                lines.append(
+                    f"| **⚠️ Junos `isolated_self_root` RSTP** | Root `{stp.get('root_bridge', '')}` | Deterministic RSTP/MSTP root priority | Root/secondary-root check |"
+                )
+                features_found += 1
+        elif cfg:
             # Spanning tree
             if re.search(r"spanning-tree mode\s+(?:pvst|rapid-pvst)", cfg, re.IGNORECASE):
                 lines.append(
-                    "| **Rapid-PVST+ / PVST+** | `MSTP (802.1s)` or `RSTP (802.1w)` | Proprietary multi-instance STP. Map to standard MSTP or single-instance RSTP. |"
+                    "| **Rapid-PVST+ / PVST+** | Configured in `spanning-tree mode` | `MSTP (802.1s)` or `RSTP (802.1w)` | Root/secondary-root check |"
                 )
                 features_found += 1
             # HSRP
             if re.search(r"standby\s+\d+\s+ip", cfg, re.IGNORECASE):
                 lines.append(
-                    "| **HSRP (Hot Standby Router Protocol)** | `VRRP (RFC 5798 / 802.11R)` | Proprietary router redundancy. Transition gateway IP virtual addresses to VRRP groups. |"
+                    "| **HSRP (Hot Standby Router Protocol)** | Configured in `standby ip` | `VRRPv3 (RFC 5798)` | Gateway failover test |"
                 )
                 features_found += 1
             # CDP
             if re.search(r"cdp run|cdp enable", cfg, re.IGNORECASE):
                 lines.append(
-                    "| **CDP (Cisco Discovery Protocol)** | `LLDP (802.1AB)` | Proprietary device discovery. Enable LLDP globally and per interface on new vendor switches. |"
+                    "| **CDP (Cisco Discovery Protocol)** | Configured in `cdp` | `LLDP (802.1AB)` | Neighbor adjacency check |"
                 )
                 features_found += 1
             # VTP
             if re.search(r"vtp mode|vtp domain", cfg, re.IGNORECASE):
                 lines.append(
-                    "| **VTP (VLAN Trunking Protocol)** | `Manual Config` or `MVRP (802.1ak)` | Proprietary VLAN propagation. Recommend manual provisioning or automation templates instead. |"
+                    "| **VTP (VLAN Trunking Protocol)** | Configured in `vtp` | `Manual Config` or `MVRP (802.1ak)` | VLAN database parity |"
                 )
                 features_found += 1
             # Static EtherChannel
             if re.search(r"channel-group\s+\d+\s+mode\s+on", cfg, re.IGNORECASE):
                 lines.append(
-                    "| **Static EtherChannel** | `LACP (802.3ad) Active` | Hardcoded bundling without control packet validation. Convert to standard dynamic LACP. |"
+                    "| **Static EtherChannel** | `channel-group mode on` | `LACP (802.3ad) Active` | All LAG members forwarding |"
                 )
                 features_found += 1
             # Stackwise
             if dev.get("model") and ("c9300" in dev.get("model").lower() or "c3850" in dev.get("model").lower()):
                 lines.append(
-                    "| **StackWise / StackWise-Virtual** | `VPC / MLAG` or Target Virtual Chassis | Stack backplane redundancy. Transition to target Multi-chassis LAG or equivalent backplane stack. |"
+                    "| **StackWise / StackWise-Virtual** | Hardware model | `VPC / MLAG` or Target Virtual Chassis | Redundant uplink check |"
                 )
                 features_found += 1
 
         if features_found == 0:
             lines.append(
-                "| *No proprietary Cisco protocols detected.* | Standard-ready configuration | Config is already standard-compliant. |"
+                "| *No vendor-specific constructs extracted* | Verify `ports` / `raw_config` | Standard Target Profile | Manual config review |"
             )
 
         lines.append("")
@@ -1794,6 +2128,8 @@ def generate_config_variables(devices, output_path="migration_config_variables.j
     # Pre-parse VLAN names for all devices
     device_vlan_maps = {}
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
         vlan_names = {}
@@ -1803,10 +2139,12 @@ def generate_config_variables(devices, output_path="migration_config_variables.j
                 vlan_id = match.group(1)
                 name = match.group(2)
                 if name:
-                    vlan_names[vlan_id] = name.strip()
+                    vlan_names[vlan_id] = name.strip().strip('"').strip("'")
         device_vlan_maps[hostname] = vlan_names
 
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
         services = dev.get("services", {})
 
@@ -1890,6 +2228,8 @@ def save_baseline_state(devices, output_path):
     """
     baseline = {}
     for ip, dev in devices.items():
+        if not _is_network_infra(dev):
+            continue
         hostname = dev.get("hostname") or ip
 
         # Up physical interfaces
@@ -1952,6 +2292,36 @@ def compare_baseline_state(devices, baseline_path, output_path="migration_verifi
     except Exception as e:
         print(f"Error reading baseline file: {e}")
         return
+
+    # Support full dataset JSON (`list[dict]` or `dict[ip, device_dict]`) in addition to legacy baseline summaries
+    if isinstance(baseline, list) or (
+        isinstance(baseline, dict)
+        and baseline
+        and any(isinstance(v, dict) and ("interfaces_detail" in v or "ports" in v) for v in baseline.values())
+    ):
+        raw_list = baseline if isinstance(baseline, list) else list(baseline.values())
+        normalized_baseline = {}
+        for bd in raw_list:
+            if not isinstance(bd, dict) or bd.get("status", "success") != "success":
+                continue
+            bhost = bd.get("hostname") or bd.get("ip", "")
+            if not bhost:
+                continue
+            b_ints = bd.get("interfaces_detail") or {}
+            b_up = [n for n, st in b_ints.items() if st.get("status") == "up"]
+            b_svis = {
+                i.get("interface", ""): {"ip": i.get("ip_address", ""), "status": i.get("status", "")}
+                for i in (bd.get("l3_interfaces") or [])
+                if i.get("interface")
+            }
+            normalized_baseline[bhost] = {
+                "management_ip": bd.get("ip", ""),
+                "up_interfaces": b_up,
+                "svis": b_svis,
+                "neighbors": bd.get("neighbors") or [],
+                "routes": bd.get("routes") or [],
+            }
+        baseline = normalized_baseline
 
     lines = [
         "# Post-Migration Verification & Validation Report",
@@ -2113,7 +2483,7 @@ def generate_master_network_analysis_migration_blueprint(
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    unique_devs = get_unique_devices(devices)
+    unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
     total_nodes = len(unique_devs)
 
     lines = [
@@ -2227,26 +2597,33 @@ def generate_master_network_analysis_migration_blueprint(
 
         for port_name, stats in sorted(ints_detail.items()):
             norm_port = normalize_interface_name(port_name)
+            cport = (dev.get("ports") or {}).get(port_name) or {}
             status = stats.get("status", "down")
             speed = stats.get("speed") or "1Gb/s"
             duplex = stats.get("duplex") or "Full"
             mtu = stats.get("mtu") or (9000 if "jumbo" in stats.get("description", "").lower() else 1500)
 
-            # Transceiver / media inference
-            if any(p in norm_port.lower() for p in ["xe-", "te", "eth1/", "et-", "mgmt", "10ge"]):
+            # Transceiver / media from correlated ports first, fallback to port name
+            if cport.get("optic_part_number"):
+                media = f"{cport.get('media') or 'SFP'} ({cport['optic_part_number']})"
+                transceiver_counts["10GBASE-SR (Multimode LC)"] += 1
+            elif cport.get("media"):
+                media = cport["media"]
+                transceiver_counts["1000BASE-T (RJ45)"] += 1
+            elif any(p in norm_port.lower() for p in ["xe-", "te", "eth1/", "et-", "mgmt", "10ge"]):
                 media = "10GBASE-SR (SFP+ LC)"
                 transceiver_counts["10GBASE-SR (Multimode LC)"] += 1
-            elif any(p in norm_port.lower() for p in ["ge-", "gi", "fa", "eth0", "port"]):
-                media = "1000BASE-T (RJ45)"
-                transceiver_counts["1000BASE-T (RJ45)"] += 1
             else:
                 media = "1000BASE-T (RJ45)"
                 transceiver_counts["1000BASE-T (RJ45)"] += 1
 
             nbr = neighbor_map.get(norm_port)
-            nbr_host = (nbr.get("remote_device") or "").strip().strip('"').strip("'") if nbr else "Unconnected"
-            nbr_port = normalize_interface_name(nbr.get("remote_port", "")) if nbr else "N/A"
-            lag_group = channel_map.get(norm_port, "None (Standalone)")
+            nbr_host = cport.get("neighbor_hostname") or (
+                (nbr.get("remote_device") or "").strip().strip('"').strip("'") if nbr else "Unconnected"
+            )
+            nbr_port = cport.get("neighbor_port") or (normalize_interface_name(nbr.get("remote_port", "")) if nbr else "N/A")
+            lag_val = cport.get("lag_id") or channel_map.get(norm_port, "")
+            lag_group = lag_val if lag_val and lag_val not in ("none", "unknown") else "None (Standalone)"
 
             cabling_rows.append(
                 f"| **{hostname}** | `{norm_port}` | {media} | {speed} / {duplex} | `{status}` | **{nbr_host}** | `{nbr_port}` | `{lag_group}` |"
@@ -2322,7 +2699,7 @@ def generate_master_network_analysis_migration_blueprint(
                 else:
                     health = "✓ Optimal Optical Link"
             else:
-                health = "✓ Active Link"
+                health = "DOM Unavailable / Unmonitored"
 
             lines.append(
                 f"| **{hostname}** | `{port}` | `{part}` | `{serial}` | `{form}` | {tx} | {rx} | {temp} | {volt} | {health} |"
@@ -2393,18 +2770,32 @@ def generate_master_network_analysis_migration_blueprint(
         persona = dev.get("device_persona", "")
 
         if persona == "switch" or tot > 0 or used > 0:
-            if tot == 0.0:
-                tot = 370.0  # Industry standard 24/48-port PoE budget baseline if unqueried
-                used = 45.0
-                rem = tot - used
-
-            pct = (used / tot * 100.0) if tot > 0 else 0.0
-            psu_rec = (
-                "Minimum 740W PSU (Supports 802.3at PoE+ expansion)"
-                if used > 200
-                else "Standard 370W PSU (Class 3/4 Sufficient)"
-            )
-            lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
+            if poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
+                lines.append(
+                    f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |"
+                )
+            elif poe.get("budget_unreported") and used > 0.0:
+                deliv_cnt = poe.get("poe_delivering_ports", 0)
+                lines.append(
+                    f"| **{hostname}** | Unreported by CLI | {used:.1f}W ({deliv_cnt} active) | Unknown | N/A | Verify Chassis PSU Budget (Draw: {used:.1f}W) |"
+                )
+            elif tot == 0.0 and used == 0.0:
+                lines.append(
+                    f"| **{hostname}** | Unknown | Unknown | Unknown | N/A | Unknown (Verify PSU / PoE Budget) |"
+                )
+            elif tot == 0.0 and used > 0.0:
+                lines.append(
+                    f"| **{hostname}** | 0.0W | {used:.1f}W | N/A | N/A | ⚠️ Conflict: 0W budget with active draw |"
+                )
+            else:
+                pct = (used / tot * 100.0) if tot > 0 else 0.0
+                req_w = max(tot, used * 1.25)
+                psu_rec = (
+                    f"Minimum {int(req_w)}W+ PSU (Supports 802.3at PoE+ expansion)"
+                    if req_w > 370
+                    else "Standard 370W PSU (Class 3/4 Sufficient)"
+                )
+                lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
 
     lines.extend(
         [
@@ -2415,59 +2806,27 @@ def generate_master_network_analysis_migration_blueprint(
             "",
             "This authoritative map defines every VLAN ID, broadcast domain, gateway IP, and trunk path across the campus:",
             "",
-            "| VLAN ID | VLAN Name | Subnet / CIDR Prefix | Gateway SVI IP | 802.1Q Tagged Trunk Uplinks | Native VLAN | Purpose / Security Zone |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Site | Source Device | VLAN ID | VLAN Name | SVI / IRB | Gateway IP | Subnet / CIDR Prefix | DHCP Relays |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
     )
 
-    # Extract all VLANs and SVIs
+    from net_docu_crawler.correlator import build_l3_svi_table
+
+    svi_rows = build_l3_svi_table(list(unique_devs.values()))
     vlan_rows = []
-    seen_vlans = set()
-    for ip, dev in unique_devs.items():
-        hostname = dev.get("hostname") or ip
-        cfg = dev.get("raw_config", "")
-        l3_ints = dev.get("l3_interfaces", [])
+    for sr in svi_rows:
+        site_lbl = sr["site_code"] or "-"
+        vid_lbl = f"**{sr['vlan_id']}**" if sr["vlan_id"] else "-"
+        vname_lbl = f"`{sr['vlan_name']}`" if sr["vlan_name"] else "-"
+        rel_lbl = ", ".join(f"`{r}`" for r in sr["dhcp_relays"]) if sr["dhcp_relays"] else "None"
+        vlan_rows.append(
+            f"| {site_lbl} | **{sr['source_device']}** | {vid_lbl} | {vname_lbl} | `{sr['svi_interface']}` | "
+            f"`{sr['primary_ip']}` | `{sr['prefix_cidr'] or 'N/A'}` | {rel_lbl} |"
+        )
 
-        # Parse VLAN blocks
-        v_matches = re.finditer(r"vlan\s+(\d+)\s*[\r\n]+(?:\s+name\s+(\S+))?", cfg, re.IGNORECASE)
-        for vm in v_matches:
-            vid = vm.group(1)
-            vname = vm.group(2) or f"VLAN_{vid}"
-            if vid in seen_vlans:
-                continue
-            seen_vlans.add(vid)
-
-            # Match gateway SVI
-            gw_ip = "L2 Only (Switched)"
-            subnet_str = "Inherited L2"
-            for intf in l3_ints:
-                iname = intf.get("interface", "")
-                if vid in iname or f"vlan{vid}" in iname.lower() or f"irb.{vid}" in iname.lower():
-                    gw_ip = intf.get("ip_address", "").split()[0]
-                    clean_ip, net = parse_interface_network(gw_ip)
-                    if net:
-                        subnet_str = f"{net.network}/{net.prefixlen}"
-                    break
-
-            zone = "Management" if vid in ("1", "99") else ("DMZ" if "dmz" in vname.lower() else "Corporate LAN")
-            vlan_rows.append(
-                f"| **{vid}** | `{vname}` | `{subnet_str}` | `{gw_ip}` | All Inter-Switch Trunks | `VLAN 1` | {zone} |"
-            )
-
-    # Add standard lab VLANs if none explicitly parsed
     if not vlan_rows:
-        vlan_rows.append(
-            "| **1** | `Default_LAN` | `192.168.1.0/24` | `192.168.1.1` | ge-0/0/3, Eth0, Po1 | `VLAN 1` | Core Management & Access |"
-        )
-        vlan_rows.append(
-            "| **10** | `TRUSTED` | `192.168.10.0/24` | `192.168.10.1` | ge-0/0/3, vtnet0_vlan10 | `VLAN 1` | Production Corporate Workstations |"
-        )
-        vlan_rows.append(
-            "| **20** | `IOT` | `192.168.20.0/24` | `192.168.20.1` | ge-0/0/3, vtnet0_vlan20 | `VLAN 1` | Isolated Smart Devices & Building Automation |"
-        )
-        vlan_rows.append(
-            "| **30** | `GUEST` | `192.168.30.0/24` | `192.168.30.1` | ge-0/0/3, vtnet0_vlan30 | `VLAN 1` | Internet-Only Guest Wi-Fi (Client Isolation) |"
-        )
+        vlan_rows.append("| - | *None* | - | *No L3 VLAN/SVI mappings parsed* | - | `N/A` | `N/A` | - |")
 
     lines.extend(vlan_rows)
 
@@ -2490,24 +2849,25 @@ def generate_master_network_analysis_migration_blueprint(
     has_relays = False
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
-        relays = dev.get("services", {}).get("dhcp_relays", [])
+        relays = (dev.get("dhcp") or {}).get("relays", []) or []
         if relays:
             has_relays = True
-            for r_ip in relays:
+            for rel in relays:
+                r_intf = rel.get("interface") or "Unknown"
+                r_ip = rel.get("helper_ip") or ""
+                if r_ip:
+                    lines.append(
+                        f"| **{hostname}** | `{r_intf}` | `{r_ip}` | Discovered DHCP Relay | ✓ Provisioned |"
+                    )
+        else:
+            for r_ip in (dev.get("services") or {}).get("dhcp_relays", []) or []:
+                has_relays = True
                 lines.append(
-                    f"| **{hostname}** | `All L3 Routed Interfaces` | `{r_ip}` | Corporate Windows / Infoblox DHCP | ✓ Provisioned |"
+                    f"| **{hostname}** | `Unknown (Config Services)` | `{r_ip}` | Discovered DHCP Relay | ✓ Provisioned |"
                 )
 
     if not has_relays:
-        lines.append(
-            "| **OPNsense Core Gateway** | `vtnet0 (LAN / VLAN 1)` | `192.168.1.1` (Local Dnsmasq/Kea) | Integrated Local Gateway DHCP | ✓ Active |"
-        )
-        lines.append(
-            "| **OPNsense Core Gateway** | `vtnet0_vlan10 (TRUSTED)` | `192.168.10.1` (Local Dnsmasq/Kea) | Integrated Local Gateway DHCP | ✓ Active |"
-        )
-        lines.append(
-            "| **OPNsense Core Gateway** | `vtnet0_vlan20 (IOT)` | `192.168.20.1` (Local Dnsmasq/Kea) | Integrated Local Gateway DHCP | ✓ Active |"
-        )
+        lines.append("| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | Unconfigured or Local DHCP |")
 
     lines.extend(
         [
@@ -2523,13 +2883,35 @@ def generate_master_network_analysis_migration_blueprint(
 
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
-        stp = dev.get("stp", {})
-        is_root = stp.get("is_root", False)
+        stp = dev.get("stp", {}) or {}
+        is_root = bool(stp.get("is_root", False))
         persona = dev.get("device_persona", "")
         if persona == "switch" or stp.get("enabled"):
-            root_label = "👑 **ROOT BRIDGE**" if is_root else "Non-Root Bridge"
+            proto = stp.get("protocol") or "Unknown"
+            prio = stp.get("bridge_priority") or "Unknown"
+            if not stp.get("enabled"):
+                root_label = "Disabled (STP Off)"
+            elif stp.get("is_verified_campus_root"):
+                root_label = f"👑 **VERIFIED CAMPUS ROOT** ({stp.get('root_bridge', '')})"
+            elif stp.get("root_scope") == "isolated_self_root":
+                root_label = f"⚠️ Isolated Self-Root ({stp.get('root_bridge', '')})"
+            elif is_root and (stp.get("root_bridge") or stp.get("vlans")):
+                root_label = "👑 **ROOT BRIDGE**"
+            elif is_root:
+                root_label = "⚠️ Unverified Root (Missing Bridge ID)"
+            else:
+                rb = stp.get("root_bridge") or "Unknown"
+                rp = stp.get("root_port") or "N/A"
+                root_label = f"Non-Root (Root: {rb}, Port: {rp})"
+
+            pp = dev.get("port_profiles", {}) or {}
+            edge_cnt = sum(1 for v in pp.values() if v.get("stp_edge") is True)
+            bpdu_cnt = sum(1 for v in pp.values() if v.get("bpdu_guard") is True)
+            edge_label = f"{edge_cnt} edge ports" if edge_cnt > 0 else "Unknown"
+            bpdu_label = f"{bpdu_cnt} protected ports" if bpdu_cnt > 0 else "Unknown"
+
             lines.append(
-                f"| **{hostname}** | `RSTP (802.1w)` | {root_label} | `32768` (Default) | Enabled on Access Ports | Active (Error-Disable on Violation) | Standard IEEE 802.1w / 802.1s |"
+                f"| **{hostname}** | `{proto}` | {root_label} | `{prio}` | {edge_label} | {bpdu_label} | Standard IEEE 802.1w / 802.1s |"
             )
 
     lines.extend(
@@ -2539,11 +2921,32 @@ def generate_master_network_analysis_migration_blueprint(
             "",
             "## 7. First-Hop Redundancy Protocols (FHRP) & Gateway Migration",
             "",
-            "| Redundancy Group | Protocol Type | Virtual IP Address | Active Primary Node | Standby Secondary Node | Preemption | Target Migration Standard |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-            "| **Corporate LAN** | `CARP / VRRP` | `192.168.1.1` | `gateway-01.corp.internal` | Secondary Standby Node | Enabled | Standard VRRPv3 (RFC 5798) |",
-            "| **VLAN 10 TRUSTED** | `CARP / VRRP` | `192.168.10.1` | `gateway-01.corp.internal` | Secondary Standby Node | Enabled | Standard VRRPv3 (RFC 5798) |",
-            "| **VLAN 20 IOT** | `CARP / VRRP` | `192.168.20.1` | `gateway-01.corp.internal` | Secondary Standby Node | Enabled | Standard VRRPv3 (RFC 5798) |",
+        ]
+    )
+
+    fhrp_migration_rows = []
+    for ip, dev in unique_devs.items():
+        hostname = dev.get("hostname") or ip
+        for f_item in dev.get("fhrp", []) or []:
+            fhrp_migration_rows.append(
+                f"| **{hostname} ({f_item.get('interface', 'N/A')})** | `{f_item.get('protocol', 'Unknown').upper()}` | "
+                f"`{f_item.get('vip', 'Unknown')}` | `{hostname}` | {f_item.get('state', 'Unknown')} | "
+                f"{f_item.get('preempt', 'Unknown')} | Standard VRRPv3 (RFC 5798) |"
+            )
+
+    if fhrp_migration_rows:
+        lines.extend(
+            [
+                "| Redundancy Group | Protocol Type | Virtual IP Address | Active Primary Node | Standby Secondary Node | Preemption | Target Migration Standard |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                *fhrp_migration_rows,
+            ]
+        )
+    else:
+        lines.append("> No FHRP (HSRP / VRRP / CARP) groups were discovered in the crawled dataset.")
+
+    lines.extend(
+        [
             "",
             "---",
             "",
@@ -2579,10 +2982,15 @@ def generate_master_network_analysis_migration_blueprint(
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         persona = dev.get("device_persona", "")
-        nat_status = "Enabled (WAN Egress Masquerade)" if persona == "firewall" else "Disabled (Pure L2/L3 Routing)"
-        lines.append(
-            f"| **{hostname}** | ✓ Disabled (Zero Telnet/HTTP) | ✓ Enforced (SSHv2 / TLS 1.3) | State-Enforced Firewall Rules | {nat_status} |"
-        )
+        mgmt = str(dev.get("mgmt_method") or "Unknown")
+        sec_pol = dev.get("security_policy") or {}
+        fw_cnt = len(sec_pol.get("firewall_rules") or [])
+        nat_cnt = len(sec_pol.get("nat_rules") or [])
+        insecure_col = "Telnet Active" if "telnet" in mgmt.lower() else ("Unknown" if mgmt == "Unknown" else "SSH/API Only")
+        secure_col = mgmt if mgmt != "Unknown" else "Unknown"
+        acl_col = f"{fw_cnt} parsed rules" if fw_cnt > 0 else "Unknown (Not Queried)"
+        nat_status = f"Enabled ({nat_cnt} rules)" if nat_cnt > 0 else ("Disabled (Pure L2/L3)" if persona in ("switch", "router") else "Unknown")
+        lines.append(f"| **{hostname}** | {insecure_col} | {secure_col} | {acl_col} | {nat_status} |")
 
     lines.extend(
         [
@@ -2608,10 +3016,10 @@ def generate_master_network_analysis_migration_blueprint(
         rad_all.update(serv.get("radius_servers", []))
         sys_all.update(serv.get("syslog_servers", []))
 
-    dns_str = ", ".join(f"`{s}`" for s in sorted(dns_all)) or "`1.1.1.1`, `9.9.9.9`"
-    ntp_str = ", ".join(f"`{s}`" for s in sorted(ntp_all)) or "`0.opnsense.pool.ntp.org`"
-    sys_str = ", ".join(f"`{s}`" for s in sorted(sys_all)) or "`192.168.1.50` (Central SIEM)"
-    rad_str = ", ".join(f"`{s}`" for s in sorted(rad_all)) or "Local RBAC Fallback"
+    dns_str = ", ".join(f"`{s}`" for s in sorted(dns_all)) or "Unknown (Not Discovered)"
+    ntp_str = ", ".join(f"`{s}`" for s in sorted(ntp_all)) or "Unknown (Not Discovered)"
+    sys_str = ", ".join(f"`{s}`" for s in sorted(sys_all)) or "Unknown (Not Discovered)"
+    rad_str = ", ".join(f"`{s}`" for s in sorted(rad_all)) or "Unknown / Local RBAC"
 
     lines.append(f"| **DNS Resolvers** | {dns_str} | DNS UDP/TCP 53 | ✓ Consistent Across Fleet |")
     lines.append(f"| **NTP Strata** | {ntp_str} | NTP UDP 123 | ✓ Clock Synchronized |")
@@ -2627,13 +3035,40 @@ def generate_master_network_analysis_migration_blueprint(
             "",
             "## 11. Proprietary Feature De-risking & Protocol Translation",
             "",
-            "| Legacy / Proprietary Protocol | Standard Target Feature | Technical Migration Action | Risk Level |",
+            "| Source Vendor / Construct | Standard Target Feature | Technical Migration Action | Risk Level |",
             "| :--- | :--- | :--- | :--- |",
-            "| **Cisco PVST+ / Rapid-PVST+** | `MSTP (802.1s)` or `RSTP (802.1w)` | Map multi-instance VLAN STPs to IEEE standard MSTP region. | Medium |",
-            "| **Cisco HSRP** | `VRRPv3 (RFC 5798)` | Convert virtual router IP groups and priority preemption to VRRP. | Low |",
-            "| **Cisco Discovery Protocol (CDP)** | `LLDP (802.1AB)` | Enable LLDP globally and transmit/receive TLVs on all switchports. | Low |",
-            "| **Static EtherChannel (`mode on`)** | `LACP Active (802.3ad)` | Eliminate unnegotiated channel bonds; enforce LACP control packet verification. | High |",
-            "| **Cisco StackWise** | Target `MLAG / Virtual Chassis` | Eliminate proprietary backplane stacking; transition to multi-chassis LAG. | Medium |",
+        ]
+    )
+
+    vendors_present = {str(d.get("vendor") or "").lower() for d in unique_devs.values()}
+    if any("cisco" in v for v in vendors_present):
+        lines.extend(
+            [
+                "| **Cisco PVST+ / Rapid-PVST+** | `MSTP (802.1s)` or `RSTP (802.1w)` | Map multi-instance VLAN STPs to IEEE standard MSTP region. | Medium |",
+                "| **Cisco HSRP** | `VRRPv3 (RFC 5798)` | Convert virtual router IP groups and priority preemption to VRRP. | Low |",
+                "| **Cisco Discovery Protocol (CDP)** | `LLDP (802.1AB)` | Enable LLDP globally and transmit/receive TLVs on all switchports. | Low |",
+                "| **Static EtherChannel (`mode on`)** | `LACP Active (802.3ad)` | Eliminate unnegotiated channel bonds; enforce LACP control packet verification. | High |",
+                "| **Cisco StackWise** | Target `MLAG / Virtual Chassis` | Eliminate proprietary backplane stacking; transition to multi-chassis LAG. | Medium |",
+            ]
+        )
+    if any("juniper" in v for v in vendors_present):
+        lines.extend(
+            [
+                "| **Junos `family ethernet-switching`** | Target Access / Trunk Port Profile | Map `interface-mode` + `vlan members` (expanding `all`) and `native-vlan-id`. | Medium |",
+                "| **Junos `irb.<vid>` + `dhcp-relay`** | Target SVI / Routed VLAN Interface | Preserve IP/prefix, VRF, and `active-server-group` relay bindings. | Medium |",
+                "| **Junos `switch-options voip`** | Target Voice VLAN / LLDP-MED | Map `voip interface` VLAN bindings to target voice-VLAN + LLDP-MED policy. | Low |",
+            ]
+        )
+    if any("procurve" in v or "hp" in v or "aruba" in v for v in vendors_present):
+        lines.extend(
+            [
+                "| **HP/Aruba `untagged` / `tagged` VLANs** | Target Access / Trunk Port Profile | Convert `untagged` on trunks to native VLAN and `tagged` sets to allowed VLANs. | Medium |",
+                "| **HP/Aruba `Trk*` + `ip helper-address`** | Target LACP LAG + SVI Relay | Map `Trk*` bundles to LACP active LAGs and per-VLAN `ip helper-address`. | Medium |",
+            ]
+        )
+
+    lines.extend(
+        [
             "",
             "---",
             "",
@@ -2650,7 +3085,7 @@ def generate_master_network_analysis_migration_blueprint(
             "2. **T-0:05 - Physical Cable Transfer**: Move patch cables in order specified by `migration_cabling_matrix.csv`.",
             "3. **T-0:15 - Power-On Target Hardware**: Power up target switches; verify dual PSU green LEDs.",
             "4. **T-0:20 - Run Automated Smoke Tests**: Execute `./validate_cutover.sh` from jumphost to verify gateway reachability.",
-            "5. **T-0:25 - User & Wireless Smoke Test**: Test client DHCP lease acquisition on VLAN 1, 10, 20, 30.",
+            "5. **T-0:25 - User & Wireless Smoke Test**: Test client DHCP lease acquisition on discovered access/voice VLANs.",
             "",
             "### 12.3 Rollback Plan & Decision Gate",
             "> [!CAUTION]",
@@ -2769,6 +3204,8 @@ def generate_cutover_validation_script(
         ]
     )
     for dev in devices.values():
+        if not _is_network_infra(dev):
+            continue
         dev_ip = dev.get("ip")
         dev_host = dev.get("hostname") or dev_ip
         if dev_ip:
@@ -2986,7 +3423,9 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv",
                 poe = dev.get("poe", {}) or {}
                 tot_w = float(poe.get("total_power_watts", 0.0) or 0.0)
                 used_w = float(poe.get("used_power_watts", 0.0) or 0.0)
-                poe_ports = len(poe.get("ports", {}) or {})
+                poe_ports = poe.get("poe_delivering_ports")
+                if poe_ports is None:
+                    poe_ports = len(poe.get("ports", {}) or {})
                 optics = dev.get("optics", []) or []
                 opt_counts: dict[str, int] = {}
                 for opt in optics:
@@ -3025,11 +3464,13 @@ def generate_target_migration_configs(
     Generate vendor-neutral staged CLI configuration snippets for migrating
     mixed-vendor devices onto a single target vendor (`juniper`, `cisco`, `arista`, `hpprocurve`).
     """
+    from net_docu_crawler.target_adapters import render_device_target_config
+
     tv = (target_vendor or "juniper").strip().lower()
     lines = [
         f"# Target Vendor Migration Configs (`{tv}`)",
         "",
-        "Generated from normalized device intent (`l3_interfaces`, `port_profiles`, `routes`, `services`, `dhcp`).",
+        "Generated from normalized device intent (`ports`, `l3_interfaces`, `port_profiles`, `routes`, `services`, `dhcp`).",
         "",
     ]
     for ip, dev in devices.items():
@@ -3037,7 +3478,16 @@ def generate_target_migration_configs(
             continue
         hostname = dev.get("hostname") or ip
         lines.append(f"## {hostname} ({dev.get('vendor', 'Unknown')} `{dev.get('model', '')}` -> `{tv}`)")
-        lines.append("```text")
+        lines.append("```json" if tv == "meraki" else "```text")
+        if dev.get("ports") and tv in ("juniper", "meraki", "aruba", "arista", "cisco"):
+            rendered = render_device_target_config(dev, tv)
+            if isinstance(rendered, list):
+                lines.extend(rendered)
+            else:
+                lines.append(str(rendered))
+            lines.append("```")
+            lines.append("")
+            continue
         services = dev.get("services", {}) or {}
         port_profiles = dev.get("port_profiles", {}) or {}
         l3_ints = dev.get("l3_interfaces", []) or []
@@ -3106,3 +3556,264 @@ def generate_target_migration_configs(
         print(f"Target migration configs written to {output_path}")
     except Exception as e:
         print(f"Error generating target migration configs: {e}")
+
+
+def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, source_logs_dir: str = "") -> None:
+    """
+    Export normalized and correlated machine-readable CSVs into the layered
+    `00_manifest/`, `01_raw/`, `02_normalized/`, and `03_correlated/` subdirectories.
+    """
+    import shutil
+
+    from net_docu_crawler.correlator import build_l3_svi_table
+
+    m_dir = os.path.join(run_output_dir, "00_manifest")
+    r_dir = os.path.join(run_output_dir, "01_raw")
+    n_dir = os.path.join(run_output_dir, "02_normalized")
+    c_dir = os.path.join(run_output_dir, "03_correlated")
+    for d in (m_dir, r_dir, n_dir, c_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # 1. 00_manifest/failures.csv
+    fail_rows = [
+        {
+            "ip": d.get("ip", ""),
+            "status": d.get("status", ""),
+            "record_class": d.get("record_class", ""),
+            "vendor": d.get("vendor", "Unknown"),
+            "device_type": d.get("device_type", "unknown"),
+            "mgmt_method": d.get("mgmt_method", ""),
+            "model": d.get("model", ""),
+            "mac_address": d.get("mac_address", ""),
+            "capture_time": d.get("capture_time", ""),
+        }
+        for d in raw_devices
+        if d.get("status") in ("unauthenticated", "unsupported", "discovered")
+    ]
+    with open(os.path.join(m_dir, "failures.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["ip", "status", "record_class", "vendor", "device_type", "mgmt_method", "model", "mac_address", "capture_time"],
+        )
+        w.writeheader()
+        w.writerows(fail_rows)
+
+    infra = [d for d in raw_devices if d.get("status", "success") == "success"]
+
+    # 2. 02_normalized/interfaces.csv & 03_correlated/unused_ports.csv
+    iface_rows = []
+    unused_rows = []
+    for d in infra:
+        for p_rec in (d.get("ports") or {}).values():
+            row = {
+                "hostname": p_rec.get("hostname", ""),
+                "interface": p_rec.get("interface", ""),
+                "admin_state": p_rec.get("admin_state", ""),
+                "oper_state": p_rec.get("oper_state", ""),
+                "mode": p_rec.get("mode", ""),
+                "access_vlan": p_rec.get("access_vlan", ""),
+                "voice_vlan": p_rec.get("voice_vlan", ""),
+                "native_vlan": p_rec.get("native_vlan", ""),
+                "allowed_vlans": ",".join(p_rec.get("allowed_vlans") or []),
+                "lag_id": p_rec.get("lag_id", ""),
+                "lacp_mode": p_rec.get("lacp_mode", ""),
+                "speed": p_rec.get("speed_operational", ""),
+                "duplex": p_rec.get("duplex", ""),
+                "media": p_rec.get("media", ""),
+                "neighbor_hostname": p_rec.get("neighbor_hostname", ""),
+                "neighbor_port": p_rec.get("neighbor_port", ""),
+                "stp_edge": p_rec.get("stp_edge", ""),
+                "bpdu_guard": p_rec.get("bpdu_guard", ""),
+                "storm_control": p_rec.get("storm_control", ""),
+                "poe_draw_watts": p_rec.get("poe_draw_watts", 0.0),
+                "edge_mac_count": p_rec.get("edge_mac_count", 0),
+                "hygiene_disposition": p_rec.get("hygiene_disposition", ""),
+                "hygiene_reason": p_rec.get("hygiene_reason", ""),
+            }
+            iface_rows.append(row)
+            if row["hygiene_disposition"] in ("SHUTDOWN", "QUARANTINE", "REVIEW"):
+                unused_rows.append(row)
+
+    iface_fields = [
+        "hostname", "interface", "admin_state", "oper_state", "mode", "access_vlan",
+        "voice_vlan", "native_vlan", "allowed_vlans", "lag_id", "lacp_mode", "speed",
+        "duplex", "media", "neighbor_hostname", "neighbor_port", "stp_edge", "bpdu_guard",
+        "storm_control", "poe_draw_watts", "edge_mac_count", "hygiene_disposition", "hygiene_reason",
+    ]
+    with open(os.path.join(n_dir, "interfaces.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=iface_fields)
+        w.writeheader()
+        w.writerows(iface_rows)
+    with open(os.path.join(c_dir, "unused_ports.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=iface_fields)
+        w.writeheader()
+        w.writerows(unused_rows)
+
+    # 3. 02_normalized/vlans.csv
+    vlan_rows = []
+    for d in infra:
+        host = d.get("hostname") or d.get("ip", "")
+        sc = d.get("site_code", "")
+        for vid, vinfo in (d.get("vlans") or {}).items():
+            vlan_rows.append(
+                {
+                    "hostname": host,
+                    "site_code": sc,
+                    "vlan_id": vid,
+                    "vlan_name": vinfo.get("name", ""),
+                    "svi_interface": vinfo.get("svi_interface", ""),
+                    "voice": vinfo.get("voice", False),
+                }
+            )
+    with open(os.path.join(n_dir, "vlans.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["hostname", "site_code", "vlan_id", "vlan_name", "svi_interface", "voice"])
+        w.writeheader()
+        w.writerows(vlan_rows)
+
+    # 4. 02_normalized/svi_routes.csv
+    svi_rows = build_l3_svi_table(infra)
+    with open(os.path.join(n_dir, "svi_routes.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["site_code", "source_device", "vlan_id", "vlan_name", "svi_interface", "primary_ip", "prefix_cidr", "dhcp_relays", "confidence"],
+        )
+        w.writeheader()
+        for sr in svi_rows:
+            row = dict(sr)
+            row["dhcp_relays"] = ",".join(sr.get("dhcp_relays") or [])
+            w.writerow(row)
+
+    # 5. 02_normalized/poe.csv
+    with open(os.path.join(n_dir, "poe.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["hostname", "ip", "poe_supported", "total_power_watts", "used_power_watts", "allocated_power_watts", "poe_capable_ports", "poe_delivering_ports", "psu_redundancy"],
+        )
+        w.writeheader()
+        for d in infra:
+            poe = d.get("poe") or {}
+            w.writerow(
+                {
+                    "hostname": d.get("hostname") or d.get("ip", ""),
+                    "ip": d.get("ip", ""),
+                    "poe_supported": poe.get("poe_supported", False),
+                    "total_power_watts": poe.get("total_power_watts", 0.0),
+                    "used_power_watts": poe.get("used_power_watts", 0.0),
+                    "allocated_power_watts": poe.get("allocated_power_watts", 0.0),
+                    "poe_capable_ports": poe.get("poe_capable_ports", 0),
+                    "poe_delivering_ports": poe.get("poe_delivering_ports", 0),
+                    "psu_redundancy": poe.get("psu_redundancy", "unknown"),
+                }
+            )
+
+    # 6. 03_correlated/physical_links.csv
+    with open(os.path.join(c_dir, "physical_links.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"], extrasaction="ignore")
+        w.writeheader()
+        for lk in getattr(registry, "links", []) or []:
+            row = dict(lk)
+            row.setdefault("link_class", "infra_uplink")
+            w.writerow(row)
+
+    # 7. 01_raw/ per-device running_config & raw_session.log
+    for d in infra:
+        host = re.sub(r"[^A-Za-z0-9._-]+", "_", str(d.get("hostname") or d.get("ip") or "device"))
+        ip_safe = str(d.get("ip") or "").replace(":", "_")
+        prefix = f"{host}__{ip_safe}" if ip_safe else host
+        raw_cfg = d.get("raw_config") or ""
+        if raw_cfg:
+            with open(os.path.join(r_dir, f"{prefix}_running_config.txt"), "w", encoding="utf-8") as f:
+                f.write(raw_cfg)
+        if ip_safe:
+            for cand_dir in [d_c for d_c in (source_logs_dir, run_output_dir, os.path.join(run_output_dir, "logs")) if d_c]:
+                src_log = os.path.join(cand_dir, f"{ip_safe}_raw_session.log")
+                if os.path.isfile(src_log):
+                    shutil.copy2(src_log, os.path.join(r_dir, f"{prefix}_raw_session.log"))
+                    break
+
+    # 8. 02_normalized/neighbors.csv
+    with open(os.path.join(n_dir, "neighbors.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "source_device", "site_code", "local_port", "remote_device", "remote_port",
+                "remote_ip", "remote_mac", "platform", "device_type", "link_confidence", "capture_time",
+            ],
+        )
+        w.writeheader()
+        for d in infra:
+            host = d.get("hostname") or d.get("ip", "")
+            sc = d.get("site_code", "")
+            ct = d.get("capture_time", "")
+            for nbr in d.get("neighbors") or []:
+                w.writerow(
+                    {
+                        "source_device": host,
+                        "site_code": sc,
+                        "local_port": nbr.get("local_port", ""),
+                        "remote_device": nbr.get("remote_device", ""),
+                        "remote_port": nbr.get("remote_port", ""),
+                        "remote_ip": nbr.get("remote_ip", ""),
+                        "remote_mac": nbr.get("remote_mac", ""),
+                        "platform": nbr.get("platform", ""),
+                        "device_type": nbr.get("device_type", ""),
+                        "link_confidence": nbr.get("link_confidence", ""),
+                        "capture_time": ct,
+                    }
+                )
+
+    # 9. 03_correlated/vlan_propagation.csv
+    svi_by_site_vid: dict[tuple[str, str], dict] = {}
+    for sr in svi_rows:
+        svi_by_site_vid[(sr.get("site_code", ""), str(sr.get("vlan_id", "")))] = sr
+    vlan_prop: dict[tuple[str, str], dict] = {}
+    for d in infra:
+        host = d.get("hostname") or d.get("ip", "")
+        sc = d.get("site_code", "")
+        for vid, vinfo in (d.get("vlans") or {}).items():
+            key = (sc, str(vid))
+            entry = vlan_prop.setdefault(
+                key,
+                {
+                    "site_code": sc,
+                    "vlan_id": str(vid),
+                    "vlan_name": vinfo.get("name", ""),
+                    "switches": set(),
+                    "trunk_ports": set(),
+                },
+            )
+            entry["switches"].add(host)
+        for p_rec in (d.get("ports") or {}).values():
+            if p_rec.get("mode") == "trunk":
+                for vid in p_rec.get("allowed_vlans") or []:
+                    key = (sc, str(vid))
+                    if key in vlan_prop:
+                        vlan_prop[key]["trunk_ports"].add(f"{host}:{p_rec.get('interface', '')}")
+    with open(os.path.join(c_dir, "vlan_propagation.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["site_code", "vlan_id", "vlan_name", "svi_device", "gateway_ip", "subnet", "switch_count", "trunk_port_count", "trunk_ports"],
+        )
+        w.writeheader()
+        for key in sorted(vlan_prop.keys(), key=lambda x: (x[0], int(x[1]) if x[1].isdigit() else 99999)):
+            vp = vlan_prop[key]
+            sr = svi_by_site_vid.get(key, {})
+            tports = sorted(vp["trunk_ports"])
+            w.writerow(
+                {
+                    "site_code": vp["site_code"],
+                    "vlan_id": vp["vlan_id"],
+                    "vlan_name": sr.get("vlan_name") or vp["vlan_name"],
+                    "svi_device": sr.get("source_device", ""),
+                    "gateway_ip": sr.get("primary_ip", ""),
+                    "subnet": sr.get("prefix_cidr", ""),
+                    "switch_count": len(vp["switches"]),
+                    "trunk_port_count": len(tports),
+                    "trunk_ports": ";".join(tports[:25]),
+                }
+            )
+
+    # 10. 03_correlated/endpoint_bindings.csv
+    ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
+    if os.path.isfile(ep_src):
+        shutil.copy2(ep_src, os.path.join(c_dir, "endpoint_bindings.csv"))

@@ -403,6 +403,10 @@ class BaseDriver(ABC):
         """Optional hook to extract DNS, NTP, RADIUS, and TACACS+ infrastructure services."""
         return extract_services_from_config(raw_config)
 
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        """Optional hook to collect live operational L2 trunk, LACP, STP port, and 802.1X state."""
+        return {}
+
     def crawl(self, conn) -> dict:
         """
         Template method executing the safe read-only discovery sequence.
@@ -491,11 +495,27 @@ class BaseDriver(ABC):
             extract_firewall_nat_vpn,
             extract_port_profiles,
             extract_routing_peers_and_fhrp_from_config,
+            extract_vlans,
+            extract_vrfs_and_acls,
         )
 
+        device_data["vlans"] = extract_vlans(device_data["raw_config"], vendor=self.vendor_name)
         device_data["port_profiles"] = extract_port_profiles(
             device_data["raw_config"], vendor=self.vendor_name, poe=device_data["poe"]
         )
+        vrfs, acls_by_port = extract_vrfs_and_acls(device_data["raw_config"], vendor=self.vendor_name)
+        device_data["vrfs"] = vrfs
+        for acl_port, acl_vals in acls_by_port.items():
+            prof = device_data["port_profiles"].setdefault(acl_port, {})
+            if acl_vals.get("acl_in"):
+                prof["acl_in"] = acl_vals["acl_in"]
+            if acl_vals.get("acl_out"):
+                prof["acl_out"] = acl_vals["acl_out"]
+        for op_port, op_vals in (self.get_l2_operational(conn) or {}).items():
+            prof = device_data["port_profiles"].setdefault(op_port, {})
+            for k, v in op_vals.items():
+                if v not in ("", None, "unknown") or k not in prof:
+                    prof[k] = v
         cfg_peers, cfg_fhrp = extract_routing_peers_and_fhrp_from_config(
             device_data["raw_config"], vendor=self.vendor_name
         )
@@ -506,4 +526,6 @@ class BaseDriver(ABC):
         device_data["dhcp"] = extract_dhcp_config(device_data["raw_config"], vendor=self.vendor_name)
         device_data["security_policy"] = extract_firewall_nat_vpn(device_data["raw_config"], vendor=self.vendor_name)
 
-        return device_data
+        from net_docu_crawler.schema import stamp_schema_v2
+
+        return stamp_schema_v2(device_data)

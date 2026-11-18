@@ -235,6 +235,7 @@ class HPProCurveDriver(BaseDriver):
                 m_port = re.match(r"^\s*([A-Za-z0-9/]+)\s+\S+\s+\|\s+\S+\s+(Yes|No)\s+(Up|Down)\s+(\S+)", line)
                 if m_port and not ("Port" in line or "---" in line):
                     port = m_port.group(1).strip()
+                    admin_status = "up" if m_port.group(2).lower() == "yes" else "down"
                     status = "up" if m_port.group(3).lower() == "up" else "down"
                     mode = m_port.group(4)
 
@@ -257,6 +258,7 @@ class HPProCurveDriver(BaseDriver):
                     interfaces_detail[port] = {
                         "status": status,
                         "protocol": status,
+                        "admin_status": admin_status,
                         "speed": speed,
                         "duplex": duplex,
                         "mac_address": "",
@@ -307,11 +309,21 @@ class HPProCurveDriver(BaseDriver):
                             rem_host = rem_host.split(".")[0]
 
                             plat = oui_lookup.lookup_oui(remote_mac) if remote_mac else chassis_raw
+                            plat_low = plat.lower()
+                            host_low = rem_host.lower()
                             dev_type = "switch"
-                            if any(w in plat.lower() for w in ["ap", "access point", "aruba"]):
+                            if any(w in plat_low or w in host_low for w in ["ap", "access point", "aruba", "ruckus", "ubiquiti", "unifi"]):
                                 dev_type = "ap"
-                            elif any(w in plat.lower() for w in ["router", "mikrotik"]):
+                            elif any(w in plat_low or w in host_low for w in ["axis", "hikvision", "camera", "hanwha"]):
+                                dev_type = "camera"
+                            elif any(w in plat_low or w in host_low for w in ["polycom", "yealink", "mitel", "avaya", "grandstream"]):
+                                dev_type = "phone"
+                            elif any(w in plat_low or w in host_low for w in ["crestron", "extron", "biamp"]):
+                                dev_type = "av_control"
+                            elif any(w in plat_low for w in ["router", "mikrotik"]):
                                 dev_type = "router"
+                            elif any(w in plat_low for w in ["apple", "dell", "lenovo", "intel", "microsoft"]):
+                                dev_type = "endpoint"
 
                             neighbors.append(
                                 {
@@ -327,6 +339,37 @@ class HPProCurveDriver(BaseDriver):
                             )
         except Exception:
             pass
+
+        # Enrich with untruncated System Name / PortId from detail output when available
+        if neighbors:
+            try:
+                raw_detail = conn.send_command("show lldp info remote-device detail")
+                if raw_detail and "Invalid input" not in raw_detail and "Local Port" in raw_detail:
+                    detail_map: dict[str, dict[str, str]] = {}
+                    cur_lp = ""
+                    for ln in raw_detail.splitlines():
+                        m_lp = re.match(r"^\s*Local Port\s*:\s*(\S+)", ln)
+                        if m_lp:
+                            cur_lp = m_lp.group(1).strip()
+                            detail_map.setdefault(cur_lp, {})
+                        elif cur_lp:
+                            m_sn = re.match(r"^\s*SysName\s*:\s*(.+)$", ln) or re.match(
+                                r"^\s*System Name\s*:\s*(.+)$", ln
+                            )
+                            if m_sn:
+                                detail_map[cur_lp]["sys_name"] = m_sn.group(1).strip().split(".")[0]
+                            m_pid = re.match(r"^\s*PortId\s*:\s*(.+)$", ln)
+                            if m_pid:
+                                detail_map[cur_lp]["port_id"] = m_pid.group(1).strip()
+                    for n in neighbors:
+                        d_info = detail_map.get(n.get("local_port", ""))
+                        if d_info:
+                            if d_info.get("sys_name"):
+                                n["remote_device"] = d_info["sys_name"]
+                            if d_info.get("port_id") and not n.get("remote_port"):
+                                n["remote_port"] = d_info["port_id"]
+            except Exception:
+                pass
 
         # 2. Fallback: CDP neighbor detail if LLDP is empty
         if not neighbors:
@@ -443,24 +486,54 @@ class HPProCurveDriver(BaseDriver):
                     mac = oui_lookup.normalize_mac(m_mac.group(1)).lower()
                     port = m_mac.group(2)
                     vlan = m_mac.group(3) or "1"
-                    mac_table.append({"mac": mac, "port": port, "vlan": vlan})
+                    mac_table.append(
+                        {
+                            "mac": mac,
+                            "interface": port,
+                            "port": port,
+                            "vlan": vlan,
+                            "type": "dynamic",
+                            "vendor": oui_lookup.lookup_oui(mac),
+                        }
+                    )
         except Exception:
             pass
         return mac_table
 
     def get_stp(self, conn) -> dict:
-        stp = {"enabled": False, "is_root": False, "vlans": {}}
+        stp = {
+            "enabled": False,
+            "is_root": False,
+            "protocol": "Unknown",
+            "root_bridge": "",
+            "bridge_id": "",
+            "bridge_priority": "",
+            "root_cost": "",
+            "root_port": "",
+            "vlans": {},
+        }
         try:
             raw = conn.send_command("show spanning-tree")
             if "STP Enabled   : Yes" in raw or "STP Enabled [No] : Yes" in raw:
                 stp["enabled"] = True
-            m_root = re.search(r"Root Bridge MAC Address\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw)
+            elif "STP Enabled   : No" in raw:
+                stp["enabled"] = False
+            m_mode = re.search(r"Mode\s*:\s*(\S+)", raw, re.IGNORECASE)
+            if m_mode:
+                stp["protocol"] = m_mode.group(1).strip().upper()
+            elif "Multiple Spanning Tree" in raw:
+                stp["protocol"] = "MSTP"
+            m_prio = re.search(r"Switch Priority\s*:\s*(\d+)", raw, re.IGNORECASE)
+            if m_prio:
+                stp["bridge_priority"] = m_prio.group(1).strip()
+            m_root = re.search(r"(?:Root Bridge MAC Address|CST Root MAC Address)\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw)
             m_this = re.search(r"Switch MAC Address\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw)
-            if m_root and m_this:
-                r_mac = oui_lookup.normalize_mac(m_root.group(1)).lower()
-                s_mac = oui_lookup.normalize_mac(m_this.group(1)).lower()
-                if r_mac == s_mac:
-                    stp["is_root"] = True
+            if m_root:
+                stp["root_bridge"] = oui_lookup.normalize_mac(m_root.group(1)).lower()
+            if m_this:
+                stp["bridge_id"] = oui_lookup.normalize_mac(m_this.group(1)).lower()
+            if stp["root_bridge"] and stp["bridge_id"] and stp["root_bridge"] == stp["bridge_id"]:
+                stp["is_root"] = True
         except Exception:
             pass
         return stp
@@ -475,27 +548,98 @@ class HPProCurveDriver(BaseDriver):
                 return ""
 
     def get_poe(self, conn) -> dict:
-        poe = {"total_power_watts": 0.0, "used_power_watts": 0.0, "available_power_watts": 0.0, "ports": {}}
+        from net_docu_crawler.schema import build_empty_poe_summary
+
+        poe = build_empty_poe_summary()
         try:
             raw = conn.send_command("show power-over-ethernet brief")
-            m_tot = re.search(r"Total Available Power\s*:\s*([\d.]+)\s*W", raw, re.IGNORECASE)
-            m_used = re.search(r"Total Power Drawn\s*:\s*([\d.]+)\s*W", raw, re.IGNORECASE)
-            if m_tot:
-                poe["total_power_watts"] = float(m_tot.group(1))
-            if m_used:
-                poe["used_power_watts"] = float(m_used.group(1))
-            poe["available_power_watts"] = max(0.0, poe["total_power_watts"] - poe["used_power_watts"])
+            m_red = re.search(r"PoE Power Status\s*:\s*([^\r\n]+)", raw, re.IGNORECASE)
+            if m_red:
+                poe["psu_redundancy"] = m_red.group(1).strip()
+
+            # Chassis-level summary appears before any "Module X Power" section
+            pre_module = re.split(r"(?m)^\s*Module\s+\S+\s+Power", raw, maxsplit=1)[0]
+            m_chassis = re.search(
+                r"Available:\s*([\d.]+)\s*W\s+Used:\s*([\d.]+)\s*W\s+Remaining:\s*([\d.]+)\s*W",
+                pre_module,
+                re.IGNORECASE,
+            )
+            if m_chassis:
+                poe["poe_supported"] = True
+                poe["total_power_watts"] = float(m_chassis.group(1))
+                poe["used_power_watts"] = float(m_chassis.group(2))
+                poe["available_power_watts"] = float(m_chassis.group(3))
+            else:
+                m_tot = re.search(r"Total Available Power\s*:\s*([\d.]+)\s*W", pre_module, re.IGNORECASE)
+                m_used = re.search(r"Total Power Drawn\s*:\s*([\d.]+)\s*W", pre_module, re.IGNORECASE)
+                if m_tot:
+                    poe["poe_supported"] = True
+                    poe["total_power_watts"] = float(m_tot.group(1))
+                if m_used:
+                    poe["used_power_watts"] = float(m_used.group(1))
+                poe["available_power_watts"] = max(0.0, poe["total_power_watts"] - poe["used_power_watts"])
+
+            alloc_total = 0.0
+            capable_cnt = 0
+            enabled_cnt = 0
+            delivering_cnt = 0
             for line in raw.splitlines():
                 m_p = re.match(
-                    r"^\s*([A-Za-z0-9/]+)\s*\|\s*(Yes|No)\b.*?([\d.]+)\s*W",
+                    r"^\s*([A-Za-z0-9/]+)\s*\|\s*(Yes|No)\s+\S+\s+\S+\s+([\d.]+)\s*W\s+([\d.]+)\s*W\s+(.*?)\s+(Delivering|Searching|Disabled|Fault|Other Fault)\s+(\d+)",
                     line,
                     re.IGNORECASE,
                 )
                 if m_p:
-                    port, enabled, watts = m_p.groups()
-                    w_val = float(watts)
-                    if w_val > 0 or enabled.lower() == "yes":
-                        poe["ports"][port] = {"status": "delivering" if w_val > 0 else "idle", "power_watts": w_val}
+                    port, enabled_s, alloc_s, actual_s, _ctype, det_status, p_cls = m_p.groups()
+                    enabled_b = enabled_s.lower() == "yes"
+                    alloc_w = float(alloc_s)
+                    actual_w = float(actual_s)
+                    det_l = det_status.lower()
+                    capable_cnt += 1
+                    if enabled_b:
+                        enabled_cnt += 1
+                    if det_l == "delivering" or actual_w > 0:
+                        delivering_cnt += 1
+                        alloc_total += alloc_w
+                    poe["ports"][port] = {
+                        "status": det_l,
+                        "enabled": enabled_b,
+                        "power_watts": actual_w,
+                        "draw_watts": actual_w,
+                        "allocated_watts": alloc_w,
+                        "class": p_cls,
+                    }
+                else:
+                    m_short = re.match(r"^\s*([A-Za-z0-9/]+)\s*\|\s*(Yes|No)\b.*?([\d.]+)\s*W", line, re.IGNORECASE)
+                    if m_short:
+                        port, enabled_s, watts = m_short.groups()
+                        enabled_b = enabled_s.lower() == "yes"
+                        w_val = float(watts)
+                        capable_cnt += 1
+                        if enabled_b:
+                            enabled_cnt += 1
+                        if w_val > 0:
+                            delivering_cnt += 1
+                        poe["ports"][port] = {
+                            "status": "delivering" if w_val > 0 else "searching",
+                            "enabled": enabled_b,
+                            "power_watts": w_val,
+                            "draw_watts": w_val,
+                            "allocated_watts": w_val,
+                            "class": "",
+                        }
+            poe["poe_capable_ports"] = capable_cnt
+            poe["poe_enabled_ports"] = enabled_cnt
+            poe["poe_delivering_ports"] = delivering_cnt
+            poe["allocated_power_watts"] = round(alloc_total, 2)
+            if capable_cnt > 0:
+                poe["poe_supported"] = True
+            if poe["total_power_watts"] == 0.0 and delivering_cnt > 0:
+                poe["budget_unreported"] = True
+                if poe["used_power_watts"] == 0.0:
+                    poe["used_power_watts"] = round(
+                        sum(p.get("draw_watts", 0.0) for p in poe["ports"].values()), 2
+                    )
         except Exception:
             pass
         return poe
@@ -530,3 +674,53 @@ class HPProCurveDriver(BaseDriver):
         except Exception:
             pass
         return optics
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        ops: dict[str, dict] = {}
+        try:
+            raw_trunks = conn.send_command("show trunks")
+            if raw_trunks and "Invalid input" not in raw_trunks:
+                for line in raw_trunks.splitlines():
+                    m_tr = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|.*?\b(Trk\d+)\s+(LACP|Trunk|Dyn\d*)", line, re.I)
+                    if m_tr:
+                        p, grp, proto = m_tr.group(1), m_tr.group(2), m_tr.group(3)
+                        ops.setdefault(p, {})["lag_group"] = grp
+                        ops[p]["lacp_mode"] = "active" if "lacp" in proto.lower() else "on"
+        except Exception:
+            pass
+
+        try:
+            raw_lacp = conn.send_command("show lacp")
+            if raw_lacp and "Invalid input" not in raw_lacp:
+                for line in raw_lacp.splitlines():
+                    m_lc = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(Trk\d+)\s+.*?(Active|Passive)", line, re.I)
+                    if m_lc:
+                        p, grp, mode = m_lc.group(1), m_lc.group(2), m_lc.group(3).lower()
+                        ops.setdefault(p, {})["lag_group"] = grp
+                        ops[p]["lacp_mode"] = mode
+        except Exception:
+            pass
+
+        try:
+            raw_stp = conn.send_command("show spanning-tree detail")
+            if raw_stp and "Invalid input" not in raw_stp:
+                for line in raw_stp.splitlines():
+                    m_st = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|\s+(?:100Mb|1Gb|10Gb|\S+)\s+\|\s+\d+\s+\|\s+(\S+)\s+\|\s+(\S+)", line)
+                    if m_st:
+                        p, state, role = m_st.group(1), m_st.group(2), m_st.group(3)
+                        ops.setdefault(p, {})["stp_state"] = state
+                        ops[p]["stp_role"] = role
+        except Exception:
+            pass
+
+        try:
+            raw_auth = conn.send_command("show port-access authenticator")
+            if raw_auth and "Invalid input" not in raw_auth:
+                for line in raw_auth.splitlines():
+                    m_au = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(?:Enabled|Active)", line, re.I)
+                    if m_au:
+                        ops.setdefault(m_au.group(1), {})["auth_policy"] = "dot1x"
+        except Exception:
+            pass
+
+        return ops

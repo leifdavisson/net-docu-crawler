@@ -2144,7 +2144,10 @@ def test_hpprocurve_optics_2col_mac_and_sku_model():
     data = drv.crawl(MockProCurveConn())
     assert data["model"] == "HP 2530-48G-PoE+ (J9853A)"
     assert len(data["mac_table"]) == 1
-    assert data["mac_table"][0] == {"mac": "20:d8:0b:93:4c:b9", "port": "27", "vlan": "1"}
+    assert data["mac_table"][0]["mac"] == "20:d8:0b:93:4c:b9"
+    assert data["mac_table"][0]["port"] == "27"
+    assert data["mac_table"][0]["interface"] == "27"
+    assert data["mac_table"][0]["vlan"] == "1"
     assert len(data["optics"]) == 1
     assert data["optics"][0]["port"] == "A1"
     assert data["optics"][0]["part_number"] == "J8436A"

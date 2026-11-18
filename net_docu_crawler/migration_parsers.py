@@ -58,7 +58,7 @@ def extract_port_profiles(
     v_lower = (vendor or "").lower()
 
     # 1. Cisco IOS / Arista EOS / NX-OS interface blocks
-    if any(k in v_lower for k in ("cisco", "arista", "")) and "interface " in raw_config:
+    if any(k in v_lower for k in ("cisco", "arista")) and "interface " in raw_config:
         blocks = re.split(r"(?m)^interface\s+", raw_config)
         for blk in blocks[1:]:
             lines = blk.splitlines()
@@ -105,7 +105,7 @@ def extract_port_profiles(
                 prof["dot1x_mab"] = True
 
     # 2. HP ProCurve / ArubaOS-S VLAN & trunk blocks
-    if "procurve" in v_lower or "vlan " in raw_config:
+    if "procurve" in v_lower or "arubaos-s" in v_lower or re.search(r"(?m)^vlan\s+\d+\b", raw_config):
         for m_trk in re.finditer(r"(?m)^trunk\s+(\S+)\s+(Trk\d+)\s*(lacp|trunk)?", raw_config, re.IGNORECASE):
             ports_spec, trk_name, mode_tok = m_trk.groups()
             for p in _expand_port_range(ports_spec):
@@ -113,53 +113,185 @@ def extract_port_profiles(
                 prof["lag_group"] = trk_name
                 prof["lacp_mode"] = (mode_tok or "lacp").lower()
 
+        hp_untagged: dict[str, str] = {}
+        hp_tagged: dict[str, list[str]] = {}
+        hp_voice_vlans: set[str] = set()
+
         vlan_blocks = re.split(r"(?m)^vlan\s+(\d+)\b", raw_config)
         for idx in range(1, len(vlan_blocks) - 1, 2):
             vid = vlan_blocks[idx]
             body = vlan_blocks[idx + 1].split("\nexit")[0]
+            if re.search(r"^\s*voice\b", body, re.MULTILINE):
+                hp_voice_vlans.add(vid)
             for m_untag in re.finditer(r"^\s*untagged\s+([^\r\n]+)", body, re.MULTILINE):
                 for p in _expand_port_range(m_untag.group(1).strip()):
-                    prof = _ensure_port(p)
-                    prof["access_vlan"] = vid
-                    if prof["mode"] == "unknown":
-                        prof["mode"] = "access"
+                    hp_untagged[p] = vid
             for m_tag in re.finditer(r"^\s*tagged\s+([^\r\n]+)", body, re.MULTILINE):
                 for p in _expand_port_range(m_tag.group(1).strip()):
-                    prof = _ensure_port(p)
-                    prof["mode"] = "trunk"
-                    existing = [v for v in prof["trunk_allowed_vlans"].split(",") if v]
-                    if vid not in existing:
-                        existing.append(vid)
-                    prof["trunk_allowed_vlans"] = ",".join(existing)
+                    hp_tagged.setdefault(p, [])
+                    if vid not in hp_tagged[p]:
+                        hp_tagged[p].append(vid)
+
+        for p in set(hp_untagged) | set(hp_tagged):
+            prof = _ensure_port(p)
+            untag_v = hp_untagged.get(p, "")
+            tag_list = hp_tagged.get(p, [])
+            non_voice_tagged = [v for v in tag_list if v not in hp_voice_vlans]
+            voice_tagged = [v for v in tag_list if v in hp_voice_vlans]
+            if non_voice_tagged:
+                prof["mode"] = "trunk"
+                prof["native_vlan"] = untag_v or "none"
+                prof["trunk_allowed_vlans"] = ",".join(tag_list)
+            elif untag_v:
+                prof["mode"] = "access"
+                prof["access_vlan"] = untag_v
+                if voice_tagged:
+                    prof["voice_vlan"] = voice_tagged[0]
+
+        for m_edge in re.finditer(r"(?m)^spanning-tree\s+(\S+)\s+admin-edge-port\b", raw_config):
+            for p in _expand_port_range(m_edge.group(1)):
+                _ensure_port(p)["stp_edge"] = True
+        for m_bpdu in re.finditer(r"(?m)^spanning-tree\s+(\S+)\s+bpdu-protection\b", raw_config):
+            for p in _expand_port_range(m_bpdu.group(1)):
+                _ensure_port(p)["bpdu_guard"] = True
+        for m_auth in re.finditer(r"(?m)^aaa\s+port-access\s+(?:authenticator|mac-based)\s+(\S+)", raw_config):
+            for p in _expand_port_range(m_auth.group(1)):
+                _ensure_port(p)["dot1x_mab"] = True
 
     # 3. Juniper Junos hierarchical / set-style interface VLANs & ae bundles
     if "juniper" in v_lower or "ethernet-switching" in raw_config:
+        # Expand `set interfaces interface-range <rname> ...` into per-member lines
+        irange_members: dict[str, list[str]] = {}
+        for m_ir_m in re.finditer(r"set\s+interfaces\s+interface-range\s+(\S+)\s+member\s+(\S+)", raw_config):
+            rname, mport = m_ir_m.group(1), m_ir_m.group(2)
+            irange_members.setdefault(rname, []).append(mport)
+        for m_ir_r in re.finditer(
+            r"set\s+interfaces\s+interface-range\s+(\S+)\s+member-range\s+([A-Za-z]+-\d+/\d+/)(\d+)\s+to\s+[A-Za-z]+-\d+/\d+/(\d+)",
+            raw_config,
+        ):
+            rname, pfx, s_idx, e_idx = m_ir_r.group(1), m_ir_r.group(2), int(m_ir_r.group(3)), int(m_ir_r.group(4))
+            for idx in range(s_idx, e_idx + 1):
+                irange_members.setdefault(rname, []).append(f"{pfx}{idx}")
+        junos_cfg = raw_config
+        if irange_members:
+            expanded_lines = []
+            for m_ir_cmd in re.finditer(
+                r"set\s+interfaces\s+interface-range\s+(\S+)\s+(?!member\b|member-range\b)(.+)$",
+                raw_config,
+                re.MULTILINE,
+            ):
+                rname, tail = m_ir_cmd.group(1), m_ir_cmd.group(2)
+                for mport in irange_members.get(rname, []):
+                    expanded_lines.append(f"set interfaces {mport} {tail}")
+            if expanded_lines:
+                junos_cfg = raw_config + "\n" + "\n".join(expanded_lines)
+
         for m_set in re.finditer(
             r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+interface-mode\s+(access|trunk)",
-            raw_config,
+            junos_cfg,
         ):
+            if m_set.group(1) == "interface-range":
+                continue
             prof = _ensure_port(m_set.group(1))
             prof["mode"] = m_set.group(2)
-        for m_v in re.finditer(
-            r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+vlan\s+members\s+(\S+)",
-            raw_config,
+
+        for m_nat in re.finditer(
+            r"set\s+interfaces\s+(\S+)\s+(?:unit\s+0\s+family\s+ethernet-switching\s+)?native-vlan-id\s+(\S+)",
+            junos_cfg,
         ):
-            prof = _ensure_port(m_v.group(1))
-            val = m_v.group(2).strip("[]")
-            if prof["mode"] == "trunk":
-                existing = [v for v in prof["trunk_allowed_vlans"].split(",") if v]
-                if val not in existing:
-                    existing.append(val)
-                prof["trunk_allowed_vlans"] = ",".join(existing)
+            if m_nat.group(1) == "interface-range":
+                continue
+            prof = _ensure_port(m_nat.group(1))
+            prof["native_vlan"] = m_nat.group(2).strip('"')
+
+        vlans_map = extract_vlans(junos_cfg, vendor)
+        name_to_vid = {v["name"].strip('"').lower(): vid for vid, v in vlans_map.items() if v.get("name")}
+
+        def _resolve_vid(tok: str) -> str:
+            t_clean = tok.strip().strip('"').strip("'")
+            if not t_clean:
+                return ""
+            if t_clean.lower() in name_to_vid:
+                return name_to_vid[t_clean.lower()]
+            m_vn = re.match(r"^(?:vlan|vl)[_-]?(\d+)$", t_clean, re.IGNORECASE)
+            if m_vn:
+                return m_vn.group(1)
+            return t_clean
+
+        for p_data in profiles.values():
+            if p_data.get("native_vlan"):
+                p_data["native_vlan"] = _resolve_vid(p_data["native_vlan"])
+
+        junos_members: dict[str, list[str]] = {}
+        for m_v in re.finditer(
+            r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+vlan\s+members\s+(\[[^\]]+\]|\S+)",
+            junos_cfg,
+        ):
+            port = m_v.group(1)
+            if port == "interface-range":
+                continue
+            raw_val = m_v.group(2).strip("[]")
+            for tok in raw_val.split():
+                t = _resolve_vid(tok)
+                if t:
+                    junos_members.setdefault(port, [])
+                    if t not in junos_members[port]:
+                        junos_members[port].append(t)
+
+        for port, members in junos_members.items():
+            prof = _ensure_port(port)
+            if prof["mode"] == "trunk" or len(members) > 1 or "all" in members:
+                if prof["mode"] == "unknown":
+                    prof["mode"] = "trunk"
+                prof["trunk_allowed_vlans"] = ",".join(members)
+                if not prof["native_vlan"]:
+                    prof["native_vlan"] = "none"
             else:
-                prof["access_vlan"] = val
+                if prof["mode"] == "unknown":
+                    prof["mode"] = "access"
+                prof["access_vlan"] = members[0]
+
+        for m_voip in re.finditer(
+            r"set\s+(?:switch-options|ethernet-switching-options)\s+voip\s+interface\s+(\S+?)(?:\.0)?\s+vlan\s+(\S+)",
+            junos_cfg,
+        ):
+            p_voip = m_voip.group(1)
+            voip_vid = _resolve_vid(m_voip.group(2))
+            for target_p in irange_members.get(p_voip, [p_voip]):
+                prof = _ensure_port(target_p)
+                prof["voice_vlan"] = voip_vid
+
         for m_ae in re.finditer(
             r"set\s+interfaces\s+(\S+)\s+ether-options\s+802\.3ad\s+(ae\d+)",
-            raw_config,
+            junos_cfg,
         ):
             prof = _ensure_port(m_ae.group(1))
             prof["lag_group"] = m_ae.group(2)
             prof["lacp_mode"] = "active"
+
+        for m_edge in re.finditer(r"set\s+protocols\s+[rvx]?stp\s+interface\s+(\S+)\s+edge\b", junos_cfg):
+            p_ed = m_edge.group(1).split(".")[0]
+            for target_p in irange_members.get(p_ed, [p_ed]):
+                _ensure_port(target_p)["stp_edge"] = True
+        for m_bpdu in re.finditer(r"set\s+protocols\s+[rvx]?stp\s+interface\s+(\S+)\s+bpdu-block-on-edge\b", junos_cfg):
+            p_bp = m_bpdu.group(1).split(".")[0]
+            for target_p in irange_members.get(p_bp, [p_bp]):
+                _ensure_port(target_p)["bpdu_guard"] = True
+        for m_storm in re.finditer(
+            r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+storm-control\b", junos_cfg
+        ):
+            if m_storm.group(1) == "interface-range":
+                continue
+            prof = _ensure_port(m_storm.group(1))
+            prof["storm_control"] = True
+            if prof["mode"] == "unknown":
+                prof["mode"] = "access"
+                if not prof["access_vlan"]:
+                    prof["access_vlan"] = "1"
+        for m_dot1x in re.finditer(r"set\s+protocols\s+dot1x\s+authenticator\s+interface\s+(\S+)", junos_cfg):
+            p_dx = m_dot1x.group(1).split(".")[0]
+            for target_p in irange_members.get(p_dx, [p_dx]):
+                _ensure_port(target_p)["dot1x_mab"] = True
 
     # Merge PoE per-port wattage if available
     if poe and isinstance(poe.get("ports"), dict):
@@ -353,14 +485,63 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                 }
             )
 
+    # Cisco / Arista interface-scoped ip helper-address (stop at !, exit, or vlan/router stanza)
     for blk in re.split(r"(?m)^interface\s+", raw_config)[1:]:
         lines = blk.splitlines()
         if not lines:
             continue
         intf = lines[0].strip()
-        body = "\n".join(lines[1:])
+        body_lines = []
+        for ln in lines[1:]:
+            s = ln.strip()
+            if s == "!" or s.lower() == "exit" or re.match(r"^(?:vlan|router|ip\s+route)\b", s, re.IGNORECASE):
+                break
+            body_lines.append(ln)
+        body = "\n".join(body_lines)
         for m_hlp in re.finditer(r"^\s*ip\s+helper-address\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
             result["relays"].append({"interface": intf, "helper_ip": m_hlp.group(1)})
+
+    # HP ProCurve / ArubaOS-S VLAN-scoped ip helper-address
+    if re.search(r"(?m)^vlan\s+\d+\b", raw_config):
+        vlan_blocks = re.split(r"(?m)^vlan\s+(\d+)\b", raw_config)
+        for idx in range(1, len(vlan_blocks) - 1, 2):
+            vid = vlan_blocks[idx]
+            body = vlan_blocks[idx + 1].split("\nexit")[0]
+            seen_h: set[str] = set()
+            for m_hlp in re.finditer(r"^\s*ip\s+helper-address\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
+                hip = m_hlp.group(1)
+                if hip not in seen_h:
+                    seen_h.add(hip)
+                    result["relays"].append({"interface": f"VLAN {vid}", "helper_ip": hip})
+
+    # Juniper Junos forwarding-options dhcp-relay
+    if "dhcp-relay" in raw_config or "helpers bootp" in raw_config:
+        sg_ips: dict[str, list[str]] = {}
+        grp_sg: dict[str, str] = {}
+        grp_intfs: dict[str, list[str]] = {}
+        for m_sg in re.finditer(
+            r"set\s+forwarding-options\s+dhcp-relay\s+server-group\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)", raw_config
+        ):
+            sg_ips.setdefault(m_sg.group(1), []).append(m_sg.group(2))
+        for m_asg in re.finditer(
+            r"set\s+forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+active-server-group\s+(\S+)", raw_config
+        ):
+            grp_sg[m_asg.group(1)] = m_asg.group(2)
+        for m_gi in re.finditer(
+            r"set\s+forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+interface\s+(\S+)", raw_config
+        ):
+            grp_intfs.setdefault(m_gi.group(1), []).append(m_gi.group(2))
+        for grp, intfs in grp_intfs.items():
+            sg = grp_sg.get(grp, "")
+            ips = sg_ips.get(sg, [])
+            for intf in intfs:
+                for hip in ips:
+                    result["relays"].append({"interface": intf, "helper_ip": hip})
+        for m_bootp in re.finditer(
+            r"set\s+forwarding-options\s+helpers\s+bootp\s+server\s+(\d+\.\d+\.\d+\.\d+)\s+interface\s+(\S+)",
+            raw_config,
+        ):
+            result["relays"].append({"interface": m_bootp.group(2), "helper_ip": m_bootp.group(1)})
 
     # 2. OPNsense config.xml <dhcpd>
     if "<dhcpd>" in raw_config:
@@ -600,3 +781,84 @@ def extract_firewall_nat_vpn(raw_config: str, vendor: str = "") -> dict:
             )
 
     return out
+
+
+def extract_vlans(raw_config: str, vendor: str = "") -> dict[str, dict]:
+    """
+    Extract configured VLANs {vlan_id: {"id", "name", "svi_interface", "voice"}}
+    from Cisco IOS/Arista, HP ProCurve, and Juniper Junos configurations.
+    """
+    vlans: dict[str, dict] = {}
+    if not raw_config:
+        return vlans
+
+    # 1. Cisco / Arista / HP ProCurve `vlan <id>` blocks
+    vlan_blocks = re.split(r"(?m)^vlan\s+(\d+)\b", raw_config)
+    for idx in range(1, len(vlan_blocks) - 1, 2):
+        vid = vlan_blocks[idx]
+        body = vlan_blocks[idx + 1].split("\nexit")[0].split("\n!")[0]
+        m_name = re.search(r'^\s*name\s+"?([^"\r\n]+)"?', body, re.MULTILINE | re.IGNORECASE)
+        vname = m_name.group(1).strip() if m_name else f"VLAN_{vid}"
+        is_voice = bool(re.search(r"^\s*voice\b", body, re.MULTILINE | re.IGNORECASE))
+        vlans[vid] = {"id": vid, "name": vname, "svi_interface": "", "voice": is_voice}
+
+    # 2. Juniper Junos `set vlans <vname> vlan-id <id>` & `l3-interface irb.<unit>`
+    junos_vnames: dict[str, dict] = {}
+    for m_vid in re.finditer(r"set\s+vlans\s+(\S+)\s+vlan-id\s+(\d+)", raw_config):
+        vname, vid = m_vid.group(1), m_vid.group(2)
+        junos_vnames.setdefault(vname, {"id": vid, "name": vname, "svi_interface": "", "voice": False})
+        junos_vnames[vname]["id"] = vid
+    for m_l3 in re.finditer(r"set\s+vlans\s+(\S+)\s+l3-interface\s+(\S+)", raw_config):
+        vname, l3_if = m_l3.group(1), m_l3.group(2)
+        if vname in junos_vnames:
+            junos_vnames[vname]["svi_interface"] = l3_if
+        else:
+            m_irb = re.match(r"^irb\.(\d+)$", l3_if, re.IGNORECASE)
+            m_vn = re.match(r"^(?:vlan|vl)[_-]?(\d+)$", vname, re.IGNORECASE)
+            vid = m_vn.group(1) if m_vn else (m_irb.group(1) if m_irb else "")
+            if vid:
+                junos_vnames[vname] = {"id": vid, "name": vname, "svi_interface": l3_if, "voice": False}
+    for vinfo in junos_vnames.values():
+        vlans[vinfo["id"]] = vinfo
+
+    return vlans
+
+
+def extract_vrfs_and_acls(raw_config: str, vendor: str = "") -> tuple[list[dict], dict[str, dict]]:
+    """
+    Extract VRF / routing-instance names and per-interface ACL bindings
+    (`acl_in`, `acl_out`) from Cisco, Arista, HP ProCurve, and Junos configs.
+    """
+    vrfs: list[dict] = []
+    acls: dict[str, dict] = {}
+    if not raw_config:
+        return vrfs, acls
+
+    seen_vrfs: set[str] = set()
+    for m_vrf in re.finditer(r"(?m)^(?:ip\s+vrf|vrf\s+definition)\s+(\S+)", raw_config):
+        vname = m_vrf.group(1)
+        if vname not in seen_vrfs:
+            seen_vrfs.add(vname)
+            vrfs.append({"name": vname, "type": "vrf"})
+    for m_ri in re.finditer(r"set\s+routing-instances\s+(\S+)\s+instance-type\s+(\S+)", raw_config):
+        vname, rtype = m_ri.groups()
+        if vname not in seen_vrfs:
+            seen_vrfs.add(vname)
+            vrfs.append({"name": vname, "type": rtype})
+
+    for m_jfilt in re.finditer(
+        r"set\s+interfaces\s+(\S+)\s+unit\s+\d+\s+family\s+(?:ethernet-switching|inet)\s+filter\s+(input|output)\s+(\S+)",
+        raw_config,
+    ):
+        port, direction, fname = m_jfilt.groups()
+        acls.setdefault(port, {"acl_in": "", "acl_out": ""})
+        acls[port]["acl_in" if direction == "input" else "acl_out"] = fname
+
+    for m_intf in re.finditer(r"(?m)^interface\s+(\S+)\s*\r?\n((?:[ \t]+[^\r\n]+\r?\n)*)", raw_config):
+        port, body = m_intf.group(1), m_intf.group(2)
+        for m_ag in re.finditer(r"(?m)^\s*(?:ip|ipv6)\s+access-group\s+(\S+)\s+(in|out)\b", body, re.IGNORECASE):
+            fname, direction = m_ag.group(1), m_ag.group(2).lower()
+            acls.setdefault(port, {"acl_in": "", "acl_out": ""})
+            acls[port]["acl_in" if direction == "in" else "acl_out"] = fname
+
+    return vrfs, acls

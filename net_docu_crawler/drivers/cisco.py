@@ -347,3 +347,51 @@ class CiscoDriver(BaseDriver):
             return conn.send_command("show running-config")
         except Exception:
             return ""
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        ops: dict[str, dict] = {}
+        try:
+            raw_trunk = conn.send_command("show interfaces trunk")
+            if raw_trunk and "Invalid input" not in raw_trunk:
+                section = ""
+                for line in raw_trunk.splitlines():
+                    if "Mode" in line and "Native vlan" in line:
+                        section = "mode"
+                        continue
+                    if "Vlans allowed on trunk" in line:
+                        section = "allowed"
+                        continue
+                    if "Vlans in spanning tree" in line:
+                        section = "other"
+                        continue
+                    if section == "mode":
+                        m = re.match(r"^\s*(\S+)\s+(?:on|auto|desirable|trunk)\s+\S+\s+trunking\s+(\d+)", line, re.I)
+                        if m:
+                            p, nat = m.group(1), m.group(2)
+                            ops.setdefault(p, {})["mode"] = "trunk"
+                            ops[p]["native_vlan"] = nat
+                    elif section == "allowed":
+                        m = re.match(r"^\s*(\S+)\s+([\d,-]+)", line)
+                        if m:
+                            p, vlans = m.group(1), m.group(2)
+                            ops.setdefault(p, {})["mode"] = "trunk"
+                            ops[p]["trunk_allowed_vlans"] = vlans
+        except Exception:
+            pass
+
+        try:
+            raw_ec = conn.send_command("show etherchannel summary")
+            if raw_ec and "Invalid input" not in raw_ec:
+                for line in raw_ec.splitlines():
+                    m_ec = re.match(r"^\s*\d+\s+(Po\d+)\(\S+\)\s+(LACP|PAgP|-)\s+(.+)$", line, re.I)
+                    if m_ec:
+                        po_name, proto, members_str = m_ec.group(1), m_ec.group(2).lower(), m_ec.group(3)
+                        for tok in members_str.split():
+                            pname = re.sub(r"\([^)]*\)$", "", tok).strip()
+                            if pname:
+                                ops.setdefault(pname, {})["lag_group"] = po_name
+                                ops[pname]["lacp_mode"] = "active" if proto == "lacp" else "on"
+        except Exception:
+            pass
+
+        return ops

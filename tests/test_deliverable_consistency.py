@@ -40,9 +40,19 @@ SMOKE_SCRIPT_PATH = "docs/net_docu_crawler/validate_cutover.sh"
 PORT_ENDPOINT_CSV_PATH = "docs/net_docu_crawler/port_mac_endpoint_mapping.csv"
 FORTIOS_BACKUP_PATH = "scratch/fortios_Lab_LD2_backup.conf"
 
+def _has_full_live_dataset() -> bool:
+    if not os.path.exists(DATASET_PATH):
+        return False
+    try:
+        with open(DATASET_PATH, encoding="utf-8") as f:
+            return len(json.load(f)) >= 8
+    except Exception:
+        return False
+
+
 requires_live_dataset = pytest.mark.skipif(
-    not os.path.exists(DATASET_PATH),
-    reason="Live crawl deliverables not present on disk (gitignored in CI)",
+    not _has_full_live_dataset(),
+    reason="Full live crawl deliverables (>=8 devices) not present in docs/net_docu_crawler/",
 )
 
 
@@ -268,6 +278,35 @@ def test_expand_targets_cidr_routed_subnets():
     # Large /16 subnet must actually cap expansion at max_hosts_per_cidr
     capped = expand_targets(["10.0.0.0/16"], max_hosts_per_cidr=16)
     assert len(capped) == 16
+
+
+@requires_live_dataset
+def test_layered_deliverables_structure():
+    base_dir = os.path.dirname(DATASET_PATH)
+    required = [
+        "00_manifest/collection_manifest.json",
+        "00_manifest/data_quality_report.md",
+        "00_manifest/failures.csv",
+        "02_normalized/devices.json",
+        "02_normalized/interfaces.csv",
+        "02_normalized/neighbors.csv",
+        "02_normalized/poe.csv",
+        "02_normalized/svi_routes.csv",
+        "02_normalized/vlans.csv",
+        "03_correlated/physical_links.csv",
+        "03_correlated/unused_ports.csv",
+        "03_correlated/vlan_propagation.csv",
+        "04_migration/asset_inventory.csv",
+        "04_migration/cabling_matrix.csv",
+        "05_reports/Network_Analysis.md",
+        "05_reports/L2_network_diagrams.md",
+        "05_reports/L3_network_diagrams.md",
+        "05_reports/protocol_translation_matrix.md",
+    ]
+    if not os.path.isdir(os.path.join(base_dir, "00_manifest")):
+        pytest.skip("Legacy non-layered output directory")
+    for rel in required:
+        assert os.path.isfile(os.path.join(base_dir, rel)), f"Missing layered deliverable: {rel}"
 
     dedup = expand_targets(["192.168.1.1", "192.168.1.1", "172.16.1.1"])
     assert dedup == ["192.168.1.1", "172.16.1.1"]
