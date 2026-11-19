@@ -284,8 +284,7 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv", infra_o
             writer.writeheader()
             for ip, dev in devices.items():
                 if infra_only and (
-                    dev.get("status") in ("unauthenticated", "unsupported", "discovered")
-                    or not _is_network_infra(dev)
+                    dev.get("status") in ("unauthenticated", "unsupported", "discovered") or not _is_network_infra(dev)
                 ):
                     continue
                 model_lower = dev.get("model", "").lower()
@@ -940,7 +939,11 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
             if clean_ip.startswith(("127.", "128.0.")):
                 continue
-            subnet_range = svi_row.get("prefix_cidr") or svi_row.get("subnet") or (f"{net.network}/{net.prefixlen}" if net else "N/A")
+            subnet_range = (
+                svi_row.get("prefix_cidr")
+                or svi_row.get("subnet")
+                or (f"{net.network}/{net.prefixlen}" if net else "N/A")
+            )
             lines.append(
                 f"| {hostname} | {intf_name} | {vlan_id_str or 'N/A'} | {vlan_name or 'N/A'} | {desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
             )
@@ -1688,10 +1691,7 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
                 neighbors = dev.get("neighbors", [])
 
                 # Pre-map port_profiles by normalized interface name
-                norm_profiles = {
-                    normalize_interface_name(p_name): p_data
-                    for p_name, p_data in port_profiles.items()
-                }
+                norm_profiles = {normalize_interface_name(p_name): p_data for p_name, p_data in port_profiles.items()}
 
                 # Pre-map neighbors by local interface name (normalized)
                 neighbor_map = {}
@@ -1905,7 +1905,9 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
             res_conf = (
                 "CORRELATED_DHCP"
                 if mac in dhcp_macs
-                else ("CORRELATED_ARP" if res_ip else ("INFERRED_OUI" if vendor and vendor != "Unknown" else "UNRESOLVED"))
+                else (
+                    "CORRELATED_ARP" if res_ip else ("INFERRED_OUI" if vendor and vendor != "Unknown" else "UNRESOLVED")
+                )
             )
             seen_port_mac.add((hostname, port, mac))
             rows.append(
@@ -2010,7 +2012,9 @@ def generate_protocol_translation(devices, output_path="cisco_to_target_translat
         cfg = dev.get("raw_config", "")
 
         lines.append(f"## Switch: {hostname} ({ip}) — {dev.get('vendor', 'Unknown')}")
-        lines.append("| Source Construct | Source Evidence (Ports / VLANs / IPs) | Target Standard Equivalent | Validation Gate |")
+        lines.append(
+            "| Source Construct | Source Evidence (Ports / VLANs / IPs) | Target Standard Equivalent | Validation Gate |"
+        )
         lines.append("| --- | --- | --- | --- |")
 
         features_found = 0
@@ -2046,7 +2050,9 @@ def generate_protocol_translation(devices, output_path="cisco_to_target_translat
         elif "juniper" in vendor_l:
             all_trks = [p for p, d in ports_map.items() if d.get("allowed_vlans_raw") == "all"]
             if acc_ports or trk_ports:
-                ev = f"{len(acc_ports)} access, {len(trk_ports)} trunk" + (f" ({len(all_trks)} using `all`)" if all_trks else "")
+                ev = f"{len(acc_ports)} access, {len(trk_ports)} trunk" + (
+                    f" ({len(all_trks)} using `all`)" if all_trks else ""
+                )
                 lines.append(
                     f"| **Junos `family ethernet-switching`** | {ev} | Target Access / Trunk Port Profiles (explicit VLANs) | Compare source vs target port objects |"
                 )
@@ -2621,7 +2627,9 @@ def generate_master_network_analysis_migration_blueprint(
             nbr_host = cport.get("neighbor_hostname") or (
                 (nbr.get("remote_device") or "").strip().strip('"').strip("'") if nbr else "Unconnected"
             )
-            nbr_port = cport.get("neighbor_port") or (normalize_interface_name(nbr.get("remote_port", "")) if nbr else "N/A")
+            nbr_port = cport.get("neighbor_port") or (
+                normalize_interface_name(nbr.get("remote_port", "")) if nbr else "N/A"
+            )
             lag_val = cport.get("lag_id") or channel_map.get(norm_port, "")
             lag_group = lag_val if lag_val and lag_val not in ("none", "unknown") else "None (Standalone)"
 
@@ -2771,9 +2779,7 @@ def generate_master_network_analysis_migration_blueprint(
 
         if persona == "switch" or tot > 0 or used > 0:
             if poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
-                lines.append(
-                    f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |"
-                )
+                lines.append(f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |")
             elif poe.get("budget_unreported") and used > 0.0:
                 deliv_cnt = poe.get("poe_delivering_ports", 0)
                 lines.append(
@@ -2856,9 +2862,7 @@ def generate_master_network_analysis_migration_blueprint(
                 r_intf = rel.get("interface") or "Unknown"
                 r_ip = rel.get("helper_ip") or ""
                 if r_ip:
-                    lines.append(
-                        f"| **{hostname}** | `{r_intf}` | `{r_ip}` | Discovered DHCP Relay | ✓ Provisioned |"
-                    )
+                    lines.append(f"| **{hostname}** | `{r_intf}` | `{r_ip}` | Discovered DHCP Relay | ✓ Provisioned |")
         else:
             for r_ip in (dev.get("services") or {}).get("dhcp_relays", []) or []:
                 has_relays = True
@@ -2867,7 +2871,9 @@ def generate_master_network_analysis_migration_blueprint(
                 )
 
     if not has_relays:
-        lines.append("| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | Unconfigured or Local DHCP |")
+        lines.append(
+            "| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | Unconfigured or Local DHCP |"
+        )
 
     lines.extend(
         [
@@ -2986,10 +2992,16 @@ def generate_master_network_analysis_migration_blueprint(
         sec_pol = dev.get("security_policy") or {}
         fw_cnt = len(sec_pol.get("firewall_rules") or [])
         nat_cnt = len(sec_pol.get("nat_rules") or [])
-        insecure_col = "Telnet Active" if "telnet" in mgmt.lower() else ("Unknown" if mgmt == "Unknown" else "SSH/API Only")
+        insecure_col = (
+            "Telnet Active" if "telnet" in mgmt.lower() else ("Unknown" if mgmt == "Unknown" else "SSH/API Only")
+        )
         secure_col = mgmt if mgmt != "Unknown" else "Unknown"
         acl_col = f"{fw_cnt} parsed rules" if fw_cnt > 0 else "Unknown (Not Queried)"
-        nat_status = f"Enabled ({nat_cnt} rules)" if nat_cnt > 0 else ("Disabled (Pure L2/L3)" if persona in ("switch", "router") else "Unknown")
+        nat_status = (
+            f"Enabled ({nat_cnt} rules)"
+            if nat_cnt > 0
+            else ("Disabled (Pure L2/L3)" if persona in ("switch", "router") else "Unknown")
+        )
         lines.append(f"| **{hostname}** | {insecure_col} | {secure_col} | {acl_col} | {nat_status} |")
 
     lines.extend(
@@ -3593,7 +3605,17 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     with open(os.path.join(m_dir, "failures.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["ip", "status", "record_class", "vendor", "device_type", "mgmt_method", "model", "mac_address", "capture_time"],
+            fieldnames=[
+                "ip",
+                "status",
+                "record_class",
+                "vendor",
+                "device_type",
+                "mgmt_method",
+                "model",
+                "mac_address",
+                "capture_time",
+            ],
         )
         w.writeheader()
         w.writerows(fail_rows)
@@ -3635,10 +3657,29 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
                 unused_rows.append(row)
 
     iface_fields = [
-        "hostname", "interface", "admin_state", "oper_state", "mode", "access_vlan",
-        "voice_vlan", "native_vlan", "allowed_vlans", "lag_id", "lacp_mode", "speed",
-        "duplex", "media", "neighbor_hostname", "neighbor_port", "stp_edge", "bpdu_guard",
-        "storm_control", "poe_draw_watts", "edge_mac_count", "hygiene_disposition", "hygiene_reason",
+        "hostname",
+        "interface",
+        "admin_state",
+        "oper_state",
+        "mode",
+        "access_vlan",
+        "voice_vlan",
+        "native_vlan",
+        "allowed_vlans",
+        "lag_id",
+        "lacp_mode",
+        "speed",
+        "duplex",
+        "media",
+        "neighbor_hostname",
+        "neighbor_port",
+        "stp_edge",
+        "bpdu_guard",
+        "storm_control",
+        "poe_draw_watts",
+        "edge_mac_count",
+        "hygiene_disposition",
+        "hygiene_reason",
     ]
     with open(os.path.join(n_dir, "interfaces.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=iface_fields)
@@ -3675,7 +3716,17 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     with open(os.path.join(n_dir, "svi_routes.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["site_code", "source_device", "vlan_id", "vlan_name", "svi_interface", "primary_ip", "prefix_cidr", "dhcp_relays", "confidence"],
+            fieldnames=[
+                "site_code",
+                "source_device",
+                "vlan_id",
+                "vlan_name",
+                "svi_interface",
+                "primary_ip",
+                "prefix_cidr",
+                "dhcp_relays",
+                "confidence",
+            ],
         )
         w.writeheader()
         for sr in svi_rows:
@@ -3687,7 +3738,17 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     with open(os.path.join(n_dir, "poe.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["hostname", "ip", "poe_supported", "total_power_watts", "used_power_watts", "allocated_power_watts", "poe_capable_ports", "poe_delivering_ports", "psu_redundancy"],
+            fieldnames=[
+                "hostname",
+                "ip",
+                "poe_supported",
+                "total_power_watts",
+                "used_power_watts",
+                "allocated_power_watts",
+                "poe_capable_ports",
+                "poe_delivering_ports",
+                "psu_redundancy",
+            ],
         )
         w.writeheader()
         for d in infra:
@@ -3708,7 +3769,11 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
 
     # 6. 03_correlated/physical_links.csv
     with open(os.path.join(c_dir, "physical_links.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"], extrasaction="ignore")
+        w = csv.DictWriter(
+            f,
+            fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"],
+            extrasaction="ignore",
+        )
         w.writeheader()
         for lk in getattr(registry, "links", []) or []:
             row = dict(lk)
@@ -3725,7 +3790,9 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
             with open(os.path.join(r_dir, f"{prefix}_running_config.txt"), "w", encoding="utf-8") as f:
                 f.write(raw_cfg)
         if ip_safe:
-            for cand_dir in [d_c for d_c in (source_logs_dir, run_output_dir, os.path.join(run_output_dir, "logs")) if d_c]:
+            for cand_dir in [
+                d_c for d_c in (source_logs_dir, run_output_dir, os.path.join(run_output_dir, "logs")) if d_c
+            ]:
                 src_log = os.path.join(cand_dir, f"{ip_safe}_raw_session.log")
                 if os.path.isfile(src_log):
                     shutil.copy2(src_log, os.path.join(r_dir, f"{prefix}_raw_session.log"))
@@ -3736,8 +3803,17 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
         w = csv.DictWriter(
             f,
             fieldnames=[
-                "source_device", "site_code", "local_port", "remote_device", "remote_port",
-                "remote_ip", "remote_mac", "platform", "device_type", "link_confidence", "capture_time",
+                "source_device",
+                "site_code",
+                "local_port",
+                "remote_device",
+                "remote_port",
+                "remote_ip",
+                "remote_mac",
+                "platform",
+                "device_type",
+                "link_confidence",
+                "capture_time",
             ],
         )
         w.writeheader()
@@ -3792,7 +3868,17 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     with open(os.path.join(c_dir, "vlan_propagation.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["site_code", "vlan_id", "vlan_name", "svi_device", "gateway_ip", "subnet", "switch_count", "trunk_port_count", "trunk_ports"],
+            fieldnames=[
+                "site_code",
+                "vlan_id",
+                "vlan_name",
+                "svi_device",
+                "gateway_ip",
+                "subnet",
+                "switch_count",
+                "trunk_port_count",
+                "trunk_ports",
+            ],
         )
         w.writeheader()
         for key in sorted(vlan_prop.keys(), key=lambda x: (x[0], int(x[1]) if x[1].isdigit() else 99999)):

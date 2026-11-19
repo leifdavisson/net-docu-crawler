@@ -109,7 +109,9 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
         poe_p = poe_ports.get(port_name) or poe_ports.get(norm_p)
         if poe_p:
             rec["poe_state"] = str(poe_p.get("status") or "unknown").lower()
-            rec["poe_draw_watts"] = float(poe_p.get("draw_watts", poe_p.get("power_watts", poe_p.get("watts", 0.0))) or 0.0)
+            rec["poe_draw_watts"] = float(
+                poe_p.get("draw_watts", poe_p.get("power_watts", poe_p.get("watts", 0.0))) or 0.0
+            )
             rec["poe_allocated_watts"] = float(poe_p.get("allocated_watts", 0.0) or 0.0)
             rec["poe_class"] = str(poe_p.get("class") or "")
 

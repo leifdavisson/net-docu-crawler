@@ -1338,7 +1338,9 @@ def crawl_network(
         if unauth_infra:
             with ThreadPoolExecutor(max_workers=min(max_workers, len(unauth_infra))) as pool:
                 fb_futs = {
-                    pool.submit(collect_snmp_fallback, d["ip"], community=snmp_community, timeout=min(float(timeout), 2.0)): d
+                    pool.submit(
+                        collect_snmp_fallback, d["ip"], community=snmp_community, timeout=min(float(timeout), 2.0)
+                    ): d
                     for d in unauth_infra
                 }
                 for fut in as_completed(fb_futs):
@@ -1564,7 +1566,11 @@ def render_deliverables_from_dataset(
                     nbr["remote_platform"] = plat_label
 
             n_type = (nbr.get("device_type") or "").lower()
-            l_class = "infra_uplink" if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge")) else "edge_endpoint"
+            l_class = (
+                "infra_uplink"
+                if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge"))
+                else "edge_endpoint"
+            )
             registry.add_bidirectional_link(
                 local_node=local_host,
                 local_port=nbr.get("local_port", ""),
@@ -1586,7 +1592,9 @@ def render_deliverables_from_dataset(
     for d in (manifest_dir, norm_dir, corr_dir, mig_dir, rep_dir):
         os.makedirs(d, exist_ok=True)
     write_quality_report(quality_report, manifest_dir)
-    print(f"[+] Quality Gates: {'PASS' if quality_report['passed'] else 'FAIL'} (see {os.path.join(manifest_dir, 'data_quality_report.md')})")
+    print(
+        f"[+] Quality Gates: {'PASS' if quality_report['passed'] else 'FAIL'} (see {os.path.join(manifest_dir, 'data_quality_report.md')})"
+    )
 
     confirmed_count = sum(1 for lk in registry.links if lk["status"] == "confirmed")
     print(f"\n[+] Processed {len(raw_devices)} network devices!")

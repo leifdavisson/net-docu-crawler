@@ -472,7 +472,9 @@ class DeviceRegistry:
                     # Synthesize reverse neighbor on peer if peer is crawled and lacks an entry on r_port
                     peer_dev = by_host.get(r_host.lower())
                     if peer_dev and r_port and l_port:
-                        peer_ints = {normalize_interface(k).lower(): k for k in (peer_dev.get("interfaces_detail") or {})}
+                        peer_ints = {
+                            normalize_interface(k).lower(): k for k in (peer_dev.get("interfaces_detail") or {})
+                        }
                         if r_port.lower() in peer_ints:
                             peer_port_exact = peer_ints[r_port.lower()]
                             already = any(

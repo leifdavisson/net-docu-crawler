@@ -40,6 +40,7 @@ SMOKE_SCRIPT_PATH = "docs/net_docu_crawler/validate_cutover.sh"
 PORT_ENDPOINT_CSV_PATH = "docs/net_docu_crawler/port_mac_endpoint_mapping.csv"
 FORTIOS_BACKUP_PATH = "scratch/fortios_Lab_LD2_backup.conf"
 
+
 def _has_full_live_dataset() -> bool:
     if not os.path.exists(DATASET_PATH):
         return False

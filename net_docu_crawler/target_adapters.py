@@ -38,10 +38,14 @@ def render_device_target_config(dev: dict, target_vendor: str) -> list[str]:
                 lines.append(f"# BLOCKED: {pname} has unresolved mode/native_vlan; manual verification required")
                 continue
             if mode == "access":
-                lines.append(f'{{"portId": "{pname}", "type": "access", "vlan": "{p.get("access_vlan", "")}", "voiceVlan": "{p.get("voice_vlan", "")}"}}')
+                lines.append(
+                    f'{{"portId": "{pname}", "type": "access", "vlan": "{p.get("access_vlan", "")}", "voiceVlan": "{p.get("voice_vlan", "")}"}}'
+                )
             elif mode == "trunk":
                 allowed = ",".join(p.get("allowed_vlans") or [])
-                lines.append(f'{{"portId": "{pname}", "type": "trunk", "vlan": "{p.get("native_vlan", "none")}", "allowedVlans": "{allowed}"}}')
+                lines.append(
+                    f'{{"portId": "{pname}", "type": "trunk", "vlan": "{p.get("native_vlan", "none")}", "allowedVlans": "{allowed}"}}'
+                )
         return lines
 
     for pname, p in ports.items():
@@ -56,7 +60,9 @@ def render_device_target_config(dev: dict, target_vendor: str) -> list[str]:
             elif mode == "trunk":
                 lines.append(f"set interfaces {pname} unit 0 family ethernet-switching interface-mode trunk")
                 if p.get("allowed_vlans"):
-                    lines.append(f"set interfaces {pname} unit 0 family ethernet-switching vlan members [{' '.join(p['allowed_vlans'])}]")
+                    lines.append(
+                        f"set interfaces {pname} unit 0 family ethernet-switching vlan members [{' '.join(p['allowed_vlans'])}]"
+                    )
         elif tv in ("cisco", "arista", "aruba"):
             lines.append(f"interface {pname}")
             if mode == "access" and p.get("access_vlan"):

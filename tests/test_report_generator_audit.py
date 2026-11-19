@@ -90,9 +90,7 @@ def test_migration_report_no_fabricated_defaults(tmp_path):
             "device_persona": "switch",
             "model": "EX3400-48P",
             "serial": "ABC123456",
-            "interfaces_detail": {
-                "ge-0/0/1": {"status": "up", "speed": "1000", "duplex": "full"}
-            },
+            "interfaces_detail": {"ge-0/0/1": {"status": "up", "speed": "1000", "duplex": "full"}},
             "port_profiles": {},
             "poe": {"total_power_watts": 0.0, "used_power_watts": 0.0, "available_power_watts": 0.0},
             "stp": {"enabled": True, "is_root": True, "vlans": {}},
@@ -175,7 +173,15 @@ def test_physical_links_link_class_export(tmp_path):
     reg = DeviceRegistry()
     reg.add_bidirectional_link("SW1", "Gi1/0/1", "SW2", "Gi1/0/2", link_class="infra_uplink")
     reg.add_bidirectional_link("SW1", "Gi1/0/3", "cam-01", "eth0", link_class="edge_endpoint")
-    dev = {"hostname": "SW1", "ip": "10.0.0.1", "status": "success", "ports": {}, "vlans": {}, "l3_interfaces": [], "poe": {}}
+    dev = {
+        "hostname": "SW1",
+        "ip": "10.0.0.1",
+        "status": "success",
+        "ports": {},
+        "vlans": {},
+        "l3_interfaces": [],
+        "poe": {},
+    }
     report_generator.export_layered_csvs([dev], reg, str(tmp_path))
     with open(tmp_path / "03_correlated" / "physical_links.csv", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))

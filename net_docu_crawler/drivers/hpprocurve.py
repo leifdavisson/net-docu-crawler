@@ -312,11 +312,17 @@ class HPProCurveDriver(BaseDriver):
                             plat_low = plat.lower()
                             host_low = rem_host.lower()
                             dev_type = "switch"
-                            if any(w in plat_low or w in host_low for w in ["ap", "access point", "aruba", "ruckus", "ubiquiti", "unifi"]):
+                            if any(
+                                w in plat_low or w in host_low
+                                for w in ["ap", "access point", "aruba", "ruckus", "ubiquiti", "unifi"]
+                            ):
                                 dev_type = "ap"
                             elif any(w in plat_low or w in host_low for w in ["axis", "hikvision", "camera", "hanwha"]):
                                 dev_type = "camera"
-                            elif any(w in plat_low or w in host_low for w in ["polycom", "yealink", "mitel", "avaya", "grandstream"]):
+                            elif any(
+                                w in plat_low or w in host_low
+                                for w in ["polycom", "yealink", "mitel", "avaya", "grandstream"]
+                            ):
                                 dev_type = "phone"
                             elif any(w in plat_low or w in host_low for w in ["crestron", "extron", "biamp"]):
                                 dev_type = "av_control"
@@ -526,7 +532,9 @@ class HPProCurveDriver(BaseDriver):
             m_prio = re.search(r"Switch Priority\s*:\s*(\d+)", raw, re.IGNORECASE)
             if m_prio:
                 stp["bridge_priority"] = m_prio.group(1).strip()
-            m_root = re.search(r"(?:Root Bridge MAC Address|CST Root MAC Address)\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw)
+            m_root = re.search(
+                r"(?:Root Bridge MAC Address|CST Root MAC Address)\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw
+            )
             m_this = re.search(r"Switch MAC Address\s*:\s*([0-9a-fA-F-]+|[0-9a-fA-F:]+)", raw)
             if m_root:
                 stp["root_bridge"] = oui_lookup.normalize_mac(m_root.group(1)).lower()
@@ -637,9 +645,7 @@ class HPProCurveDriver(BaseDriver):
             if poe["total_power_watts"] == 0.0 and delivering_cnt > 0:
                 poe["budget_unreported"] = True
                 if poe["used_power_watts"] == 0.0:
-                    poe["used_power_watts"] = round(
-                        sum(p.get("draw_watts", 0.0) for p in poe["ports"].values()), 2
-                    )
+                    poe["used_power_watts"] = round(sum(p.get("draw_watts", 0.0) for p in poe["ports"].values()), 2)
         except Exception:
             pass
         return poe
@@ -705,7 +711,10 @@ class HPProCurveDriver(BaseDriver):
             raw_stp = conn.send_command("show spanning-tree detail")
             if raw_stp and "Invalid input" not in raw_stp:
                 for line in raw_stp.splitlines():
-                    m_st = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|\s+(?:100Mb|1Gb|10Gb|\S+)\s+\|\s+\d+\s+\|\s+(\S+)\s+\|\s+(\S+)", line)
+                    m_st = re.match(
+                        r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|\s+(?:100Mb|1Gb|10Gb|\S+)\s+\|\s+\d+\s+\|\s+(\S+)\s+\|\s+(\S+)",
+                        line,
+                    )
                     if m_st:
                         p, state, role = m_st.group(1), m_st.group(2), m_st.group(3)
                         ops.setdefault(p, {})["stp_state"] = state

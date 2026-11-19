@@ -170,7 +170,13 @@ class JuniperDriver(BaseDriver):
 
                 # Only include physical switch/router interfaces (ge-*, xe-*, et-*, ae*) in physical port detail
                 if re.match(r"^(?:ge-|xe-|et-|fe-|ae\d|irb)", name):
-                    default_speed = "10Gb/s" if name.startswith("xe-") else ("40Gb/s" if name.startswith("et-") else ("100Mb/s" if name.startswith("fe-") else "1Gb/s"))
+                    default_speed = (
+                        "10Gb/s"
+                        if name.startswith("xe-")
+                        else (
+                            "40Gb/s" if name.startswith("et-") else ("100Mb/s" if name.startswith("fe-") else "1Gb/s")
+                        )
+                    )
                     interfaces_detail[name] = {
                         "status": oper_status,
                         "protocol": oper_status,
@@ -726,9 +732,7 @@ class JuniperDriver(BaseDriver):
         poe["poe_enabled_ports"] = sum(
             1 for p in poe["ports"].values() if str(p.get("status", "")).upper() != "DISABLED"
         )
-        poe["poe_delivering_ports"] = sum(
-            1 for p in poe["ports"].values() if float(p.get("watts", 0.0) or 0.0) > 0
-        )
+        poe["poe_delivering_ports"] = sum(1 for p in poe["ports"].values() if float(p.get("watts", 0.0) or 0.0) > 0)
         return poe
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -1007,7 +1011,9 @@ class JuniperDriver(BaseDriver):
             raw_es = conn.send_command("show ethernet-switching interfaces | display json")
             if raw_es and raw_es.strip().startswith("{"):
                 data = json.loads(raw_es)
-                for entry in data.get("l2ng-l2ald-iff-interface-information", [{}])[0].get("l2ng-l2ald-iff-interface-entry", []):
+                for entry in data.get("l2ng-l2ald-iff-interface-information", [{}])[0].get(
+                    "l2ng-l2ald-iff-interface-entry", []
+                ):
                     iname = (entry.get("l2ng-l2ald-iff-interface-name", [{}])[0].get("data") or "").split(".")[0]
                     if not iname:
                         continue
@@ -1021,7 +1027,9 @@ class JuniperDriver(BaseDriver):
             raw_lacp = conn.send_command("show lacp interfaces | display json")
             if raw_lacp and raw_lacp.strip().startswith("{"):
                 data = json.loads(raw_lacp)
-                for grp_blk in data.get("lacp-interface-information-list", [{}])[0].get("lacp-interface-information", []):
+                for grp_blk in data.get("lacp-interface-information-list", [{}])[0].get(
+                    "lacp-interface-information", []
+                ):
                     ae_name = grp_blk.get("lag-lacp-header", [{}])[0].get("aggregate-name", [{}])[0].get("data", "")
                     for p_ent in grp_blk.get("lag-lacp-state", []):
                         pname = p_ent.get("name", [{}])[0].get("data", "")

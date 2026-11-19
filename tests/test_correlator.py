@@ -25,7 +25,12 @@ def test_correlate_device_ports_and_stp_consensus():
             "ge-0/0/8": {"mode": "trunk", "trunk_allowed_vlans": "all", "native_vlan": "3019"},
         },
         "neighbors": [
-            {"local_port": "ge-0/0/8", "remote_device": "NMS_BLDG_H_RMs_9-12", "remote_port": "ge-0/2/0", "device_type": "switch"}
+            {
+                "local_port": "ge-0/0/8",
+                "remote_device": "NMS_BLDG_H_RMs_9-12",
+                "remote_port": "ge-0/2/0",
+                "device_type": "switch",
+            }
         ],
         "mac_table": [{"interface": "ge-0/0/8", "mac": "aa:bb:cc:dd:ee:ff", "vlan": "10"}],
         "l3_interfaces": [{"interface": "irb.3019", "ip_address": "172.31.1.1/24", "status": "up"}],
@@ -77,13 +82,7 @@ def test_extract_vrfs_and_acls_propagation():
     from net_docu_crawler.correlator import correlate_device_ports
     from net_docu_crawler.migration_parsers import extract_vrfs_and_acls
 
-    cfg = (
-        "ip vrf MGMT\n"
-        "interface Gi1/0/1\n"
-        " ip access-group EDGE_IN in\n"
-        " ip access-group EDGE_OUT out\n"
-        "!\n"
-    )
+    cfg = "ip vrf MGMT\ninterface Gi1/0/1\n ip access-group EDGE_IN in\n ip access-group EDGE_OUT out\n!\n"
     vrfs, acls = extract_vrfs_and_acls(cfg, vendor="cisco")
     assert vrfs == [{"name": "MGMT", "type": "vrf"}]
     assert acls["Gi1/0/1"] == {"acl_in": "EDGE_IN", "acl_out": "EDGE_OUT"}
