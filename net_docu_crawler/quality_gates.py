@@ -134,11 +134,17 @@ def write_quality_report(report: dict, manifest_dir: str) -> None:
         "# Data Quality & Cutover-Readiness Gate Report",
         "",
         f"**Overall P0 Gate Status**: `{'PASS' if report['passed'] else 'FAIL'}`",
-        "",
-        "## Discovery Funnel",
-        "| Category | Count |",
-        "| :--- | :--- |",
     ]
+    if report.get("dns_domain"):
+        lines.append(f"**Detected DNS Domain**: `{report['dns_domain']}`")
+    lines.extend(
+        [
+            "",
+            "## Discovery Funnel",
+            "| Category | Count |",
+            "| :--- | :--- |",
+        ]
+    )
     for k, v in report["funnel"].items():
         lines.append(f"| `{k}` | {v} |")
 

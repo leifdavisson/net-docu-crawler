@@ -1091,7 +1091,7 @@ def parse_interface_ips_from_config(raw_config):
     return intf_ips
 
 
-def generate_network_analysis_report(devices, output_path="network_analysis_report.md"):
+def generate_network_analysis_report(devices, output_path="network_analysis_report.md", dns_domain: str = ""):
     """
     Generates a structured Layer 1-7 network analysis report.
     Details cabling errors, speed mismatches, STP loop risks, subnets, and L4-L7 services.
@@ -1100,10 +1100,16 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         "# Layered Network Analysis Report (OSI-Oriented)",
         "",
         "This report evaluates network behavior, health indicators, configuration consistency, and security gaps parsed from active switch running-states.",
-        "",
-        "## 1. Layer 1/2 (Physical & Data Link) Analysis",
-        "",
     ]
+    if dns_domain:
+        lines.extend(["", f"**Detected DNS Domain**: `{dns_domain}`"])
+    lines.extend(
+        [
+            "",
+            "## 1. Layer 1/2 (Physical & Data Link) Analysis",
+            "",
+        ]
+    )
 
     # A. Cabling & Speed Mismatches
     lines.append("### Cabling Issues & Speed/Duplex Mismatches")
@@ -2478,6 +2484,7 @@ def generate_master_network_analysis_migration_blueprint(
     output_path: str = "Network_Analysis.md",
     scope: str = "Discovered Network",
     timestamp: str = "",
+    dns_domain: str = "",
 ) -> None:
     """
     Generates the comprehensive, unified Master Migration Blueprint (Network_Analysis.md)
@@ -2502,36 +2509,42 @@ def generate_master_network_analysis_migration_blueprint(
         "| Attribute | Migration Scope Value |",
         "| :--- | :--- |",
         f"| **Migration Target Scope** | `{scope}` |",
-        f"| **Discovery Execution Timestamp** | `{timestamp}` |",
-        f"| **Total Discovered Infrastructure Nodes** | `{total_nodes}` |",
-        "| **Read-Only Discovery Invariant** | Strictly Enforced (Zero Control-Plane Blast Radius) |",
-        "",
-        "---",
-        "",
-        "## Table of Contents",
-        "1. [Executive Summary & Current Hardware Estate](#1-executive-summary--current-hardware-estate)",
-        "2. [Physical Layer 1/2 Cabling, Optics & MTU Matrix](#2-physical-layer-12-cabling-optics--mtu-matrix)",
-        "3. [Power over Ethernet (PoE) Budget & Power Supply Sizing](#3-power-over-ethernet-poe-budget--power-supply-sizing)",
-        "4. [Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map](#4-layer-2-vlans-8021q-trunks--native-vlan-map)",
-        "5. [DHCP Relay & IP Helper Addresses (Migration Critical)](#5-dhcp-relay--ip-helper-addresses-migration-critical)",
-        "6. [Spanning Tree (STP) & Loop Prevention Plan](#6-spanning-tree-stp--loop-prevention-plan)",
-        "7. [First-Hop Redundancy Protocols (FHRP) & Gateway Migration](#7-first-hop-redundancy-protocols-fhrp--gateway-migration)",
-        "8. [Layer 3 Subnets, Routing Boundaries & WAN Egress](#8-layer-3-subnets-routing-boundaries--wan-egress)",
-        "9. [Security, Access Control Lists & NAT Policies](#9-security-access-control-lists--nat-policies)",
-        "10. [Infrastructure Services (DNS, NTP, Syslog, SNMP, AAA)](#10-infrastructure-services-dns-ntp-syslog-snmp-aaa)",
-        "11. [Proprietary Feature De-risking & Protocol Translation](#11-proprietary-feature-de-risking--protocol-translation)",
-        "12. [Maintenance Window Cutover Runbook & Rollback Plan](#12-maintenance-window-cutover-runbook--rollback-plan)",
-        "",
-        "---",
-        "",
-        "## 1. Executive Summary & Current Hardware Estate",
-        "",
-        "The following estate reflects the physical and virtual network appliances discovered during discovery. "
-        "Review model lifecycle status and recommended target architecture replacements:",
-        "",
-        "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Target Replacement Guidance |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+    if dns_domain:
+        lines.append(f"| **Detected DNS Domain** | `{dns_domain}` |")
+    lines.extend(
+        [
+            f"| **Discovery Execution Timestamp** | `{timestamp}` |",
+            f"| **Total Discovered Infrastructure Nodes** | `{total_nodes}` |",
+            "| **Read-Only Discovery Invariant** | Strictly Enforced (Zero Control-Plane Blast Radius) |",
+            "",
+            "---",
+            "",
+            "## Table of Contents",
+            "1. [Executive Summary & Current Hardware Estate](#1-executive-summary--current-hardware-estate)",
+            "2. [Physical Layer 1/2 Cabling, Optics & MTU Matrix](#2-physical-layer-12-cabling-optics--mtu-matrix)",
+            "3. [Power over Ethernet (PoE) Budget & Power Supply Sizing](#3-power-over-ethernet-poe-budget--power-supply-sizing)",
+            "4. [Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map](#4-layer-2-vlans-8021q-trunks--native-vlan-map)",
+            "5. [DHCP Relay & IP Helper Addresses (Migration Critical)](#5-dhcp-relay--ip-helper-addresses-migration-critical)",
+            "6. [Spanning Tree (STP) & Loop Prevention Plan](#6-spanning-tree-stp--loop-prevention-plan)",
+            "7. [First-Hop Redundancy Protocols (FHRP) & Gateway Migration](#7-first-hop-redundancy-protocols-fhrp--gateway-migration)",
+            "8. [Layer 3 Subnets, Routing Boundaries & WAN Egress](#8-layer-3-subnets-routing-boundaries--wan-egress)",
+            "9. [Security, Access Control Lists & NAT Policies](#9-security-access-control-lists--nat-policies)",
+            "10. [Infrastructure Services (DNS, NTP, Syslog, SNMP, AAA)](#10-infrastructure-services-dns-ntp-syslog-snmp-aaa)",
+            "11. [Proprietary Feature De-risking & Protocol Translation](#11-proprietary-feature-de-risking--protocol-translation)",
+            "12. [Maintenance Window Cutover Runbook & Rollback Plan](#12-maintenance-window-cutover-runbook--rollback-plan)",
+            "",
+            "---",
+            "",
+            "## 1. Executive Summary & Current Hardware Estate",
+            "",
+            "The following estate reflects the physical and virtual network appliances discovered during discovery. "
+            "Review model lifecycle status and recommended target architecture replacements:",
+            "",
+            "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Target Replacement Guidance |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
 
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip

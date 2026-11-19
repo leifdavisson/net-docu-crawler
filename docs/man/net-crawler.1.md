@@ -89,8 +89,8 @@ Every target flows through a 4-tier identification cascade (local ARP OUI with h
   (Default) Store deliverables under `deliverables/<Target>_<Timestamp>_<domain>/`.
 - `--no-organize`
   Write flat output directly to `--output-dir` without creating a timestamped subfolder.
-- `--domain SUFFIX`
-  Domain suffix for organized report folders (default: `lan`).
+- `--site LABEL`, `--domain LABEL`
+  Site/run folder label for organized deliverables `deliverables/<Target>_<Timestamp>_<site>/` (default: `auto`, which uses the detected DNS suffix's first label or falls back to `lan`). `--domain` is kept as a backwards-compatible alias.
 - `--sanitize-passwords`
   Redact passwords, pre-shared keys, and SNMP communities in saved configurations, logs, and exports.
 - `--target-vendor VENDOR`

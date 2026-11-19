@@ -983,12 +983,15 @@ def extract_neighbor_ips(
 def compute_organized_output_dir(
     targets: list[str],
     base_dir: str = "deliverables",
-    domain: str = "lan",
+    site: str = "auto",
+    domain: str = "",
 ) -> str:
     """
-    Computes a structured directory path: <base_dir>/<Subnet>_<TimeStamp>_<domain>/
+    Computes a structured directory path: <base_dir>/<Subnet>_<TimeStamp>_<site>/
     Example: deliverables/192.168.1.0-24_20261107_221530_lan
     """
+    from net_docu_crawler.domain_detector import detect_local_dns_suffix, domain_to_site_slug
+
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     scope_slug = "multi_target"
     if targets:
@@ -1002,7 +1005,11 @@ def compute_organized_output_dir(
             else:
                 scope_slug = targets[0].strip().replace("/", "-").replace(":", "-")
 
-    folder_name = f"{scope_slug}_{ts}_{domain}"
+    label = (domain or site or "auto").strip()
+    if not label or label.lower() == "auto":
+        label = domain_to_site_slug(detect_local_dns_suffix(), fallback="lan")
+
+    folder_name = f"{scope_slug}_{ts}_{label}"
     return os.path.join(base_dir, folder_name)
 
 
@@ -1011,7 +1018,8 @@ def crawl_network(
     credentials_path: str | list[str] = "credentials.json",
     output_dir: str = "",
     organize: bool = True,
-    domain: str = "lan",
+    site: str = "auto",
+    domain: str = "",
     sanitize_passwords: bool = False,
     timeout: int = 8,
     ssh_ports: list[int] | None = None,
@@ -1099,7 +1107,7 @@ def crawl_network(
     # Determine output destination (structured run folder vs legacy flat folder)
     if organize:
         base = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else "deliverables"
-        run_output_dir = compute_organized_output_dir(targets, base_dir=base, domain=domain)
+        run_output_dir = compute_organized_output_dir(targets, base_dir=base, site=site, domain=domain)
         is_organized = True
     elif not output_dir or output_dir == "auto":
         run_output_dir = "docs/net_docu_crawler"
@@ -1580,10 +1588,18 @@ def render_deliverables_from_dataset(
             )
 
     from net_docu_crawler.correlator import correlate_dataset
+    from net_docu_crawler.domain_detector import detect_environment_dns_domain
     from net_docu_crawler.quality_gates import evaluate_quality_gates, write_quality_report
 
     correlate_dataset(raw_devices)
+    dns_info = detect_environment_dns_domain(raw_devices)
     quality_report = evaluate_quality_gates(raw_devices)
+    if dns_info["primary_domain"]:
+        quality_report["dns_domain"] = dns_info["primary_domain"]
+    if dns_info["local_dns_suffix"]:
+        quality_report["local_dns_suffix"] = dns_info["local_dns_suffix"]
+    if dns_info["device_domains"]:
+        quality_report["device_domains"] = dns_info["device_domains"]
     manifest_dir = os.path.join(run_output_dir, "00_manifest")
     norm_dir = os.path.join(run_output_dir, "02_normalized")
     corr_dir = os.path.join(run_output_dir, "03_correlated")
@@ -1649,7 +1665,10 @@ def render_deliverables_from_dataset(
     # 1. Master Migration Blueprint (Network_Analysis.md)
     blueprint_path = os.path.join(run_output_dir, "Network_Analysis.md")
     report_generator.generate_master_network_analysis_migration_blueprint(
-        devices_dict, output_path=blueprint_path, scope=scope_label
+        devices_dict,
+        output_path=blueprint_path,
+        scope=scope_label,
+        dns_domain=dns_info["primary_domain"],
     )
     print(f"[+] Generated master migration blueprint: {blueprint_path}")
 
@@ -1660,7 +1679,11 @@ def render_deliverables_from_dataset(
 
     # 3. Standard deliverables (L2/L3 Diagrams, Asset Inventory, Cabling Matrix, Protocol Translation, Live Report)
     rep_path = os.path.join(run_output_dir, "net_docu_crawler_live_report.md")
-    report_generator.generate_network_analysis_report(devices_dict, output_path=rep_path)
+    report_generator.generate_network_analysis_report(
+        devices_dict,
+        output_path=rep_path,
+        dns_domain=dns_info["primary_domain"],
+    )
     print(f"[+] Generated network analysis report: {rep_path}")
 
     inv_path = os.path.join(run_output_dir, "asset_inventory.csv")
@@ -2073,17 +2096,19 @@ def main():
     parser.add_argument(
         "--organize",
         action="store_true",
-        help="(Default) Store deliverables in a structured folder: deliverables/<Subnet>_<TimeStamp>_<domain>/",
+        help="(Default) Store deliverables in a structured folder: deliverables/<Subnet>_<TimeStamp>_<site>/",
     )
     parser.add_argument(
         "--no-organize",
         action="store_true",
-        help="Write flat output directly to --output-dir without creating a <Subnet>_<TimeStamp>_<domain> subfolder",
+        help="Write flat output directly to --output-dir without creating a <Subnet>_<TimeStamp>_<site> subfolder",
     )
     parser.add_argument(
+        "--site",
         "--domain",
-        default="lan",
-        help="Domain suffix for organized report folders (default: lan)",
+        dest="site",
+        default="auto",
+        help="Site/run folder label for organized deliverables (default: auto-detected from DNS suffix, fallback 'lan')",
     )
     parser.add_argument(
         "--sanitize-passwords",
@@ -2277,7 +2302,7 @@ def main():
             credentials_path=args.credentials,
             output_dir=args.output_dir,
             organize=not args.no_organize,
-            domain=args.domain,
+            site=args.site,
             sanitize_passwords=args.sanitize_passwords,
             timeout=args.timeout,
             ssh_ports=args.ssh_ports,
