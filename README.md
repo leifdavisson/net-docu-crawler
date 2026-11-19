@@ -27,9 +27,9 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 flowchart LR
     Targets["Target IPs / Routed Subnets<br>(192.168.1.0/24, 172.16.1.0/24)"]
     Cascade["4-Tier Zero-Blast-Radius Cascade<br>1. Offline ARP OUI<br>2. TCP 22 SSH Banner<br>3. Post-Auth Prompt<br>4. Version Probe"]
-    Drivers["11 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
+    Drivers["12 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
     Registry["DeviceRegistry<br>- SVI and Hypervisor MAC Safe<br>- Global ARP Neighbor Resolution<br>- Bidirectional Link Stitching"]
-    Reports["Deliverables (docs/reports/)<br>- L2 and L3 Mermaid Topologies<br>- Asset Inventory and Cabling CSVs<br>- Health Audit and Migration Blueprint"]
+    Reports["Deliverables (deliverables/)<br>- L2 and L3 Mermaid Topologies<br>- Asset Inventory and Cabling CSVs<br>- Health Audit and Migration Blueprint"]
 
     Targets --> Cascade
     Cascade --> Drivers
@@ -110,17 +110,18 @@ python3 net_crawler.py --snmp --snmp-community public --organize
 
 ## Generated Deliverables
 
-When executed with `--organize` (or into `docs/net_docu_crawler/`), the crawler automatically builds an engineer-ready deliverable bundle:
+When executed (organized into `deliverables/<Target>_<Timestamp>_<domain>/` by default, or flat into `docs/net_docu_crawler/` with `--no-organize`), the crawler automatically builds an engineer-ready deliverable bundle:
 
 1. **`Network_Analysis.md`**: Complete Network Migration Blueprint tailored for network engineers (chassis migration, VLAN mappings, cabling schedules, routing and default gateway requirements, risk matrix).
 2. **`asset_inventory.csv`**: Normalized inventory (Hostname, IP, MAC, Vendor, Persona, Model, Firmware, Serial), including unauthenticated, unsupported, and ARP-discovered hosts.
-3. **`bom_hardware_sizing.csv`**: Hardware sizing & Bill-of-Materials rollup (port counts, PoE wattage budgets/draw, SFP/SFP+/QSFP optics totals).
-4. **`migration_cabling_matrix.csv`**: Physical port-by-port patching matrix with link speeds, duplex, and LLDP/CDP neighbor mapping.
+3. **`bom_hardware_sizing.csv`**: Hardware sizing & Bill-of-Materials rollup (port counts, PoE wattage budgets/draw, SFP/SFP+/QSFP optics totals; defaults target SKU sizing to Juniper unless `--target-vendor` is set).
+4. **`migration_cabling_matrix.csv`** & **`port_mac_endpoint_mapping.csv`**: Physical port-by-port patching matrix with link speeds, duplex, and LLDP/CDP neighbor mapping, plus switchport-to-MAC/OUI endpoint mapping.
 5. **`L2_network_diagrams.md`**: Interactive Mermaid physical switching diagram + Wireless Access Point overlay table.
 6. **`L3_network_diagrams.md`**: Authoritative VLAN, CIDR subnet ([netaddr](https://netaddr.readthedocs.io/)), and SVI routing topology diagram.
 7. **`net_docu_crawler_live_report.md`**: Layered L1–L7 network health analysis (interface utilization, STP root/blocking audit, CIDR conflict check, DNS/NTP/AAA posture, per-port L2 intent, routing peers/FHRP, DHCP, and PoE/optics sizing).
 8. **`cisco_to_target_translation.md`** *(and `target_migration_<vendor>.md` with `--target-vendor`)*: Cross-vendor configuration translation and staged target CLI.
-9. **`logs/`**: Complete operational and session audit logs capturing every driver decision and device interaction.
+9. **`net_docu_crawler_dataset.json`**, **`validate_cutover.sh`**, & **`failed_hosts.json`**: Canonical normalized JSON dataset (for `--from-dataset`), read-only post-cutover smoke test script, and unauthenticated/unsupported host log (for `--retry-failed`).
+10. **Layered Subdirectories (`00_manifest/`, `01_raw/`, `02_normalized/`, `03_correlated/`, `04_migration/`, `05_reports/`) & `logs/`**: Machine-readable CSVs, `00_manifest/data_quality_report.md`, `00_manifest/collection_manifest.json`, and complete operational/raw session logs.
 
 ---
 
@@ -129,7 +130,7 @@ When executed with `--organize` (or into `docs/net_docu_crawler/`), the crawler 
 * **[Junior Operator Playbook (Zero-Knowledge Beginner Guide)](docs/junior_operator_playbook.md)**: Beginner-friendly step-by-step walkthrough for technicians who only know basic IP concepts.
 * **[Agent & Contributor Architecture Guide](AGENTS.md)**: Operational guardrails, zero-blast-radius rules, and code architecture.
 * **[Driver Command Reference](docs/drivers/overview.md)**: Supported read-only CLI command matrices and transport notes for all 12 supported network operating systems.
-* **[Manual Page (`net-crawler(1)`)](docs/man/net-crawler.1)**: Full CLI reference (`man -l docs/man/net-crawler.1`).
+* **[Manual Page (`net-crawler(1)`)](docs/man/net-crawler.1.md)**: Full CLI reference.
 * **[Virtual Lab & Driver Roadmap](docs/proxmox_lab_and_driver_roadmap.md)**: Architecture and setup for virtualized multi-vendor Proxmox VE testbeds.
 
 ---

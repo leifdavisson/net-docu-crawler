@@ -12,12 +12,15 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 ## SYNOPSIS
 
 ```bash
+net-crawler [OPTIONS]
 python3 net_crawler.py [OPTIONS]
 ```
 
 ## DESCRIPTION
 
-`Net-Docu-Crawler` performs strictly read-only operational state discovery across heterogeneous network infrastructure ([Cisco IOS/IOS-XE/NX-OS/IOS-XR/SMB](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html), [Juniper Junos](https://www.juniper.net/documentation/product/us/en/junos-os/), [HP ProCurve / ArubaOS-S](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm), [Arista EOS](https://www.arista.com/en/um-eos), [Fortinet FortiOS](https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference), [Palo Alto PAN-OS](https://docs.paloaltonetworks.com/), [MikroTik RouterOS](https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface), [OPNsense](https://docs.opnsense.org/), [OpenWrt](https://openwrt.org/docs/start), and [FRRouting](https://docs.frrouting.org/)) using [Netmiko](https://github.com/ktbyers/netmiko), [Paramiko](https://www.paramiko.org/), and [netaddr](https://netaddr.readthedocs.io/), and generates L1/L2/L3 diagrams, cabling matrices, BOMs, and cutover validation scripts.
+`Net-Docu-Crawler` performs strictly read-only operational state discovery across heterogeneous network infrastructure ([Cisco IOS/IOS-XE/NX-OS/IOS-XR/SMB](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html), [Juniper Junos](https://www.juniper.net/documentation/product/us/en/junos-os/), [HP ProCurve / ArubaOS-S](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm), [ArubaOS-CX / ArubaOS](https://www.arubanetworks.com/techdocs/AOS-CX/), [Arista EOS](https://www.arista.com/en/um-eos), [Fortinet FortiOS](https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference), [Palo Alto PAN-OS](https://docs.paloaltonetworks.com/), [MikroTik RouterOS](https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface), [OPNsense](https://docs.opnsense.org/), [OpenWrt](https://openwrt.org/docs/start), and [FRRouting](https://docs.frrouting.org/)) using [Netmiko](https://github.com/ktbyers/netmiko), [Paramiko](https://www.paramiko.org/), and [netaddr](https://netaddr.readthedocs.io/), and generates L1/L2/L3 diagrams, cabling matrices, BOMs, and cutover validation scripts.
+
+Every target flows through a 4-tier identification cascade (local ARP OUI with hypervisor MAC bypass, TCP/22 SSH and TCP/23 Telnet banner inspection, HTTP/TLS fingerprinting, and post-auth prompt/version checks) with vendor-scoped credential ordering to avoid AAA/fail2ban lockouts. By default, `net-crawler` automatically chases CDP/LLDP neighbor management IPs hop-by-hop without scanning dead user subnets.
 
 ---
 
@@ -91,7 +94,7 @@ python3 net_crawler.py [OPTIONS]
 - `--sanitize-passwords`
   Redact passwords, pre-shared keys, and SNMP communities in saved configurations, logs, and exports.
 - `--target-vendor VENDOR`
-  Generate staged target-vendor migration CLI configs (`cisco`, `juniper`, `arista`, `hpprocurve`).
+  Generate staged target-vendor migration CLI configs (`cisco`, `juniper`, `arista`, `aruba`, `hpprocurve`, `fortinet`, `meraki`, or `persona=vendor` pairs such as `switch=juniper,ap=aruba`).
 
 ### Baseline Verification & Offline Modes
 
@@ -157,12 +160,32 @@ python3 net_crawler.py --reparse-logs deliverables/10.1.0.1_20261114_195759_lan/
 | `migration_cabling_matrix.csv` | Port-to-port uplink & AP cabling matrix |
 | `port_mac_endpoint_mapping.csv` | Switchport-to-MAC/OUI endpoint mapping |
 | `bom_hardware_sizing.csv` | Hardware replacement & PoE/optics sizing BOM |
-| `validate_cutover.sh` / `.ps1` | Read-only post-cutover smoke test scripts |
+| `validate_cutover.sh` | Read-only post-cutover smoke test script |
 | `failed_hosts.json` | Unauthenticated/unsupported host log for `--retry-failed` |
+| `00_manifest/` | `collection_manifest.json`, `data_quality_report.md`, and `failures.csv` |
+| `01_raw/` – `05_reports/` | Layered raw, normalized, correlated, migration, and report artifacts |
+| `logs/` | Audit logs and per-device `*_raw_session.log` CLI transcripts |
 
 ---
 
+## EXIT STATUS
+
+- `0` — Completed successfully.
+- `1` — Credential validation failed or an unrecoverable CLI error occurred.
+
+---
+
+## AUTHOR
+
+Leif Davisson `<leifdavisson@gmail.com>`
+
+## LICENSE
+
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
+
 ## SEE ALSO
 
-- Troff man page: [`docs/man/net-crawler.1`](net-crawler.1)
+- Project overview: [`README.md`](../../README.md)
+- Architecture & guardrails: [`AGENTS.md`](../../AGENTS.md)
 - Driver reference: [`docs/drivers/overview.md`](../drivers/overview.md)
+- Beginner guide: [`docs/junior_operator_playbook.md`](../junior_operator_playbook.md)

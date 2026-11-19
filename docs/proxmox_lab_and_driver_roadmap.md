@@ -63,12 +63,12 @@ flowchart TD
 | **Tier 1** | **Aruba / HPE** | AOS-CX, ArubaOS | Aruba 6100/6200/6300 CX, Instant APs (IAP-215/315/515) | `switch`, `ap` | **Implemented** ([`ArubaDriver`](../net_docu_crawler/drivers/aruba.py)) |
 | **Tier 1** | **Palo Alto Networks** | PAN-OS | PA-220, PA-440, PA-3200, PA-VM | `firewall` | **Implemented** ([`PaloAltoDriver`](../net_docu_crawler/drivers/paloalto.py)) |
 | **Tier 1** | **Fortinet** | FortiOS | FortiGate 40F, 60E/60F, 80F, 100F, VM | `firewall` | **Implemented** ([`FortinetDriver`](../net_docu_crawler/drivers/fortinet.py)) |
-| **Tier 2** | **Arista Networks** | EOS | 7050, 7280, 7020 Cloud & Spine Switches | `switch`, `router` | Next Candidate |
+| **Tier 2** | **Arista Networks** | EOS | 7050, 7280, 7020 Cloud & Spine Switches | `switch`, `router` | **Implemented** ([`AristaDriver`](../net_docu_crawler/drivers/arista.py)) |
 | **Tier 2** | **Ubiquiti** | EdgeOS / UniFi | EdgeSwitch 24/48, EdgeRouter ER-X / ER-4 | `switch`, `router` | Next Candidate |
 | **Tier 2** | **Ruckus / CommScope**| FastIron | ICX 7150, 7250, 7450 Campus Switches | `switch` | Planned |
 | **Tier 2** | **Extreme Networks** | EXOS, VOSS | Summit X440, X460-G2, VSP 7400 | `switch`, `router` | Planned |
 | **Tier 2** | **Dell Networking** | DNOS 6 / OS10 | N1500, N2000, N3000, S-Series | `switch` | Planned |
-| **Tier 3** | **MikroTik** | RouterOS | Cloud Router Switches (CRS326, CRS328), CCR | `switch`, `router` | Planned |
+| **Tier 3** | **MikroTik** | RouterOS | Cloud Router Switches (CRS326, CRS328), CCR | `switch`, `router` | **Implemented** ([`MikroTikDriver`](../net_docu_crawler/drivers/mikrotik.py)) |
 | **Tier 3** | **Check Point** | Gaia OS | Quantum Security Gateway 3600 / 6200 | `firewall` | Planned |
 | **Tier 3** | **SonicWall** | SonicOS | TZ370, TZ470, NSA 2700 | `firewall` | Planned |
 
@@ -76,7 +76,7 @@ flowchart TD
 
 ## 2. Driver Authoring Blueprint: The 7-Point Specification
 
-When adding a new hardware driver to `drivers/`, every driver class must implement [`BaseDriver`](../net_docu_crawler/drivers/base.py) and provide the following 7 parameters:
+When adding a new hardware driver to `net_docu_crawler/drivers/`, every driver class must implement [`BaseDriver`](../net_docu_crawler/drivers/base.py) and provide the following 7 parameters:
 
 ```
 +----------------------------------------------------------------------------------------+

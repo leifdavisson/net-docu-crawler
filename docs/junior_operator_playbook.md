@@ -177,7 +177,7 @@ The crawler will print real-time status messages showing its 4-tier discovery ca
     -> show ip route (Default gateway: 0.0.0.0/0 via 100.64.224.1)
 [*] Disconnecting SSH session cleanly... Done (0 orphaned VTY sessions).
 [+] Resolving network topology and building deliverables...
-[+] Deliverables organized in: docs/reports/192.168.1.1_20261108_143000_lan/
+[+] Deliverables organized in: deliverables/192.168.1.1_20261108_143000_lan/
 ```
 
 Congratulations! You just completed your first automated enterprise network crawl! 🎉
@@ -205,16 +205,16 @@ If the crawler says `Unknown Vendor` because a switch has a custom login message
 ```bash
 python net_crawler.py --targets 192.168.1.1 --vendor-hint cisco --organize
 ```
-*(Supported hints: `cisco`, `juniper`, `arista`, `aruba`, `mikrotik`, `fortinet`, `paloalto`, `opnsense`, `openwrt`, `frr`)*.
+*(Supported hints: `cisco`, `ciscosmb`, `juniper`, `arista`, `hpprocurve`, `aruba`, `mikrotik`, `fortinet`, `paloalto`, `opnsense`, `openwrt`, `frr`)*.
 
 ---
 
 ## 7. Phase 6: Delivering the Results to Your Team or Boss
 
-When you pass the `--organize` flag, the crawler creates a neat, timestamped folder inside `docs/reports/`:
+By default (or when you pass `--organize`), the crawler creates a neat, timestamped folder inside `deliverables/`:
 
 ```text
-docs/reports/192.168.1.0-24_20261108_143000_lan/
+deliverables/192.168.1.0-24_20261108_143000_lan/
 ├── Network_Analysis.md
 ├── asset_inventory.csv
 ├── migration_cabling_matrix.csv

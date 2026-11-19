@@ -13,7 +13,7 @@ Quick-reference runbook for running [`Net-Docu-Crawler`](../README.md) from a Wi
 
 ```powershell
 # Clone or pull latest updates
-git pull origin feature/windows-setup
+git pull origin main
 
 # Create and activate virtual environment
 python -m venv venv
@@ -48,7 +48,7 @@ Tagging each profile with `"vendor"` (e.g., `"fortinet"`, `"cisco"`, `"ciscosmb"
 .\venv\Scripts\python.exe net_crawler.py --targets 10.29.0.1/23 --follow-subnets --max-hops 2 --organize
 ```
 
-- Deliverables are saved to `deliverables/<target>_<timestamp>/`.
+- Deliverables are saved to `deliverables/<target>_<timestamp>_<domain>/`.
 - Raw CLI session transcripts and `crawler_execution.log` are saved under `deliverables/<run>/logs/`.
 - Any `unauthenticated` or `unsupported` targets are exported to `deliverables/<run>/failed_hosts.json`.
 
