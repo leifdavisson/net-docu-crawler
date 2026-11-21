@@ -349,3 +349,59 @@ def test_crawler_execution_logging():
             log_data = f.read()
         assert "Starting discovery probe on 192.168.1.1" in log_data
         assert "banner='SSH-2.0-FreeBSD'" in log_data
+
+
+def test_blueprint_manual_verification_section_flags_unmanaged_switches_and_failed_targets(tmp_path):
+    from report_generator import generate_master_network_analysis_migration_blueprint
+
+    devices = {
+        "192.168.1.3": {
+            "ip": "192.168.1.3",
+            "hostname": "desktop-switch",
+            "vendor": "Juniper Networks",
+            "model": "ex2300-c-12p",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "status": "success",
+            "interfaces_detail": {"ge-0/0/0": {"status": "up"}, "ge-0/0/1": {"status": "up"}},
+            "neighbors": [
+                {
+                    "local_port": "ge-0/0/0",
+                    "remote_device": "opnsense",
+                    "remote_port": "eth0",
+                    "l2_accuracy": "mac_inferred",
+                }
+            ],
+            "mac_table": [
+                {"interface": "ge-0/0/0", "mac": "aa:bb:cc:00:00:01", "vlan": "1"},
+                {"interface": "ge-0/0/0", "mac": "aa:bb:cc:00:00:02", "vlan": "1"},
+            ],
+        },
+        "192.168.1.12": {
+            "ip": "192.168.1.12",
+            "hostname": "pve",
+            "vendor": "FRRouting",
+            "model": "Debian",
+            "device_type": "server",
+            "device_persona": "server",
+            "status": "success",
+            "interfaces_detail": {"vmbr0": {"status": "up"}},
+        },
+        "192.168.1.50": {
+            "ip": "192.168.1.50",
+            "hostname": "sw-edge-unauth",
+            "vendor": "Netgear",
+            "model": "GS724T",
+            "mac_address": "00:14:6c:11:22:33",
+            "status": "unauthenticated",
+        },
+    }
+    out = str(tmp_path / "Network_Analysis.md")
+    generate_master_network_analysis_migration_blueprint(devices, output_path=out, failed_hosts_count=1)
+    with open(out, encoding="utf-8") as f:
+        txt = f.read()
+    assert "### 1.5 Manual Verification & Suspected Unmanaged / Unverified Switches" in txt
+    assert "`ge-0/0/0` | `2 MACs` (no direct LLDP/CDP)" in txt
+    assert "`192.168.1.50` | **sw-edge-unauth**" in txt
+    assert "Probable Switch / Network Appliance" in txt
+    assert "**pve** (`192.168.1.12`, `server`): Hypervisor / Linux L2 bridge host" in txt

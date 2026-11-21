@@ -3418,6 +3418,187 @@ def generate_cutover_runbook(
         print(f"[-] Error writing cutover runbook: {e}")
 
 
+_PROBABLE_NETWORK_VENDOR_HINTS = (
+    "cisco",
+    "juniper",
+    "aruba",
+    "hewlett",
+    "procurve",
+    "netgear",
+    "tp-link",
+    "tplink",
+    "ubiquiti",
+    "unifi",
+    "d-link",
+    "dlink",
+    "brocade",
+    "extreme",
+    "arista",
+    "mikrotik",
+    "zyxel",
+    "allied",
+    "trendnet",
+    "ruckus",
+    "fortinet",
+    "palo",
+    "opnsense",
+    "pfsense",
+    "frrouting",
+    "edgecore",
+    "mellanox",
+    "huawei",
+    "h3c",
+    "hp inc",
+)
+
+
+def _render_blueprint_manual_verification_section(devices: dict, unique_devs: dict) -> list[str]:
+    """Render Section 1.5: manual verification checklist for suspected unmanaged switches, failed/unsupported hosts, and bridges."""
+    lines: list[str] = [
+        "",
+        "### 1.5 Manual Verification & Suspected Unmanaged / Unverified Switches",
+        "",
+        "Items below were flagged from MAC forwarding tables, LLDP/CDP gaps, SSH/TLS probes, and non-infrastructure host crawls and require physical or administrative verification:",
+        "",
+    ]
+
+    # 1. Multi-MAC ports without direct LLDP/CDP + passthrough ports + uncrawled LLDP/CDP neighbors
+    crawled_hosts_lc = {(d.get("hostname") or ip).split(".")[0].strip().lower() for ip, d in unique_devs.items()}
+    suspected_l2_rows: list[str] = []
+    for ip, dev in unique_devs.items():
+        hostname = dev.get("hostname") or ip
+        nbrs = dev.get("neighbors") or []
+        direct_nbr_ports = {
+            normalize_interface_name(n.get("local_port", "")).lower()
+            for n in nbrs
+            if n.get("local_port") and n.get("l2_accuracy", "") != "mac_inferred"
+        }
+
+        macs_by_port: dict[str, set[str]] = {}
+        for entry in dev.get("mac_table") or []:
+            port = (entry.get("interface") or entry.get("port") or "").strip()
+            mac = (entry.get("mac") or "").strip().lower()
+            if not port or not mac or port.lower() in ("cpu", "self", "router", "switch"):
+                continue
+            macs_by_port.setdefault(port, set()).add(mac)
+
+        for port, macs in sorted(macs_by_port.items()):
+            norm_p = normalize_interface_name(port).lower()
+            if len(macs) >= 2 and norm_p not in direct_nbr_ports:
+                suspected_l2_rows.append(
+                    f"| **{hostname}** | `{port}` | `{len(macs)} MACs` (no direct LLDP/CDP) | Verify unmanaged switch, hypervisor vSwitch/bridge, or L2 aggregation hop |"
+                )
+
+        for n in nbrs:
+            if n.get("l2_accuracy") in ("virtual_passthrough", "multi_neighbor_port"):
+                suspected_l2_rows.append(
+                    f"| **{hostname}** | `{n.get('local_port', '')}` | Multi-neighbor transit (`{n.get('remote_device', '')}`) | Verify unmanaged switch or passthrough bridge on uplink |"
+                )
+            r_host = (n.get("remote_device") or "").split(".")[0].strip().lower()
+            if r_host and r_host not in crawled_hosts_lc:
+                plat = n.get("platform") or n.get("remote_platform") or n.get("device_type") or "Unknown"
+                suspected_l2_rows.append(
+                    f"| **{hostname}** | `{n.get('local_port', '')}` | Uncrawled neighbor `{n.get('remote_device', '')}` (`{plat}`) | Verify management IP/credentials or confirm unmanaged/external peer |"
+                )
+
+    if suspected_l2_rows:
+        lines.extend(
+            [
+                "#### Suspected Unmanaged Switches, Multi-MAC Ports & Uncrawled Neighbors",
+                "",
+                "| Switch Hostname | Port | Evidence | Manual Verification Action |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        lines.extend(suspected_l2_rows[:25])
+        if len(suspected_l2_rows) > 25:
+            lines.append(
+                f"| *...* | *...* | *{len(suspected_l2_rows) - 25} additional L2 verification item(s) omitted* | Review `port_mac_endpoint_mapping.csv` & `L2_network_diagrams.md` |"
+            )
+        lines.append("")
+
+    # 2. Unauthenticated / Unsupported / Discovered hosts (highlighting probable switches)
+    unverified_rows: list[tuple[bool, str]] = []
+    for ip, dev in devices.items():
+        st = str(dev.get("status", "")).strip().lower()
+        if st not in ("unauthenticated", "unsupported", "discovered"):
+            continue
+        hostname = dev.get("hostname") or ip
+        mac = dev.get("mac_address") or "N/A"
+        vendor = dev.get("vendor") or "Unknown"
+        model = dev.get("model") or ""
+        haystack = f"{vendor} {model} {hostname}".lower()
+        is_probable_sw = any(h in haystack for h in _PROBABLE_NETWORK_VENDOR_HINTS)
+        role_label = "Probable Switch / Network Appliance" if is_probable_sw else "Server / Endpoint / Unknown"
+        if st == "unsupported" and model.lower().startswith("ssh-"):
+            action = f"Legacy/unsupported SSH (`{model}`); verify via console, SNMP, or Web UI"
+        elif st == "unauthenticated":
+            action = "SSH reachable but auth failed; verify credentials or confirm non-network host"
+        else:
+            action = "Discovered via ARP/OUI only; verify if managed/unmanaged switch or endpoint"
+        row = f"| `{ip}` | **{hostname}** | `{mac}` | {vendor} | `{st}` | {role_label} | {action} |"
+        unverified_rows.append((is_probable_sw, row))
+
+    if unverified_rows:
+        # Sort probable switches / network appliances first
+        unverified_rows.sort(key=lambda x: (not x[0], x[1]))
+        lines.extend(
+            [
+                "#### Unauthenticated, Unsupported & Discovered Targets Requiring Verification",
+                "",
+                "| IP Address | Hostname | MAC Address | Vendor / OUI | Status | Suspected Role | Verification Action |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for _, row in unverified_rows[:25]:
+            lines.append(row)
+        if len(unverified_rows) > 25:
+            lines.append(
+                f"| *...* | *...* | *...* | *...* | *...* | *...* | *{len(unverified_rows) - 25} additional host(s) in `failed_hosts.json`* |"
+            )
+        lines.append("")
+
+    # 3. Non-infra crawled hosts (hypervisors, Linux bridges, monitoring servers) & shared MACs
+    non_infra_notes: list[str] = []
+    for ip, dev in devices.items():
+        if str(dev.get("status", "")).strip().lower() != "success" or _is_network_infra(dev):
+            continue
+        hostname = dev.get("hostname") or ip
+        ints = dev.get("interfaces_detail") or {}
+        has_bridge = any(k.lower().startswith(("vmbr", "virbr", "br")) for k in ints) or "pve" in hostname.lower()
+        note = (
+            "Hypervisor / Linux L2 bridge host (verify virtual switch uplinks to physical switches)"
+            if has_bridge
+            else "Non-network server/appliance excluded from network BOM"
+        )
+        non_infra_notes.append(f"- **{hostname}** (`{ip}`, `{dev.get('device_type', 'server')}`): {note}")
+
+    mac_to_ips: dict[str, list[str]] = {}
+    for ip, dev in devices.items():
+        mac = str(dev.get("mac_address") or "").strip().lower()
+        if mac:
+            mac_to_ips.setdefault(mac, []).append(
+                f"`{ip}` ({dev.get('hostname') or ip}, `{dev.get('status', 'unknown')}`)"
+            )
+    for mac, entries in sorted(mac_to_ips.items()):
+        if len(entries) > 1:
+            non_infra_notes.append(
+                f"- **Shared MAC `{mac}`** observed on multiple IPs: {', '.join(entries)} — verify VIP/secondary interface or virtual controller IP."
+            )
+
+    if non_infra_notes:
+        lines.append("#### Hypervisors, Non-Infrastructure Hosts & Shared MACs")
+        lines.append("")
+        lines.extend(non_infra_notes)
+        lines.append("")
+
+    if not suspected_l2_rows and not unverified_rows and not non_infra_notes:
+        lines.append("✓ **No suspected unmanaged switches, unverified targets, or bridge anomalies detected.**")
+        lines.append("")
+
+    return lines
+
+
 def generate_master_network_analysis_migration_blueprint(
     devices: dict,
     output_path: str = "Network_Analysis.md",
@@ -3448,6 +3629,7 @@ def generate_master_network_analysis_migration_blueprint(
     unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
     lines = _render_blueprint_header_and_toc(scope, dns_domain, timestamp, len(unique_devs))
     lines.extend(_render_blueprint_executive_summary_section(unique_devs, failed_hosts_count=failed_hosts_count))
+    lines.extend(_render_blueprint_manual_verification_section(devices, unique_devs))
     lines.extend(_render_blueprint_cabling_and_mtu_section(unique_devs))
     lines.extend(_render_blueprint_optics_section(unique_devs))
     lines.extend(_render_blueprint_mac_mapping_section(unique_devs))
