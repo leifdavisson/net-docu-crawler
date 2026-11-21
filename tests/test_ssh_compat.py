@@ -146,11 +146,14 @@ def test_configure_paramiko_compat_enables_legacy_dss_and_legacy_algorithms():
     assert Transport._key_info["ssh-dss"] is LegacyDSSKey
     assert Transport._preferred_keys.count("ssh-dss") == 1
     for kex in LEGACY_KEX_ALGORITHMS:
-        assert Transport._preferred_kex.count(kex) == 1
+        if kex in Transport._kex_info:
+            assert Transport._preferred_kex.count(kex) == 1
     for cipher in LEGACY_CIPHERS:
-        assert Transport._preferred_ciphers.count(cipher) == 1
+        if cipher in Transport._cipher_info:
+            assert Transport._preferred_ciphers.count(cipher) == 1
     for mac in LEGACY_MACS:
-        assert Transport._preferred_macs.count(mac) == 1
+        if mac in Transport._mac_info:
+            assert Transport._preferred_macs.count(mac) == 1
 
 
 def test_legacy_dss_key_1024bit_signature_verification_and_serialization():

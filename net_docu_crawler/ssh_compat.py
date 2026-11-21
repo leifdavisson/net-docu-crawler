@@ -185,6 +185,8 @@ class LegacyDSSKey(PKey):
         data: bytes | None = None,
         vals: tuple[int, int, int, int] | None = None,
         key: dsa.DSAPublicKey | dsa.DSAPrivateKey | None = None,
+        password: str | bytes | None = None,
+        **_unused: Any,
     ) -> None:
         self.public_blob = None
         if msg is None and data is not None:
