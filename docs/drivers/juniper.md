@@ -1,5 +1,6 @@
 <!--
 Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -19,35 +20,50 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 * **Driver Class**: [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py)
 * **Supported Platforms**: Juniper EX Series (EX2200, EX3300, EX4300), QFX Series, MX Series, SRX Branch Gateways
-* **Upstream Netmiko Device Type**: `juniper_junos`
-* **Official Documentation**: [Juniper JunOS Automation & Scripting](https://www.juniper.net/documentation/us/en/software/junos/automation-scripting/)
+* **Upstream Netmiko Device Type**: `juniper_junos` ([Netmiko](https://github.com/ktbyers/netmiko))
+* **Official Documentation**: [Juniper Junos Documentation](https://www.juniper.net/documentation/product/us/en/junos-os/) & [JunOS Automation & Scripting](https://www.juniper.net/documentation/us/en/software/junos/automation-scripting/)
 
 ---
 
-## 1. Connection Mechanics & Pagination
+## 1. Connection Mechanics, SSH Compatibility & Pagination
 
 JunOS does not recognize Cisco's `terminal length 0`. Sending it triggers a `% Syntax error`. Instead, JunOS requires:
 ```junos
 set cli screen-length 0
 set cli screen-width 0
 ```
-Netmiko applies this automatically when connecting with `device_type="juniper_junos"`.
+[Netmiko](https://github.com/ktbyers/netmiko) applies this automatically when connecting with `device_type="juniper_junos"`.
 
-## 2. Native JSON Architecture (`| display json`)
+### 3-Stage SSH Compatibility Ladder (`ssh_compat.py`)
 
-JunOS natively supports serialized JSON output across all operational commands. [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) takes advantage of this for 100% deterministic parsing:
+`JuniperDriver` connects via `BaseDriver.safe_netmiko_connect()` -> [`net_docu_crawler/ssh_compat.py`](../../net_docu_crawler/ssh_compat.py) ([Paramiko](https://www.paramiko.org/), [pyca/cryptography](https://cryptography.io/)):
+1. **Stage 1 (Standard + Hardened KEX)**: Pre-registers RFC 8731 `curve25519-sha256` and RFC 3526 `diffie-hellman-group18-sha512` for hardened Junos SSH daemons.
+2. **Stage 2 (Legacy KEX & `LegacyDSSKey` / `ssh-dss`)**: On `IncompatiblePeer` or KEX/host-key negotiation failure (e.g., legacy Junos 9.x–12.x EX/SRX switches), registers read-only `LegacyDSSKey` (`ssh-dss`) and legacy KEX/CBC/HMAC-SHA1 algorithms while keeping `disable_sha2_fix=False`.
+3. **Stage 3 (`disable_sha2_fix=True`)**: If Stage 2 fails negotiation, retries with `disable_sha2_fix=True` for `ssh-rsa` SHA-1-only peers.
+
+## 2. Native JSON Architecture (`| display json`) & L2 Trunk Telemetry
+
+JunOS natively supports serialized JSON output across all operational commands. [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) takes advantage of this for deterministic parsing:
 
 ```junos
 show version | display json
 show chassis hardware | display json
 show interfaces terse | display json
 show lldp neighbors detail | display json
+show ethernet-switching interfaces | display json
+show lacp interfaces | display json
+show spanning-tree interface | display json
 show route | display json
 show arp no-resolve | display json
 show ethernet-switching table | display json
 ```
 
-If a legacy JunOS release (e.g., JunOS < 12.x) does not support JSON serialization on a specific command, the driver automatically catches the exception and falls back to regular expression parsing.
+If a legacy JunOS release (e.g., JunOS < 14.2) does not support JSON serialization on a specific command, the driver automatically catches the exception and falls back to regular expression parsing (including text fallback for `show ethernet-switching interfaces`).
+
+### Trunk VLAN Mismatch Normalization (`port_profiles` & `trunk_audit.py`)
+- `show ethernet-switching interfaces` (`| display json` and text fallback) populates `oper_mode` (`"trunk"` / `"access"`) and `trunk_active_vlans`, while `show lacp interfaces` resolves member interfaces to `ae*` aggregate bundles.
+- In [`migration_parsers.py`](../../net_docu_crawler/migration_parsers.py), Junos trunk interfaces without `native-vlan-id` set `native_vlan="none"` and `native_vlan_tagged=True` (since Junos drops or treats untagged ingress differently unless `native-vlan-id` is configured); interfaces with `native-vlan-id <id>` record `native_vlan=<id>` and `native_vlan_tagged=False`.
+- L3 `vlan-tagging` subinterface units (`set interfaces ge-0/0/1 unit 10 vlan-id 10`) are synthesized onto the parent port with `is_subinterface_bundle=True` so [Cisco](cisco.md) dot1Q subinterface trunks and Junos `vlan-tagging` uplinks compare accurately in [`trunk_audit.py`](../../net_docu_crawler/trunk_audit.py).
 
 ## 3. The LLDP Neighbor IP Challenge & ARP Resolution
 
