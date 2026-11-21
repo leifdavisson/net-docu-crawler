@@ -41,8 +41,36 @@ class CiscoDriver(BaseDriver):
             self._safe_enable(conn)
         return conn
 
+    def crawl(self, conn) -> dict:
+        sh_ver = self._safe_send_command(conn, "show version")
+        prompt = self._safe_find_prompt(conn) or ""
+        if re.search(r"\b(?:Arista|vEOS|cEOS)\b", sh_ver, re.IGNORECASE) or "arista" in prompt.lower():
+            from net_docu_crawler.drivers.arista import AristaDriver
+
+            logger.info("[%s] Detected Arista EOS during CiscoDriver probe; delegating to AristaDriver.", self.ip)
+            self._safe_enable(conn)
+            arista_drv = AristaDriver(
+                ip=self.ip,
+                username=self.username,
+                password=self.password,
+                secret=self.secret,
+                timeout=self.timeout,
+                session_log=self.session_log,
+                port=self.port,
+                transport=self.transport,
+            )
+            arista_drv._prefetched_sh_ver = sh_ver
+            return arista_drv.crawl(conn)
+
+        self._prefetched_sh_ver = sh_ver
+        return super().crawl(conn)
+
     def get_version(self, conn) -> dict:
-        sh_ver = conn.send_command("show version")
+        sh_ver = getattr(self, "_prefetched_sh_ver", None)
+        if sh_ver is not None:
+            self._prefetched_sh_ver = None
+        else:
+            sh_ver = conn.send_command("show version")
         os_type = "cisco_ios"
         if "NX-OS" in sh_ver or "Nexus" in sh_ver:
             os_type = "cisco_nxos"
@@ -111,8 +139,17 @@ class CiscoDriver(BaseDriver):
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
         seen = set()
+        cdp_status = "unknown"
+        lldp_status = "unknown"
         try:
             sh_cdp = conn.send_command("show cdp neighbors detail")
+            cdp_low = (sh_cdp or "").lower()
+            if "cdp is not enabled" in cdp_low:
+                cdp_status = "disabled"
+            elif "invalid input" in cdp_low:
+                cdp_status = "unsupported"
+            else:
+                cdp_status = "enabled"
             for n in parser.parse_cdp_neighbors_detail(sh_cdp):
                 n["remote_platform"] = n.get("platform", "")
                 key = (n.get("local_port", ""), n.get("remote_device", "").lower())
@@ -123,7 +160,27 @@ class CiscoDriver(BaseDriver):
             logger.debug("[%s] Cisco show cdp neighbors detail failed: %s", self.ip, exc)
         try:
             sh_lldp = conn.send_command("show lldp neighbors detail")
-            for n in parser.parse_lldp_neighbors_detail(sh_lldp):
+            lldp_low = (sh_lldp or "").lower()
+            if "lldp is not enabled" in lldp_low:
+                lldp_status = "disabled"
+            elif "invalid input" in lldp_low:
+                lldp_status = "unsupported"
+            else:
+                lldp_status = "enabled"
+
+            lldp_entries = parser.parse_lldp_neighbors_detail(sh_lldp)
+            # IOS 12.x `show lldp neighbors detail` omits `Local Intf`; recover it from summary table if needed.
+            if lldp_status == "enabled" and any(not (e.get("local_port") or "").strip() for e in lldp_entries):
+                summary_ports = self._parse_lldp_summary_ports(conn)
+                for e in lldp_entries:
+                    if not (e.get("local_port") or "").strip():
+                        dev_key = (e.get("remote_device") or "").split(".")[0].lower()
+                        port_key = (e.get("remote_port") or "").lower()
+                        recovered = summary_ports.get((dev_key, port_key)) or summary_ports.get((dev_key, ""))
+                        if recovered:
+                            e["local_port"] = recovered
+
+            for n in lldp_entries:
                 n["remote_platform"] = n.get("platform", "")
                 lldp_name = (n.get("remote_device") or "").strip()
                 lldp_ip = (n.get("remote_ip") or "").strip()
@@ -162,7 +219,54 @@ class CiscoDriver(BaseDriver):
                     neighbors.append(n)
         except Exception as exc:
             logger.debug("[%s] Cisco show lldp neighbors detail failed: %s", self.ip, exc)
+
+        notes = ""
+        if lldp_status == "disabled":
+            notes = "LLDP is disabled on Cisco IOS; run 'lldp run' to discover non-Cisco LLDP neighbors."
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": cdp_status,
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
+
+    def _parse_lldp_summary_ports(self, conn) -> dict[tuple[str, str], str]:
+        """Fallback parser for `show lldp neighbors` summary table to recover Local Intf on IOS 12.x."""
+        mapping: dict[tuple[str, str], str] = {}
+        try:
+            raw = conn.send_command("show lldp neighbors")
+            for line in (raw or "").splitlines():
+                m = re.match(
+                    r"^\s*(\S+)\s+((?:Gi|Fa|Te|Tw|Eth|Po)\S+)\s+\d+\s+\S*\s+(\S+)\s*$",
+                    line,
+                    re.IGNORECASE,
+                )
+                if m:
+                    dev_id, local_intf, port_id = m.groups()
+                    dev_short = dev_id.split(".")[0].lower()
+                    mapping[(dev_short, port_id.lower())] = local_intf
+                    mapping.setdefault((dev_short, ""), local_intf)
+        except Exception as exc:
+            logger.debug("[%s] Cisco show lldp neighbors summary fallback failed: %s", self.ip, exc)
+        return mapping
+
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        status = super().get_discovery_protocols(conn, raw_config=raw_config, neighbors=neighbors)
+        cfg_low = (raw_config or "").lower()
+        if re.search(r"^\s*lldp run\b", cfg_low, re.MULTILINE):
+            status["lldp"] = "enabled"
+        elif re.search(r"^\s*no lldp run\b", cfg_low, re.MULTILINE):
+            status["lldp"] = "disabled"
+        if re.search(r"^\s*no cdp run\b", cfg_low, re.MULTILINE):
+            status["cdp"] = "disabled"
+        elif status["cdp"] == "unknown" and raw_config:
+            status["cdp"] = "enabled"
+        if status["lldp"] == "disabled" and not status["notes"]:
+            status["notes"] = "LLDP is disabled on Cisco IOS; run 'lldp run' to discover non-Cisco LLDP neighbors."
+        return status
 
     def get_stp(self, conn) -> dict:
         try:

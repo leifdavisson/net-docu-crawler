@@ -179,41 +179,98 @@ class MikroTikDriver(BaseDriver):
             logger.debug("[%s] RouterOS /ip neighbor print detail failed: %s", self.ip, exc)
         return neighbors
 
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        cfg_low = (raw_config or "").lower()
+        if "discover-interface-list=none" in cfg_low:
+            return {
+                "lldp": "disabled",
+                "cdp": "disabled",
+                "mndp": "disabled",
+                "notes": "RouterOS neighbor discovery disabled (discover-interface-list=none).",
+            }
+        return {"lldp": "enabled", "cdp": "enabled", "mndp": "enabled", "notes": ""}
+
     def get_routing_table(self, conn) -> list[dict]:
-        routes = []
-        seen = set()
+        routes_by_key: dict[tuple[str, str, str], dict] = {}
+        proto_rank = {"connected": 5, "static": 4, "ospf": 3, "bgp": 3, "rip": 3, "dhcp": 2, "dynamic": 1}
         try:
             raw = conn.send_command("/ip route print detail")
-            for block in re.split(r"(?:^|\n)\s*\d+\s+", raw):
+            blocks: list[str] = []
+            cur_lines: list[str] = []
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.lower().startswith("flags:"):
+                    continue
+                if "dst-address=" in line:
+                    if cur_lines:
+                        blocks.append(" ".join(cur_lines))
+                    cur_lines = [line]
+                elif cur_lines:
+                    cur_lines.append(line)
+            if cur_lines:
+                blocks.append(" ".join(cur_lines))
+
+            for block in blocks:
                 m_dst = re.search(r'dst-address=("[^"]+"|[^\s]+)', block)
+                if not m_dst:
+                    continue
+                flags_prefix = block.split("dst-address=", 1)[0]
+                flags_tok = re.sub(r"^\s*\d+\s*", "", flags_prefix)
+                flags_tok = re.sub(r"[\s+H]", "", flags_tok)
+                if "X" in flags_tok or "I" in flags_tok:
+                    continue
+
+                flags_low = flags_tok.lower()
+                if "c" in flags_low:
+                    proto = "connected"
+                elif "o" in flags_low:
+                    proto = "ospf"
+                elif "b" in flags_low:
+                    proto = "bgp"
+                elif "r" in flags_low:
+                    proto = "rip"
+                elif "s" in flags_low:
+                    proto = "static"
+                elif "d" in flags_tok:
+                    proto = "dhcp"
+                else:
+                    proto = "dynamic"
+
                 m_gw = re.search(r'(?:^|\s)gateway=("[^"]+"|[^\s]+)', block)
                 m_igw = re.search(r'immediate-gw=("[^"]+"|[^\s]+)', block)
-                if m_dst:
-                    subnet = _clean_ros_token(m_dst.group(1))
-                    next_hop = _clean_ros_token(m_gw.group(1)) if m_gw else "connected"
-                    intf = ""
-                    if m_igw and "%" in m_igw.group(1):
-                        intf = _clean_ros_token(m_igw.group(1).split("%", 1)[1])
-                    flags_prefix = block.strip().split("dst-address=", 1)[0]
-                    proto = (
-                        "connected"
-                        if "c" in flags_prefix.lower()
-                        else ("static" if "s" in flags_prefix.lower() else "dynamic")
-                    )
-                    key = (subnet, next_hop, proto)
-                    if key not in seen:
-                        seen.add(key)
-                        routes.append(
-                            {
-                                "subnet": subnet,
-                                "protocol": proto,
-                                "next_hop": next_hop,
-                                "interface": intf,
-                            }
-                        )
+                m_vrf_i = re.search(r'vrf-interface=("[^"]+"|[^\s]+)', block)
+                subnet = _clean_ros_token(m_dst.group(1))
+                gw_raw = _clean_ros_token(m_gw.group(1)) if m_gw else ""
+                igw_raw = _clean_ros_token(m_igw.group(1)) if m_igw else ""
+
+                intf = ""
+                if "%" in igw_raw:
+                    intf = igw_raw.split("%", 1)[1]
+                elif "%" in gw_raw:
+                    gw_raw, intf = gw_raw.split("%", 1)
+                elif m_vrf_i:
+                    intf = _clean_ros_token(m_vrf_i.group(1))
+
+                if proto == "connected":
+                    intf = intf or gw_raw or igw_raw
+                    next_hop = "connected"
+                else:
+                    next_hop = gw_raw or "connected"
+
+                key = (subnet, next_hop, intf)
+                existing = routes_by_key.get(key)
+                if existing is None or proto_rank.get(proto, 0) > proto_rank.get(existing["protocol"], 0):
+                    routes_by_key[key] = {
+                        "subnet": subnet,
+                        "protocol": proto,
+                        "next_hop": next_hop,
+                        "interface": intf,
+                    }
         except Exception as exc:
             logger.debug("[%s] RouterOS /ip route print detail failed: %s", self.ip, exc)
-        return routes
+        return list(routes_by_key.values())
 
     def get_arp_table(self, conn) -> list[dict]:
         arp_entries = []

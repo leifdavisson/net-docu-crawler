@@ -231,13 +231,19 @@ def parse_ip_interface_brief(output, os_type):
     lines = output.splitlines()
     for line in lines:
         line = line.strip()
-        if not line or "Interface" in line or "IP-Address" in line or "OK?" in line:
+        if (
+            not line
+            or set(line.replace(" ", "")) <= {"-", "="}
+            or "Interface" in line
+            or "IP-Address" in line
+            or "OK?" in line
+        ):
             continue
         parts = line.split()
         if len(parts) >= 4:
             interface = parts[0]
             ip_addr = parts[1]
-            if os_type == "cisco_xr":
+            if os_type == "cisco_xr" or (parts[2].lower() in ("up", "down") and parts[3].lower() in ("up", "down")):
                 status = parts[2]
                 protocol = parts[3]
             else:

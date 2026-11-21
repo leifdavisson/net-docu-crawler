@@ -203,9 +203,12 @@ class FRRDriver(BaseDriver):
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw = conn.send_command("lldpcli show neighbors -f json")
-            if raw.strip().startswith("{"):
+            if raw and raw.strip().startswith("{"):
+                lldp_status = "enabled"
                 data = json.loads(raw)
                 for lldp_entry in data.get("lldp", {}).get("interface", []):
                     for intf_name, info in lldp_entry.items():
@@ -223,8 +226,22 @@ class FRRDriver(BaseDriver):
                                 "device_type": "router",
                             }
                         )
+            else:
+                chk = (conn.send_command("command -v lldpcli >/dev/null 2>&1 || echo __NO_LLDPD__") or "").strip()
+                if "__NO_LLDPD__" in chk:
+                    lldp_status = "not_installed"
+                    notes = "L3-only router (FRR); lldpd is not installed."
+                else:
+                    lldp_status = "disabled"
+                    notes = "L3-only router (FRR); lldpd service returned no neighbor data."
         except Exception as exc:
             logger.debug("[%s] FRR lldpcli neighbor query failed: %s", self.ip, exc)
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:

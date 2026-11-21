@@ -190,10 +190,31 @@ class FortinetDriver(BaseDriver):
                     continue
                 parsed = self._parse_lldp_blocks(raw)
                 if parsed:
+                    self._discovery_protocols = {
+                        "lldp": "enabled",
+                        "cdp": "unsupported",
+                        "mndp": "unsupported",
+                        "notes": "",
+                    }
                     return parsed
             except Exception as exc:
                 logger.debug("[%s] FortiOS LLDP command '%s' failed: %s", self.ip, cmd, exc)
         return []
+
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        if neighbors:
+            return {"lldp": "enabled", "cdp": "unsupported", "mndp": "unsupported", "notes": ""}
+        cfg_low = (raw_config or "").lower()
+        if "set lldp-transmission enable" in cfg_low or "set lldp-reception enable" in cfg_low:
+            return {"lldp": "enabled", "cdp": "unsupported", "mndp": "unsupported", "notes": ""}
+        return {
+            "lldp": "disabled",
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": "FortiOS LLDP TX/RX is disabled by default; enable per-interface or globally.",
+        }
 
     def get_routing_table(self, conn) -> list[dict]:
         routes = []

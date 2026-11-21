@@ -25,6 +25,7 @@ Official Upstream Documentation & References:
 
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -272,13 +273,18 @@ class OPNsenseDriver(BaseDriver):
                 }
         except Exception as exc:
             logger.warning("OPNsense interface discovery failed on %s: %s", self.ip, exc)
+        self._last_l3_interfaces = l3_interfaces
+        self._last_interfaces_detail = interfaces_detail
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw = conn.send_command("lldpctl -f json 2>/dev/null")
             if raw and raw.strip().startswith("{"):
+                lldp_status = "enabled"
                 data = json.loads(raw)
                 for lldp_entry in data.get("lldp", {}).get("interface", []):
                     for intf_name, info in lldp_entry.items():
@@ -296,36 +302,87 @@ class OPNsenseDriver(BaseDriver):
                                 "device_type": "switch",
                             }
                         )
+            else:
+                chk = (conn.send_command("command -v lldpctl >/dev/null 2>&1 || echo __NO_LLDPD__") or "").strip()
+                if "__NO_LLDPD__" in chk:
+                    lldp_status = "not_installed"
+                    notes = "lldpd (os-lldpd plugin) is not installed on OPNsense."
+                else:
+                    lldp_status = "disabled"
+                    notes = "lldpctl returned no JSON output; lldpd service may be stopped."
         except (json.JSONDecodeError, TypeError, AttributeError) as exc:
             logger.debug("OPNsense LLDP JSON parse failed on %s: %s", self.ip, exc)
         except Exception as exc:
             logger.debug("OPNsense LLDP query failed on %s: %s", self.ip, exc)
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
+
+    def _resolve_truncated_netif(self, netif: str, subnet: str) -> str:
+        """Restore 12-char truncated FreeBSD `netstat -rn` Netif names (e.g. `vtnet0_vlan1` -> `vtnet0_vlan10`)."""
+        known = set(getattr(self, "_last_interfaces_detail", {}).keys())
+        if not known or netif in known:
+            return netif
+
+        try:
+            target_net = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            target_net = None
+
+        if target_net is not None:
+            for l3 in getattr(self, "_last_l3_interfaces", []):
+                intf_cand = str(l3.get("interface") or "")
+                ip_cand = str(l3.get("ip_address") or "")
+                if not intf_cand.startswith(netif) or "/" not in ip_cand:
+                    continue
+                try:
+                    if ipaddress.ip_interface(ip_cand).network == target_net:
+                        return intf_cand
+                except ValueError:
+                    continue
+
+        if len(netif) >= 12:
+            matches = [k for k in known if k.startswith(netif)]
+            if len(matches) == 1:
+                return matches[0]
+        return netif
 
     def get_routing_table(self, conn) -> list[dict]:
         routes = []
         try:
-            raw = conn.send_command("netstat -rn -f inet")
+            raw = conn.send_command("netstat -rnW -f inet")
+            if "Destination" not in (raw or ""):
+                raw = conn.send_command("netstat -rn -f inet")
             lines = raw.strip().splitlines()
             start = False
+            netif_idx = 3
             for line in lines:
                 if "Destination" in line and "Gateway" in line:
                     start = True
+                    hdr_cols = line.split()
+                    if "Netif" in hdr_cols:
+                        netif_idx = hdr_cols.index("Netif")
                     continue
                 if not start or not line.strip():
                     continue
                 parts = line.split()
-                if len(parts) >= 4:
+                if len(parts) > netif_idx:
                     dst = parts[0]
                     gw = parts[1]
                     flags = parts[2]
-                    netif = parts[3]
+                    netif = parts[netif_idx]
                     if dst == "127.0.0.1" or netif.startswith("lo"):
                         continue
+                    subnet = "0.0.0.0/0" if dst == "default" else dst
+                    netif = self._resolve_truncated_netif(netif, subnet)
                     proto = "static" if "S" in flags else "connected"
                     routes.append(
                         {
-                            "subnet": "0.0.0.0/0" if dst == "default" else dst,
+                            "subnet": subnet,
                             "protocol": proto,
                             "next_hop": gw,
                             "interface": netif,

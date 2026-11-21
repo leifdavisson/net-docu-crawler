@@ -415,6 +415,17 @@ class HPProCurveDriver(BaseDriver):
 
         return neighbors
 
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        cfg_low = (raw_config or "").lower()
+        lldp_status = "disabled" if re.search(r"^\s*no lldp run\b", cfg_low, re.MULTILINE) else "enabled"
+        cdp_status = "disabled" if re.search(r"^\s*no cdp run\b", cfg_low, re.MULTILINE) else "enabled"
+        notes = ""
+        if lldp_status == "disabled":
+            notes = "LLDP disabled via 'no lldp run' in ProCurve configuration."
+        return {"lldp": lldp_status, "cdp": cdp_status, "mndp": "unsupported", "notes": notes}
+
     def get_routing_table(self, conn) -> list[dict]:
         routes = []
         try:

@@ -120,8 +120,15 @@ class PaloAltoDriver(BaseDriver):
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw = conn.send_command("show lldp neighbors all")
+            if "lldp is not enabled" in (raw or "").lower() or "lldp is disabled" in (raw or "").lower():
+                lldp_status = "disabled"
+                notes = "LLDP is disabled on PAN-OS."
+            elif raw is not None:
+                lldp_status = "enabled"
             current: dict[str, str] = {}
             for line in raw.splitlines():
                 line = line.strip()
@@ -152,6 +159,12 @@ class PaloAltoDriver(BaseDriver):
         except Exception as exc:
             logger.debug("[%s] PAN-OS show lldp neighbors all failed: %s", self.ip, exc)
 
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:

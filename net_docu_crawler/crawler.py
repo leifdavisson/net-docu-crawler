@@ -53,6 +53,7 @@ from net_docu_crawler.drivers.detector import (
     get_arp_table_entries,
     get_mac_from_system_arp,
     infer_vendor_from_http,
+    is_hypervisor_mac,
     probe_appliance_ports,
     probe_http_fingerprint,
     probe_snmp_sysinfo,
@@ -578,11 +579,16 @@ def _connect_and_crawl_once(
             transport=transport,
         )
         conn = driver.connect()
-        succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
-        print(f"[+] {succ_msg}")
-        _log_event(log_file, succ_msg)
-        data = driver.crawl(conn)
-        conn.disconnect()
+        try:
+            succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
+            print(f"[+] {succ_msg}")
+            _log_event(log_file, succ_msg)
+            data = driver.crawl(conn)
+        finally:
+            try:
+                conn.disconnect()
+            except Exception as disc_exc:
+                logger.debug("Disconnect cleanup failed for %s: %s", ip, disc_exc)
         _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
         return data, "success"
     except Exception as e:
@@ -1746,46 +1752,59 @@ def _stitch_dataset_topology(raw_devices: list[dict], registry: DeviceRegistry) 
                 crawled_by_host[h_key.lower()] = d
                 crawled_by_host[h_key.split(".")[0].lower()] = d
 
-    registry.reconcile_reciprocal_neighbors(raw_devices)
-    registry.links.clear()
+    def _populate_links() -> None:
+        registry.links.clear()
+        for device_data in raw_devices:
+            local_host = device_data.get("hostname") or device_data.get("ip", "")
+            for nbr in device_data.get("neighbors", []):
+                if not nbr.get("remote_ip"):
+                    resolved_ip = registry.resolve_neighbor_ip(
+                        neighbor_mac=nbr.get("remote_mac", ""),
+                        neighbor_name=nbr.get("remote_device", ""),
+                    )
+                    if resolved_ip:
+                        nbr["remote_ip"] = resolved_ip
 
-    for device_data in raw_devices:
-        local_host = device_data.get("hostname") or device_data.get("ip", "")
-        for nbr in device_data.get("neighbors", []):
-            if not nbr.get("remote_ip"):
-                resolved_ip = registry.resolve_neighbor_ip(
-                    neighbor_mac=nbr.get("remote_mac", ""),
-                    neighbor_name=nbr.get("remote_device", ""),
+                canon_r = registry.resolve_canonical_hostname(
+                    nbr.get("remote_device", ""),
+                    remote_mac=nbr.get("remote_mac", ""),
+                    remote_ip=nbr.get("remote_ip", ""),
                 )
-                if resolved_ip:
-                    nbr["remote_ip"] = resolved_ip
+                if canon_r:
+                    nbr["remote_device"] = canon_r
 
-            matched_dev = crawled_by_ip.get(nbr.get("remote_ip", ""))
-            if not matched_dev and nbr.get("remote_device"):
-                r_key = nbr["remote_device"].split(".")[0].lower()
-                matched_dev = crawled_by_host.get(r_key)
+                matched_dev = crawled_by_ip.get(nbr.get("remote_ip", ""))
+                if not matched_dev and nbr.get("remote_device"):
+                    r_key = nbr["remote_device"].split(".")[0].lower()
+                    matched_dev = crawled_by_host.get(r_key)
 
-            if matched_dev:
-                if matched_dev.get("device_type"):
-                    nbr["device_type"] = matched_dev["device_type"]
-                if not nbr.get("platform"):
-                    plat_label = f"{matched_dev.get('vendor', '')} {matched_dev.get('model', '')}".strip()
-                    nbr["platform"] = plat_label
-                    nbr["remote_platform"] = plat_label
+                if matched_dev:
+                    if matched_dev.get("device_type"):
+                        nbr["device_type"] = matched_dev["device_type"]
+                    if not nbr.get("platform"):
+                        plat_label = f"{matched_dev.get('vendor', '')} {matched_dev.get('model', '')}".strip()
+                        nbr["platform"] = plat_label
+                        nbr["remote_platform"] = plat_label
 
-            n_type = (nbr.get("device_type") or "").lower()
-            l_class = (
-                "infra_uplink"
-                if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge"))
-                else "edge_endpoint"
-            )
-            registry.add_bidirectional_link(
-                local_node=local_host,
-                local_port=nbr.get("local_port", ""),
-                remote_node=nbr.get("remote_device", ""),
-                remote_port=nbr.get("remote_port", ""),
-                link_class=l_class,
-            )
+                n_type = (nbr.get("device_type") or "").lower()
+                l_class = (
+                    "infra_uplink"
+                    if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge"))
+                    else "edge_endpoint"
+                )
+                registry.add_bidirectional_link(
+                    local_node=local_host,
+                    local_port=nbr.get("local_port", ""),
+                    remote_node=nbr.get("remote_device", ""),
+                    remote_port=nbr.get("remote_port", ""),
+                    link_class=l_class,
+                )
+
+    _populate_links()
+    registry.reconcile_reciprocal_neighbors(raw_devices)
+    registry.infer_mac_table_links(raw_devices)
+    registry.detect_l2_anomalies(raw_devices)
+    _populate_links()
 
 
 def _update_latest_run_pointer(run_output_dir: str) -> None:
@@ -1849,6 +1868,10 @@ def _write_standard_deliverables(
     )
     print(f"[+] Generated master migration blueprint: {blueprint_path}")
 
+    runbook_path = os.path.join(run_output_dir, "cutover_runbook.md")
+    report_generator.generate_cutover_runbook(devices_dict, output_path=runbook_path, scope=scope_label)
+    print(f"[+] Generated cutover runbook: {runbook_path}")
+
     smoke_path = os.path.join(run_output_dir, "validate_cutover.sh")
     report_generator.generate_cutover_validation_script(devices_dict, output_path=smoke_path)
     print(f"[+] Generated cutover validation smoke script: {smoke_path}")
@@ -1900,6 +1923,7 @@ def _write_standard_deliverables(
         (bom_path, os.path.join(mig_dir, "bom_hardware_sizing.csv")),
         (smoke_path, os.path.join(mig_dir, "validate_cutover.sh")),
         (blueprint_path, os.path.join(rep_dir, "Network_Analysis.md")),
+        (runbook_path, os.path.join(rep_dir, "cutover_runbook.md")),
         (l2_path, os.path.join(rep_dir, "L2_network_diagrams.md")),
         (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
         (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
@@ -2023,6 +2047,121 @@ def _prepare_layered_dirs_and_quality_report(
     return trunk_audit, dns_info, norm_dir, mig_dir, rep_dir
 
 
+def _extract_device_owned_ips(dev: dict) -> set[str]:
+    """Return all non-loopback IPv4 addresses owned by a crawled device (`ip` + `l3_interfaces`)."""
+    owned: set[str] = set()
+    primary = str(dev.get("ip") or "").strip()
+    if primary:
+        owned.add(primary)
+    for l3 in dev.get("l3_interfaces", []) or []:
+        if not isinstance(l3, dict):
+            continue
+        raw_ip = str(l3.get("ip_address") or "").strip()
+        ip_tok = raw_ip.split("/")[0].split()[0].strip()
+        if ip_tok and ip_tok not in ("N/A", "unassigned", "0.0.0.0") and not ip_tok.startswith(("127.", "128.0.")):
+            owned.add(ip_tok)
+    return owned
+
+
+def _is_statically_configured_ip(dev: dict) -> bool:
+    """Return True if `dev['ip']` appears as an explicit static address in `raw_config`."""
+    ip = str(dev.get("ip") or "").strip()
+    cfg = str(dev.get("raw_config") or "")
+    if not ip or not cfg:
+        return False
+    return bool(
+        f"address={ip}/" in cfg
+        or re.search(rf"\bip\s+address\s+{re.escape(ip)}\b", cfg)
+        or f"<ipaddr>{ip}</ipaddr>" in cfg
+    )
+
+
+def reconcile_and_deduplicate_dataset(raw_devices: list[dict]) -> list[dict]:
+    """
+    Reconcile swarm member metadata (e.g., Aruba Instant AP serials/LLDP from Virtual Controller)
+    and deduplicate redundant records when a multi-IP device (secondary/DHCP + static IP, or
+    Aruba VC IP + Master AP IP) was crawled across multiple addresses in the same batch.
+    Mutates `raw_devices` in place and returns it.
+    """
+    swarm_aps_by_ip: dict[str, dict] = {}
+    swarm_aps_by_name: dict[str, dict] = {}
+    swarm_lldp_by_name: dict[str, list[dict]] = {}
+
+    for dev in raw_devices:
+        if not isinstance(dev, dict):
+            continue
+        for ap in dev.get("swarm_aps", []) or []:
+            if not isinstance(ap, dict):
+                continue
+            if ap.get("ip"):
+                swarm_aps_by_ip[str(ap["ip"])] = ap
+            if ap.get("name"):
+                swarm_aps_by_name[str(ap["name"]).lower()] = ap
+        for ap_name, nbrs in (dev.get("swarm_lldp") or {}).items():
+            if ap_name and isinstance(nbrs, list) and nbrs:
+                swarm_lldp_by_name.setdefault(str(ap_name).lower(), nbrs)
+
+    for dev in raw_devices:
+        if not isinstance(dev, dict) or dev.get("status") != "success":
+            continue
+        ip_val = str(dev.get("ip") or "").strip()
+        host_low = str(dev.get("hostname") or "").strip().lower()
+        ap_meta = swarm_aps_by_ip.get(ip_val) or swarm_aps_by_name.get(host_low)
+        if ap_meta:
+            ap_ser = str(ap_meta.get("serial") or "").strip()
+            if ap_ser and ap_ser != "Unknown" and str(dev.get("serial") or "Unknown") in ("", "Unknown"):
+                dev["serial"] = ap_ser
+        if not dev.get("neighbors") and host_low in swarm_lldp_by_name:
+            dev["neighbors"] = [dict(n) for n in swarm_lldp_by_name[host_low]]
+
+    # Deduplicate concurrent `success` crawls of two IPs on the exact same router/appliance
+    kept_success: list[dict] = []
+    non_success: list[dict] = []
+    for dev in raw_devices:
+        if not isinstance(dev, dict):
+            continue
+        if dev.get("status") != "success":
+            non_success.append(dev)
+            continue
+        dev_mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
+        dev_ips = _extract_device_owned_ips(dev)
+        dup_idx: int | None = None
+        for idx, prev in enumerate(kept_success):
+            prev_mac = oui_lookup.normalize_mac(str(prev.get("mac_address") or "")).lower().strip()
+            if not dev_mac or dev_mac != prev_mac or dev.get("vendor") != prev.get("vendor"):
+                continue
+            prev_ips = _extract_device_owned_ips(prev)
+            if dev.get("ip") in prev_ips and prev.get("ip") in dev_ips:
+                dup_idx = idx
+                break
+        if dup_idx is None:
+            kept_success.append(dev)
+        elif _is_statically_configured_ip(dev) and not _is_statically_configured_ip(kept_success[dup_idx]):
+            kept_success[dup_idx] = dev
+
+    # Drop partial (`unauthenticated`/`unsupported`/`discovered`) shadows of already-authenticated devices
+    success_owned_ips: set[str] = set()
+    success_hw_macs: set[str] = set()
+    for dev in kept_success:
+        success_owned_ips.update(_extract_device_owned_ips(dev))
+        mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
+        if mac and mac != "00:00:00:00:00:00" and not is_hypervisor_mac(mac):
+            success_hw_macs.add(mac)
+
+    kept_partials: list[dict] = []
+    for dev in non_success:
+        ip_val = str(dev.get("ip") or "").strip()
+        mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
+        if ip_val in success_owned_ips:
+            continue
+        if mac and not is_hypervisor_mac(mac) and mac in success_hw_macs:
+            continue
+        kept_partials.append(dev)
+
+    raw_devices[:] = kept_success + kept_partials
+    return raw_devices
+
+
 def render_deliverables_from_dataset(
     raw_devices: list[dict],
     registry: DeviceRegistry | None = None,
@@ -2042,11 +2181,13 @@ def render_deliverables_from_dataset(
     """
     os.makedirs(run_output_dir, exist_ok=True)
     enrich_devices_from_dhcp_reservations(raw_devices)
-    if registry is None:
-        registry = DeviceRegistry()
-        for dev in raw_devices:
-            if isinstance(dev, dict):
-                registry.register_device(dev)
+    reconcile_and_deduplicate_dataset(raw_devices)
+    prior_arp = dict(registry.global_arp) if registry is not None else {}
+    registry = DeviceRegistry()
+    registry.global_arp.update(prior_arp)
+    for dev in raw_devices:
+        if isinstance(dev, dict):
+            registry.register_device(dev)
 
     _stitch_dataset_topology(raw_devices, registry)
     trunk_audit, dns_info, norm_dir, mig_dir, rep_dir = _prepare_layered_dirs_and_quality_report(
@@ -2137,10 +2278,26 @@ class LogReplayConnection:
         cleaned = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log_text)
         cleaned = re.sub(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])", "", cleaned).replace("\r", "")
         lines = cleaned.splitlines()
+        if "--- COMMAND: " in cleaned:
+            cur_cmd: str | None = None
+            cur_buf: list[str] = []
+            for ln in lines:
+                m_opn = re.match(r"^---\s*COMMAND:\s*(.+?)\s*---\s*$", ln)
+                if m_opn:
+                    if cur_cmd is not None:
+                        self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
+                    cur_cmd = m_opn.group(1).strip()
+                    cur_buf = []
+                elif cur_cmd is not None:
+                    cur_buf.append(ln)
+            if cur_cmd is not None:
+                self.commands[cur_cmd] = "\n".join(cur_buf).strip("\n")
+            return
+
         base_prompt = ""
         prompt_re = None
         for ln in lines:
-            m = re.match(r"^([A-Za-z0-9._@-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
+            m = re.match(r"^(\[?[A-Za-z0-9._@:~/-]+\]?)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
             if m:
                 base_prompt = m.group(1)
                 prompt_re = re.compile(rf"^{re.escape(base_prompt)}(?:\s*\([^)]+\))?\s*[#>$]\s*(.*)$")
@@ -2218,20 +2375,35 @@ def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
         "frrouting": "frrouting",
     }
     low = log_text.lower()
-    if "fortigate" in low or "fortios" in low or "get system status" in low or "config system interface" in low:
+    if "/conf/config.xml" in low or "opnsense-version" in low or "<opnsense>" in low:
+        return "opnsense"
+    if "get system status" in low or "config system global" in low or "config-version=fgt" in low or "fortios" in low:
         return "fortinet"
     if "junos" in low or "show chassis hardware" in low:
         return "juniper"
+    if (
+        "arubaos" in low
+        or "aruba operating system" in low
+        or "virtual-controller-ip" in low
+        or "show ap debug lldp" in low
+    ):
+        return "aruba"
     if "procurve" in low or "arubaos-s" in low or "show power-over-ethernet brief" in low or "hp j" in low:
         return "hpprocurve"
-    if "arista" in low or "eos" in low:
+    if re.search(r"\b(?:arista|veos|ceos)\b", low) or "eos-" in low:
         return "arista"
-    if "mikrotik" in low or "/system identity" in low:
+    if "/system identity" in low or "/ip route print" in low or "mikrotik routeros" in low:
         return "mikrotik"
-    if "opnsense" in low or "/conf/config.xml" in low:
-        return "opnsense"
-    if "openwrt" in low or "ubus call" in low:
+    if "ubus call" in low or "uci export" in low or "openwrt" in low:
         return "openwrt"
+    if "frrouting" in low or "vtysh" in low or "ip -j addr" in low:
+        return "frrouting"
+    if "fortigate" in low or "config system interface" in low:
+        return "fortinet"
+    if "opnsense" in low:
+        return "opnsense"
+    if "mikrotik" in low:
+        return "mikrotik"
     if "cisco ios" in low or "show ip interface brief" in low or "show cdp neighbors detail" in low:
         return "cisco"
     if ev in _alias:

@@ -580,12 +580,16 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                     "is_blocked": is_blocked,
                     "speed": speed_val,
                     "port_channel": po_name,
+                    "l2_accuracy": n.get("l2_accuracy", ""),
                 }
             )
 
     for (id_a, id_b), links in connections.items():
         # Determine stp status: blocked if any link in bundle is blocked
         is_blocked = any(lk["is_blocked"] for lk in links)
+        accuracies = {lk.get("l2_accuracy", "") for lk in links if lk.get("l2_accuracy")}
+        is_mac_inferred = "mac_inferred" in accuracies
+        is_passthrough = bool(accuracies & {"virtual_passthrough", "multi_neighbor_port"})
 
         # Sort and select speeds
         def speed_key(s):
@@ -623,12 +627,23 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                     port_pairs.append(lp)
             label = ", ".join(sorted(set(port_pairs)))
 
+        if is_mac_inferred:
+            label = f"{label} [MAC Inferred]"
+        elif is_passthrough:
+            label = f"{label} [Passthrough/Transit]"
+
         clean_label = label.replace('"', '\\"')
 
         if is_blocked:
             # Dotted red line for blocked paths
             lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
             link_styles.append(f"  linkStyle {link_idx} stroke:#ff3333,stroke-width:{thickness},stroke-dasharray: 5 5;")
+        elif is_mac_inferred:
+            lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
+            link_styles.append(f"  linkStyle {link_idx} stroke:#e67e22,stroke-width:{thickness},stroke-dasharray: 5 5;")
+        elif is_passthrough:
+            lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
+            link_styles.append(f"  linkStyle {link_idx} stroke:#8e44ad,stroke-width:{thickness},stroke-dasharray: 5 5;")
         else:
             # Thick line with port labels
             lines.append(f'  {id_a} ==>|"{clean_label}"| {id_b}')
@@ -651,6 +666,8 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             "* **Blue Node**: Core / Distribution switches.",
             "* **Grey Node**: Access switches.",
             "* **Dashed Red Lines**: STP Blocking (`BLK`) links.",
+            "* **Dashed Orange Lines**: MAC-table inferred links (LLDP/CDP unavailable on peer).",
+            "* **Dashed Purple Lines**: Virtual/bridge passthrough or multi-neighbor transit links.",
             "* **Double Solid Lines**: Active forwarding links (line thickness indicates speed).",
             "",
         ]
@@ -726,12 +743,14 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
             r_host = (n.get("remote_device") or "").split(".")[0].lower()
             if not n_type and r_host in crawled_host_types:
                 n_type = crawled_host_types[r_host]
+            if n_type and n_type != "ap":
+                continue
             if (
                 n_type == "ap"
-                or "ap" in platform
+                or re.search(r"\bap\b", platform)
                 or "air-" in platform
                 or "access point" in platform
-                or "aruba" in platform
+                or ("aruba" in platform and "arubaos" not in platform)
             ):
                 ap_count += 1
                 ap_table.append(
@@ -758,6 +777,36 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         )
         for shost, sip, smodel in standalone_devs:
             lines.append(f"| **{shost}** | `{sip}` | `{smodel}` |")
+
+    lines.extend(
+        [
+            "",
+            "## L2 Discovery Coverage & Accuracy Audit",
+            "Per-device LLDP/CDP operational status and topology caveats (explains unlinked, MAC-inferred, or passthrough edges):",
+            "",
+            "| Hostname | IP | Persona | LLDP | CDP | Neighbors | Notes / Accuracy Caveats |",
+            "| :--- | :--- | :--- | :--- | :--- | :---: | :--- |",
+        ]
+    )
+    for ip, dev in devices.items():
+        hostname = dev.get("hostname") or ip
+        persona = dev.get("device_persona") or dev.get("device_type") or "unknown"
+        dp = dev.get("discovery_protocols") or {}
+        lldp_st = dp.get("lldp", "unknown")
+        cdp_st = dp.get("cdp", "unsupported")
+        nbrs = dev.get("neighbors") or []
+        note_parts = [dp["notes"]] if dp.get("notes") else []
+        acc_notes = sorted({n.get("l2_accuracy_note", "") for n in nbrs if n.get("l2_accuracy_note")})
+        note_parts.extend(acc_notes)
+        if not nbrs and not note_parts:
+            if persona == "router":
+                note_parts.append("L3 router with no L2 LLDP/CDP neighbors learned")
+            else:
+                note_parts.append("No LLDP/CDP neighbors learned")
+        notes_str = "; ".join(note_parts) if note_parts else "Direct LLDP/CDP visibility"
+        lines.append(
+            f"| **{hostname}** | `{ip}` | `{persona}` | `{lldp_st}` | `{cdp_st}` | {len(nbrs)} | {notes_str} |"
+        )
 
     try:
         from net_docu_crawler.diagram_validator import validate_mermaid_block
@@ -958,11 +1007,11 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
             if clean_ip.startswith(("127.", "128.0.")):
                 continue
-            subnet_range = (
-                svi_row.get("prefix_cidr")
-                or svi_row.get("subnet")
-                or (f"{net.network}/{net.prefixlen}" if net else "N/A")
-            )
+            parsed_subnet = f"{net.network}/{net.prefixlen}" if net else ""
+            if parsed_subnet and net.prefixlen < 32:
+                subnet_range = parsed_subnet
+            else:
+                subnet_range = svi_row.get("prefix_cidr") or svi_row.get("subnet") or parsed_subnet or "N/A"
             lines.append(
                 f"| {hostname} | {intf_name} | {vlan_id_str or 'N/A'} | {vlan_name or 'N/A'} | {desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
             )
@@ -2476,9 +2525,8 @@ def _render_blueprint_header_and_toc(scope: str, dns_domain: str, timestamp: str
     lines = [
         "# Network Migration Analysis Blueprint & Engineering Cutover Dossier",
         "",
-        "> **Notice**: This document is an authoritative, multi-tier network engineering analysis compiled "
-        "from live operational telemetry and configuration running-states. It contains the complete technical specification "
-        "required for bill-of-materials validation, physical patching, L2/L3 configuration migration, and maintenance-window execution.",
+        "> **Executive Overview**: High-level discovery readiness, cutover risk scorecard, hardware/L2/L3 summaries, "
+        "and clickable links to all breakout reports and CSV matrices compiled from strictly read-only telemetry.",
         "",
         "| Attribute | Migration Scope Value |",
         "| :--- | :--- |",
@@ -2512,20 +2560,176 @@ def _render_blueprint_header_and_toc(scope: str, dns_domain: str, timestamp: str
     return lines
 
 
-def _render_blueprint_executive_summary_section(unique_devs: dict) -> list[str]:
-    """Render Section 1: Executive Summary & Current Hardware Estate."""
+def _collect_discovery_readiness_metrics(unique_devs: dict, failed_hosts_count: int = 0) -> dict:
+    """Compute discovery confidence, L2 link accuracy, and SPOF/blocker flags from crawled devices."""
+    lldp_enabled = 0
+    lldp_missing: list[tuple[str, str, str]] = []
+    cdp_enabled = 0
+    total_nbrs = 0
+    direct_nbrs = 0
+    mac_inferred_nbrs = 0
+    passthrough_nbrs = 0
+    passthrough_notes: list[str] = []
+    high_poe: list[str] = []
+    gw_devs: list[str] = []
+    fhrp_total = 0
+    total_ports = 0
+    up_ports = 0
+
+    for ip, dev in unique_devs.items():
+        hostname = dev.get("hostname") or ip
+        persona = (dev.get("device_persona") or dev.get("device_type") or "").lower()
+        dp = dev.get("discovery_protocols") or {}
+        lldp_st = dp.get("lldp", "unknown")
+        cdp_st = dp.get("cdp", "unsupported")
+        nbrs = dev.get("neighbors") or []
+        if lldp_st == "enabled":
+            lldp_enabled += 1
+        elif lldp_st in ("disabled", "not_installed") or (lldp_st == "unknown" and not nbrs and cdp_st != "enabled"):
+            reason = dp.get("notes") or (
+                "No LLDP/CDP neighbors learned and protocol status unknown" if lldp_st == "unknown" else ""
+            )
+            lldp_missing.append((hostname, lldp_st, reason))
+        if cdp_st == "enabled":
+            cdp_enabled += 1
+
+        total_nbrs += len(nbrs)
+        for n in nbrs:
+            acc = n.get("l2_accuracy", "")
+            if acc == "mac_inferred":
+                mac_inferred_nbrs += 1
+            elif acc in ("virtual_passthrough", "multi_neighbor_port"):
+                passthrough_nbrs += 1
+                note = f"**{hostname}** (`{n.get('local_port', '')}` ↔ **{n.get('remote_device', '')}**): {n.get('l2_accuracy_note', acc)}"
+                if note not in passthrough_notes:
+                    passthrough_notes.append(note)
+            else:
+                direct_nbrs += 1
+
+        poe = dev.get("poe") or {}
+        tot_w = float(poe.get("total_power_watts") or 0.0)
+        used_w = float(poe.get("used_power_watts") or 0.0)
+        if tot_w > 0 and (used_w / tot_w) > 0.80:
+            high_poe.append(f"**{hostname}** ({used_w:.1f}W / {tot_w:.1f}W, {used_w / tot_w * 100:.1f}%)")
+
+        if persona in ("firewall", "router"):
+            gw_devs.append(hostname)
+        fhrp_total += len(dev.get("fhrp") or [])
+
+        ints_detail = dev.get("interfaces_detail") or {}
+        total_ports += len(ints_detail)
+        up_ports += sum(1 for s in ints_detail.values() if str((s or {}).get("status", "")).lower() == "up")
+
+    single_gw_spof = len(gw_devs) == 1 and fhrp_total == 0
+    if failed_hosts_count > 0:
+        gate = "BLOCKED"
+    elif lldp_missing or mac_inferred_nbrs or passthrough_nbrs or high_poe or single_gw_spof:
+        gate = "READY WITH CAVEATS"
+    else:
+        gate = "READY"
+
+    return {
+        "gate": gate,
+        "failed_hosts_count": failed_hosts_count,
+        "lldp_enabled": lldp_enabled,
+        "lldp_missing": lldp_missing,
+        "cdp_enabled": cdp_enabled,
+        "total_nbrs": total_nbrs,
+        "direct_nbrs": direct_nbrs,
+        "mac_inferred_nbrs": mac_inferred_nbrs,
+        "passthrough_nbrs": passthrough_nbrs,
+        "passthrough_notes": passthrough_notes,
+        "high_poe": high_poe,
+        "gw_devs": gw_devs,
+        "single_gw_spof": single_gw_spof,
+        "total_ports": total_ports,
+        "up_ports": up_ports,
+    }
+
+
+def _render_blueprint_executive_summary_section(unique_devs: dict, failed_hosts_count: int = 0) -> list[str]:
+    """Render Section 1: Executive Summary, Deliverables Index, Risks & Hardware Estate."""
+    metrics = _collect_discovery_readiness_metrics(unique_devs, failed_hosts_count=failed_hosts_count)
+    total_nodes = len(unique_devs)
+    gate_badge = (
+        f"❌ **{metrics['gate']}**"
+        if metrics["gate"] == "BLOCKED"
+        else (f"⚠️ **{metrics['gate']}**" if metrics["gate"] == "READY WITH CAVEATS" else "✅ **READY**")
+    )
+
+    lldp_assess = (
+        "✓ Full protocol coverage"
+        if not metrics["lldp_missing"]
+        else f"⚠ {len(metrics['lldp_missing'])} device(s) lack LLDP"
+    )
     lines = [
         "",
         "---",
         "",
         "## 1. Executive Summary & Current Hardware Estate",
         "",
-        "The following estate reflects the physical and virtual network appliances discovered during discovery. "
-        "Review model lifecycle status and recommended target architecture replacements:",
+        "### 1.1 Discovery Confidence & Cutover Readiness Scorecard",
         "",
-        "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Target Replacement Guidance |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| Readiness Indicator | Observed Value | Assessment |",
+        "| :--- | :--- | :--- |",
+        f"| **Cutover Readiness Gate** | {gate_badge} | Based on crawl coverage, L2 visibility & SPOF checks |",
+        f"| **Crawled Infrastructure Nodes** | `{total_nodes}` succeeded / `{metrics['failed_hosts_count']}` failed | "
+        f"{'✓ Complete scope' if metrics['failed_hosts_count'] == 0 else '⚠ Review failed_hosts.json'} |",
+        f"| **L2 Protocol Visibility (LLDP / CDP)** | `{metrics['lldp_enabled']}/{total_nodes}` LLDP enabled (`{metrics['cdp_enabled']}` CDP) | {lldp_assess} |",
+        f"| **L2 Adjacency Confidence** | `{metrics['direct_nbrs']}` direct / `{metrics['mac_inferred_nbrs']}` MAC-inferred / `{metrics['passthrough_nbrs']}` passthrough | "
+        f"{'✓ Direct cabling verified' if not (metrics['mac_inferred_nbrs'] or metrics['passthrough_nbrs']) else '⚠ Verify dashed links in L2 diagram'} |",
+        f"| **Total Interface Footprint** | `{metrics['up_ports']}` up / `{metrics['total_ports']}` total interfaces | See `migration_cabling_matrix.csv` |",
+        "",
+        "### 1.2 Deliverables & Breakout Reports Index",
+        "",
+        "| Deliverable | Purpose | Audience |",
+        "| :--- | :--- | :--- |",
+        "| [L2_network_diagrams.md](./L2_network_diagrams.md) | Physical L2 Mermaid graph, wireless AP overlay & per-device LLDP/CDP audit | Managers & Engineers |",
+        "| [L3_network_diagrams.md](./L3_network_diagrams.md) | Layer 3 routed topology, subnets & CIDR conflict audit | Managers & Engineers |",
+        "| [cutover_runbook.md](./cutover_runbook.md) | Standalone maintenance-window execution sequence, T-minus checklist & rollback plan | Cutover Lead |",
+        "| [trunk_vlan_audit.md](./trunk_vlan_audit.md) | 802.1Q trunk symmetry & native VLAN mismatch audit | Switching Engineer |",
+        "| [net_docu_crawler_live_report.md](./net_docu_crawler_live_report.md) | Full per-device interface telemetry, errors & operational state | Engineers |",
+        "| [cisco_to_target_translation.md](./cisco_to_target_translation.md) | Protocol & CLI migration translation reference | Engineers |",
+        "| [asset_inventory.csv](./asset_inventory.csv) / [bom_hardware_sizing.csv](./bom_hardware_sizing.csv) | Hardware serials, firmware & vendor-neutral port/PoE sizing BOM | Procurement & PM |",
+        "| [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) / [port_mac_endpoint_mapping.csv](./port_mac_endpoint_mapping.csv) | Complete port-by-port patch matrix & learned endpoint MAC mapping | Field Cabling Techs |",
+        "| [validate_cutover.sh](./validate_cutover.sh) / [validate_cutover.ps1](./validate_cutover.ps1) | Automated pre/post-cutover reachability & DNS smoke tests | Cutover Lead |",
+        "| [net_docu_crawler_dataset.json](./net_docu_crawler_dataset.json) / [failed_hosts.json](./failed_hosts.json) | Canonical raw JSON dataset & failed target retry list | Automation / Audit |",
+        "",
+        "### 1.3 Cutover Risks, Blind Spots & Single Points of Failure (SPOF)",
+        "",
     ]
+
+    risks: list[str] = []
+    if metrics["failed_hosts_count"] > 0:
+        risks.append(
+            f"- ❌ **Unreachable / Failed Targets ({metrics['failed_hosts_count']})**: Retry failed devices in [failed_hosts.json](./failed_hosts.json) before freezing BOM or cabling."
+        )
+    for host, st, note in metrics["lldp_missing"]:
+        detail = f" ({note})" if note else ""
+        risks.append(f"- ⚠️ **Missing L2 Discovery on `{host}`** (`lldp={st}`){detail}")
+    for pnote in metrics["passthrough_notes"]:
+        risks.append(f"- ⚠️ **L2 Passthrough / Multi-Neighbor Port**: {pnote}")
+    if metrics["single_gw_spof"]:
+        risks.append(
+            f"- ⚠️ **Single Gateway / Firewall SPOF**: Only `{metrics['gw_devs'][0]}` discovered with zero FHRP (HSRP/VRRP/CARP) redundancy."
+        )
+    for hpoe in metrics["high_poe"]:
+        risks.append(f"- ⚠️ **High PoE Utilization (>80%)**: {hpoe}")
+
+    if risks:
+        lines.extend(risks)
+    else:
+        lines.append("✓ **No critical cutover blockers, failed hosts, or L2 discovery blind spots detected.**")
+
+    lines.extend(
+        [
+            "",
+            "### 1.4 Current Hardware Estate & Port Capacity",
+            "",
+            "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Port Capacity | Role / Guidance |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         vendor = dev.get("vendor", "Unknown")
@@ -2533,21 +2737,21 @@ def _render_blueprint_executive_summary_section(unique_devs: dict) -> list[str]:
         serial = dev.get("serial", "Unknown")
         firmware = dev.get("firmware", "Unknown")
         persona = dev.get("device_persona", dev.get("device_type", "switch"))
+        ints = dev.get("interfaces_detail") or {}
+        up_cnt = sum(1 for s in ints.values() if str((s or {}).get("status", "")).lower() == "up")
+        port_cap = f"{up_cnt}/{len(ints)} up" if ints else "N/A"
 
-        target_rec = "Standard Enterprise Managed Switch"
         if persona == "firewall":
-            target_rec = "Next-Gen Firewall / Core Gateway (HA Pair)"
+            target_rec = "Security Gateway / Perimeter Firewall"
         elif persona == "router":
-            target_rec = "Carrier-Grade Edge Router / L3 Spine"
+            target_rec = "L3 Router / Transit Gateway"
         elif persona == "ap":
-            target_rec = "Wi-Fi 6E/7 Enterprise AP (802.3at PoE+)"
-        elif "cisco" in vendor.lower() and ("891" in model or "29" in model):
-            target_rec = "Modern SD-WAN / 10G Routed Gateway"
-        elif "juniper" in vendor.lower() and "ex2300" in model.lower():
-            target_rec = "Target 10G/25G Core/Distribution Switch (e.g. Arista 7050 / Juniper EX4400)"
+            target_rec = "Wireless Access Point"
+        else:
+            target_rec = f"Managed L2/L3 Switch ({len(ints)} ports)"
 
         lines.append(
-            f"| **{hostname}** | `{ip}` | {vendor} | `{model}` | `{serial}` | `{firmware}` | `{persona}` | {target_rec} |"
+            f"| **{hostname}** | `{ip}` | {vendor} | `{model}` | `{serial}` | `{firmware}` | `{persona}` | `{port_cap}` | {target_rec} |"
         )
     return lines
 
@@ -2620,7 +2824,12 @@ def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], li
 
 
 def _render_blueprint_cabling_and_mtu_section(unique_devs: dict) -> list[str]:
-    """Render Sections 2.1 (Patch Cabling Matrix) and 2.2 (MTU Discrepancy Guard)."""
+    """Render Sections 2.1 (Neighbor/Uplink Cabling Summary) and 2.2 (MTU Discrepancy Guard)."""
+    cabling_rows, mtu_mismatches = _collect_blueprint_cabling_and_mtu(unique_devs)
+    connected_rows = [r for r in cabling_rows if "**Unconnected**" not in r]
+    up_rows = [r for r in cabling_rows if "| `up` |" in r]
+    display_rows = connected_rows if connected_rows else up_rows[:15]
+
     lines = [
         "",
         "---",
@@ -2628,17 +2837,21 @@ def _render_blueprint_cabling_and_mtu_section(unique_devs: dict) -> list[str]:
         "## 2. Physical Layer 1/2 Cabling, Optics & MTU Matrix",
         "",
         "### 2.1 Patch Cabling, Port-Channels & Media Types",
-        "Every physical patch cord, optic type, and uplink LAG/LACP bond must be accounted for before cutover night:",
+        f"Discovered **{len(cabling_rows)}** total ports (**{len(up_rows)}** `up`, **{len(connected_rows)}** with L2 neighbor links). "
+        "Full port-by-port patching is exported in [migration_cabling_matrix.csv](./migration_cabling_matrix.csv); "
+        "active neighbor uplinks are summarized below:",
         "",
         "| Source Switch | Source Port | Media / Form Factor | Speed / Duplex | Status | Connected Neighbor | Neighbor Port | LAG / Port-Channel |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
-    cabling_rows, mtu_mismatches = _collect_blueprint_cabling_and_mtu(unique_devs)
-    lines.extend(cabling_rows[:60])
-    if len(cabling_rows) > 60:
-        lines.append(
-            f"| ... and {len(cabling_rows) - 60} additional switch access ports recorded in migration_cabling_matrix.csv | | | | | | | |"
-        )
+    if display_rows:
+        lines.extend(display_rows[:30])
+        if len(display_rows) > 30:
+            lines.append(
+                f"| ... and {len(display_rows) - 30} additional links in [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) | | | | | | | |"
+            )
+    else:
+        lines.append("| *None* | `N/A` | `N/A` | `N/A` | `N/A` | *No active ports* | `N/A` | `N/A` |")
 
     lines.extend(["", "### 2.2 MTU Discrepancy & Jumbo Frame Guard"])
     if mtu_mismatches:
@@ -2703,15 +2916,8 @@ def _render_blueprint_optics_section(unique_devs: dict) -> list[str]:
 
 def _render_blueprint_mac_mapping_section(unique_devs: dict) -> list[str]:
     """Render Section 2.4: Port-to-Endpoint MAC Address Mapping & Access Layer Topology."""
-    lines = [
-        "",
-        "### 2.4 Port-to-Endpoint MAC Address Mapping & Access Layer Topology",
-        "Active Layer 2 MAC forwarding table entries mapped to physical switch ports and endpoint identities (exported to `port_mac_endpoint_mapping.csv`):",
-        "",
-        "| Switch Hostname | Port | VLAN | MAC Address | OUI Vendor | Resolved Device Role |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
-    ]
-    mac_rows = []
+    priority_rows = []
+    other_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         for entry in dev.get("mac_table", []):
@@ -2722,21 +2928,33 @@ def _render_blueprint_mac_mapping_section(unique_devs: dict) -> list[str]:
             v_lower = vendor.lower()
             if any(ap in v_lower for ap in ["aruba", "ubiquiti", "ruckus", "cisco", "mist"]):
                 role = "Access Point"
-            elif any(srv in v_lower for srv in ["vmware", "dell", "hp", "supermicro", "qemu"]):
+                priority_rows.append(f"| **{hostname}** | `{port}` | `VLAN {vlan}` | `{mac}` | {vendor} | {role} |")
+            elif any(srv in v_lower for srv in ["vmware", "dell", "hp", "supermicro", "qemu", "proxmox"]):
                 role = "Server / Hypervisor"
+                priority_rows.append(f"| **{hostname}** | `{port}` | `VLAN {vlan}` | `{mac}` | {vendor} | {role} |")
             else:
                 role = "Workstation / Client"
-            mac_rows.append(f"| **{hostname}** | `{port}` | `VLAN {vlan}` | `{mac}` | {vendor} | {role} |")
+                other_rows.append(f"| **{hostname}** | `{port}` | `VLAN {vlan}` | `{mac}` | {vendor} | {role} |")
 
-    lines.extend(mac_rows[:30])
-    if len(mac_rows) > 30:
-        lines.append(
-            f"| ... and {len(mac_rows) - 30} additional learned MAC endpoints recorded in port_mac_endpoint_mapping.csv | | | | | |"
-        )
-    elif not mac_rows:
-        lines.append(
-            "| *Discovered Switches* | *Access Ports* | *VLAN 1* | *Dynamic MACs Pending Traffic* | Standard OUI | Client Workstations |"
-        )
+    mac_rows = priority_rows + other_rows
+    lines = [
+        "",
+        "### 2.4 Port-to-Endpoint MAC Address Mapping & Access Layer Topology",
+        f"Discovered **{len(mac_rows)}** learned MAC forwarding entries across switches "
+        "(complete table exported to [port_mac_endpoint_mapping.csv](./port_mac_endpoint_mapping.csv)). "
+        "Infrastructure/AP/Server sample below:",
+        "",
+        "| Switch Hostname | Port | VLAN | MAC Address | OUI Vendor | Resolved Device Role |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+    if mac_rows:
+        lines.extend(mac_rows[:10])
+        if len(mac_rows) > 10:
+            lines.append(
+                f"| ... and {len(mac_rows) - 10} additional learned MAC endpoints in [port_mac_endpoint_mapping.csv](./port_mac_endpoint_mapping.csv) | | | | | |"
+            )
+    else:
+        lines.append("| *None* | `N/A` | `N/A` | *No MAC forwarding entries learned* | `N/A` | `N/A` |")
     return lines
 
 
@@ -2779,11 +2997,7 @@ def _render_blueprint_poe_section(unique_devs: dict) -> list[str]:
         else:
             pct = (used / tot * 100.0) if tot > 0 else 0.0
             req_w = max(tot, used * 1.25)
-            psu_rec = (
-                f"Minimum {int(req_w)}W+ PSU (Supports 802.3at PoE+ expansion)"
-                if req_w > 370
-                else "Standard 370W PSU (Class 3/4 Sufficient)"
-            )
+            psu_rec = f"{rem:.1f}W headroom ({100.0 - pct:.1f}% free); size replacement PSU >= {int(req_w)}W"
             lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
     return lines
 
@@ -3028,7 +3242,7 @@ def _render_blueprint_security_and_services_section(unique_devs: dict) -> list[s
 
 
 def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list[str]:
-    """Render Sections 11 (Protocol Translation) and 12 (Cutover Runbook & Rollback Plan)."""
+    """Render Sections 11 (Protocol Translation) and 12 (Cutover Runbook Summary & Link)."""
     lines = [
         "",
         "---",
@@ -3039,7 +3253,9 @@ def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list
         "| :--- | :--- | :--- | :--- |",
     ]
     vendors_present = {str(d.get("vendor") or "").lower() for d in unique_devs.values()}
+    added_rows = 0
     if any("cisco" in v for v in vendors_present):
+        added_rows += 1
         lines.extend(
             [
                 "| **Cisco PVST+ / Rapid-PVST+** | `MSTP (802.1s)` or `RSTP (802.1w)` | Map multi-instance VLAN STPs to IEEE standard MSTP region. | Medium |",
@@ -3050,6 +3266,7 @@ def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list
             ]
         )
     if any("juniper" in v for v in vendors_present):
+        added_rows += 1
         lines.extend(
             [
                 "| **Junos `family ethernet-switching`** | Target Access / Trunk Port Profile | Map `interface-mode` + `vlan members` (expanding `all`) and `native-vlan-id`. | Medium |",
@@ -3058,11 +3275,36 @@ def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list
             ]
         )
     if any("procurve" in v or "hp" in v or "aruba" in v for v in vendors_present):
+        added_rows += 1
         lines.extend(
             [
                 "| **HP/Aruba `untagged` / `tagged` VLANs** | Target Access / Trunk Port Profile | Convert `untagged` on trunks to native VLAN and `tagged` sets to allowed VLANs. | Medium |",
                 "| **HP/Aruba `Trk*` + `ip helper-address`** | Target LACP LAG + SVI Relay | Map `Trk*` bundles to LACP active LAGs and per-VLAN `ip helper-address`. | Medium |",
             ]
+        )
+    if any("opnsense" in v for v in vendors_present):
+        added_rows += 1
+        lines.append(
+            "| **OPNsense `vtnet*_vlan*` / `CARP`** | Standard 802.1Q Subinterfaces / VRRPv3 | Preserve VLAN tags, DHCP/Dnsmasq/Kea scopes, and firewall/NAT rules. | Medium |"
+        )
+    if any("fortinet" in v or "fortigate" in v for v in vendors_present):
+        added_rows += 1
+        lines.append(
+            "| **FortiOS Zones / Policy Objects** | Standard Interface Zones / ACLs | Translate FortiOS zone members, VIP/IPPool NAT objects, and enable LLDP TX/RX. | Medium |"
+        )
+    if any("mikrotik" in v for v in vendors_present):
+        added_rows += 1
+        lines.append(
+            "| **MikroTik `MNDP` / Bridge VLAN Filtering** | `LLDP (802.1AB)` / IEEE 802.1Q | Convert RouterOS bridge PVID/tagged lists and verify LLDP vs MNDP visibility. | Low |"
+        )
+    if any("frr" in v for v in vendors_present):
+        added_rows += 1
+        lines.append(
+            "| **FRRouting (`vtysh`) L3 Control Plane** | Standard BGP / OSPF / Static Routing | Preserve ASN/area/redistribute policies; install `lldpd` if L2 adjacency is desired. | Low |"
+        )
+    if added_rows == 0:
+        lines.append(
+            "| *Discovered Estate* | Standard IEEE 802.1Q / 802.1AB / L3 Routing | No vendor-proprietary L2/L3 lock-in protocols detected. | Low |"
         )
 
     lines.extend(
@@ -3072,32 +3314,108 @@ def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list
             "",
             "## 12. Maintenance Window Cutover Runbook & Rollback Plan",
             "",
-            "### 12.1 Pre-Cutover T-Minus Checklist (24 Hours Prior)",
-            "- [ ] **Backup Verification**: All running configurations backed up (`net_docu_crawler_dataset.json` preserved).",
-            "- [ ] **Optics & Patching Staging**: Physical transceivers and cables staged according to Section 2.1.",
-            "- [ ] **DHCP Relay Validation**: Target replacement switches have helper addresses provisioned per Section 5.",
-            "- [ ] **Validation Script Ready**: Verify `./validate_cutover.sh` is executable and passes against baseline.",
+            "The complete step-by-step T-minus pre-flight checklist, cutover execution sequence, and rollback decision gate "
+            "are maintained in the standalone runbook: **[cutover_runbook.md](./cutover_runbook.md)**.",
             "",
-            "### 12.2 Cutover Window Execution Sequence (T-0 to T+30m)",
-            "1. **T-0:00 - Silence Monitoring Alerts**: Place core and access switches in maintenance mode in SIEM/NMS.",
-            "2. **T-0:05 - Physical Cable Transfer**: Move patch cables in order specified by `migration_cabling_matrix.csv`.",
-            "3. **T-0:15 - Power-On Target Hardware**: Power up target switches; verify dual PSU green LEDs.",
-            "4. **T-0:20 - Run Automated Smoke Tests**: Execute `./validate_cutover.sh` from jumphost to verify gateway reachability.",
-            "5. **T-0:25 - User & Wireless Smoke Test**: Test client DHCP lease acquisition on discovered access/voice VLANs.",
-            "",
-            "### 12.3 Rollback Plan & Decision Gate",
-            "> [!CAUTION]",
-            "> **HARD ABORT CRITERIA**: If core gateway reachability or client DHCP leasing fails and cannot be resolved "
-            "within 45 minutes of maintenance window start, trigger immediate rollback:",
-            "1. Power down replacement hardware.",
-            "2. Re-seat original cables into legacy switch ports using `migration_cabling_matrix.csv` as source reference.",
-            "3. Power on legacy switches and run `./validate_cutover.sh` to confirm 100% baseline restoration.",
+            "- **Pre-Cutover**: Backup dataset ([net_docu_crawler_dataset.json](./net_docu_crawler_dataset.json)), stage optics/cabling per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv), and verify `./validate_cutover.sh`.",
+            "- **Execution**: Silence NMS alerts -> repatch per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) -> power on target gear -> run [validate_cutover.sh](./validate_cutover.sh).",
+            "- **Rollback**: If core gateways or client DHCP fail beyond the 45-minute abort gate, restore legacy patching and re-verify baseline via [validate_cutover.sh](./validate_cutover.sh).",
             "",
             "---",
-            "*Automated Migration Blueprint compiled by Net-Docu-Crawler Engine.*",
+            "*Automated Executive Overview compiled by Net-Docu-Crawler Engine.*",
         ]
     )
     return lines
+
+
+def generate_cutover_runbook(
+    devices: dict,
+    output_path: str = "cutover_runbook.md",
+    scope: str = "Discovered Network",
+    timestamp: str = "",
+) -> None:
+    """
+    Generate the standalone Maintenance Window Cutover Runbook & Rollback Plan (cutover_runbook.md).
+    """
+    if not timestamp:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
+    gateways = []
+    stp_roots = []
+    relays = []
+    lldp_gaps = []
+
+    for ip, dev in unique_devs.items():
+        hostname = dev.get("hostname") or ip
+        for r in dev.get("routes", []):
+            rd = get_route_details(r)
+            if rd.get("subnet") in ("0.0.0.0/0", "default"):
+                gateways.append(f"`{hostname}` -> `{rd.get('next_hop')}` via `{rd.get('interface')}`")
+        stp = dev.get("stp") or {}
+        if stp.get("is_root") or stp.get("is_verified_campus_root"):
+            stp_roots.append(f"`{hostname}` (`{stp.get('root_bridge') or 'Root'}`)")
+        dev_relays = (dev.get("dhcp") or {}).get("relays", []) or []
+        if dev_relays:
+            for rel in dev_relays:
+                if rel.get("helper_ip"):
+                    relays.append(f"`{hostname}` `{rel.get('interface', '')}` -> `{rel['helper_ip']}`")
+        else:
+            for r_ip in (dev.get("services") or {}).get("dhcp_relays", []) or []:
+                relays.append(f"`{hostname}` -> `{r_ip}`")
+        dp = dev.get("discovery_protocols") or {}
+        lldp_st = dp.get("lldp", "unknown")
+        if lldp_st in ("disabled", "not_installed") or (
+            lldp_st == "unknown" and not (dev.get("neighbors") or []) and dp.get("cdp") != "enabled"
+        ):
+            lldp_gaps.append(f"`{hostname}` (`lldp={lldp_st}`)")
+
+    lines = [
+        "# Maintenance Window Cutover Runbook & Rollback Plan",
+        "",
+        f"> **Scope**: `{scope}` | **Generated**: `{timestamp}` | **Nodes**: `{len(unique_devs)}`",
+        "> **Reference Overview**: [Network_Analysis.md](./Network_Analysis.md) | "
+        "**Cabling**: [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) | "
+        "**Smoke Test**: [validate_cutover.sh](./validate_cutover.sh)",
+        "",
+        "---",
+        "",
+        "## 1. Pre-Cutover T-Minus Checklist (24 Hours Prior)",
+        "- [ ] **Configuration & Dataset Backup**: Confirm [net_docu_crawler_dataset.json](./net_docu_crawler_dataset.json) and raw device backups are archived.",
+        "- [ ] **Cabling & Optics Staging**: Stage patch cords and transceivers per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv).",
+        f"- [ ] **Default Gateways Verified**: {', '.join(gateways) if gateways else 'Verify default routes on target L3 gateways.'}",
+        f"- [ ] **STP Root Placement Verified**: {', '.join(stp_roots) if stp_roots else 'Confirm intended STP root bridge priority on target core.'}",
+        f"- [ ] **DHCP Relays Provisioned**: {', '.join(relays) if relays else 'No centralized DHCP relays detected; verify local gateway DHCP scopes if applicable.'}",
+        f"- [ ] **L2 Blind-Spot Physical Trace**: {('Manually trace physical cabling for: ' + ', '.join(lldp_gaps)) if lldp_gaps else 'All infrastructure nodes have LLDP/CDP visibility.'}",
+        "- [ ] **Validation Script Ready**: Confirm `./validate_cutover.sh` (or `validate_cutover.ps1`) executes cleanly against baseline.",
+        "",
+        "---",
+        "",
+        "## 2. Cutover Window Execution Sequence (T-0 to T+30m)",
+        "1. **T-0:00 - Silence Monitoring Alerts**: Place target switches, routers, and firewalls in maintenance mode in SIEM/NMS.",
+        "2. **T-0:05 - Physical Cable Transfer**: Move patch cables in sequence per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv).",
+        "3. **T-0:15 - Power-On & Link Verification**: Power up replacement hardware; verify uplinks, LACP/LAG bundles, and STP convergence.",
+        "4. **T-0:20 - Automated Reachability Smoke Tests**: Run `./validate_cutover.sh` from management jumphost to verify gateway and DNS reachability.",
+        "5. **T-0:25 - Client & Wireless Verification**: Verify DHCP leases, inter-VLAN routing, and AP associations across all VLANs.",
+        "",
+        "---",
+        "",
+        "## 3. Rollback Plan & Hard Abort Gate",
+        "> [!CAUTION]",
+        "> **HARD ABORT CRITERIA**: If core gateway reachability, WAN egress, or client DHCP fails and cannot be resolved within 45 minutes of maintenance window start, trigger immediate rollback:",
+        "1. Power down or isolate replacement hardware.",
+        "2. Re-seat original patch cables into legacy ports using [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) as source of truth.",
+        "3. Power on legacy switches/gateways and run `./validate_cutover.sh` to verify 100% baseline restoration.",
+        "",
+    ]
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"[+] Cutover runbook written to: {output_path}")
+    except Exception as e:
+        logger.debug("Error writing cutover runbook to %s: %s", output_path, e, exc_info=True)
+        print(f"[-] Error writing cutover runbook: {e}")
 
 
 def generate_master_network_analysis_migration_blueprint(
@@ -3106,18 +3424,30 @@ def generate_master_network_analysis_migration_blueprint(
     scope: str = "Discovered Network",
     timestamp: str = "",
     dns_domain: str = "",
+    failed_hosts_count: int | None = None,
 ) -> None:
     """
-    Generates the comprehensive, unified Master Migration Blueprint (Network_Analysis.md)
-    containing all operational, physical, logical, services, and procedural intelligence
-    required by a Senior Network Engineer to execute a flawless cutover to new network gear.
+    Generates the Executive & Cutover Readiness Overview (Network_Analysis.md)
+    linking to all breakout deliverables and compiled from live operational telemetry.
     """
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    if failed_hosts_count is None:
+        failed_hosts_count = 0
+        failed_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "failed_hosts.json")
+        if os.path.isfile(failed_path):
+            try:
+                with open(failed_path, encoding="utf-8") as fh:
+                    failed_data = json.load(fh)
+                if isinstance(failed_data, list):
+                    failed_hosts_count = len(failed_data)
+            except (OSError, ValueError):
+                failed_hosts_count = 0
+
     unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
     lines = _render_blueprint_header_and_toc(scope, dns_domain, timestamp, len(unique_devs))
-    lines.extend(_render_blueprint_executive_summary_section(unique_devs))
+    lines.extend(_render_blueprint_executive_summary_section(unique_devs, failed_hosts_count=failed_hosts_count))
     lines.extend(_render_blueprint_cabling_and_mtu_section(unique_devs))
     lines.extend(_render_blueprint_optics_section(unique_devs))
     lines.extend(_render_blueprint_mac_mapping_section(unique_devs))

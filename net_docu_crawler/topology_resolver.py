@@ -352,7 +352,17 @@ class DeviceRegistry:
             else:
                 c_node_a, c_port_a, c_node_b, c_port_b = node_a, port_a, node_b, port_b
 
-            # Check if link already recorded (exact port match, or one side lacked remote_port like MNDP)
+            # Check if link already recorded (exact port match, missing remote_port like MNDP,
+            # or LLDP subtype 3 MAC-address Port ID vs real interface name like eth0)
+            def _is_mac_port(p: str) -> bool:
+                return bool(
+                    p
+                    and re.fullmatch(
+                        r"[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}|[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|[0-9a-f]{12}",
+                        p.strip().lower(),
+                    )
+                )
+
             for existing in self.links:
                 same_nodes = (
                     existing["node_a"].lower() == c_node_a.lower() and existing["node_b"].lower() == c_node_b.lower()
@@ -363,13 +373,35 @@ class DeviceRegistry:
                 ports_match = (
                     existing["port_a"].lower() == c_port_a.lower() and existing["port_b"].lower() == c_port_b.lower()
                 )
-                partial_port_match = (
-                    existing["port_a"].lower() == c_port_a.lower() and (not existing["port_b"] or not c_port_b)
-                ) or (existing["port_b"].lower() == c_port_b.lower() and (not existing["port_a"] or not c_port_a))
+                b_compatible = (
+                    not existing["port_b"]
+                    or not c_port_b
+                    or (_is_mac_port(existing["port_b"]) != _is_mac_port(c_port_b))
+                )
+                a_compatible = (
+                    not existing["port_a"]
+                    or not c_port_a
+                    or (_is_mac_port(existing["port_a"]) != _is_mac_port(c_port_a))
+                )
+                partial_port_match = (existing["port_a"].lower() == c_port_a.lower() and b_compatible) or (
+                    existing["port_b"].lower() == c_port_b.lower() and a_compatible
+                )
                 if ports_match or partial_port_match:
-                    if not existing["port_a"] and c_port_a:
+                    if (
+                        (not existing["port_a"] or _is_mac_port(existing["port_a"]))
+                        and c_port_a
+                        and not _is_mac_port(c_port_a)
+                    ):
                         existing["port_a"] = c_port_a
-                    if not existing["port_b"] and c_port_b:
+                    elif not existing["port_a"] and c_port_a:
+                        existing["port_a"] = c_port_a
+                    if (
+                        (not existing["port_b"] or _is_mac_port(existing["port_b"]))
+                        and c_port_b
+                        and not _is_mac_port(c_port_b)
+                    ):
+                        existing["port_b"] = c_port_b
+                    elif not existing["port_b"] and c_port_b:
                         existing["port_b"] = c_port_b
                     existing["status"] = "confirmed"
                     if link_class == "infra_uplink":
@@ -463,7 +495,14 @@ class DeviceRegistry:
 
                     if matched_link:
                         lk, resolved_remote_port = matched_link
-                        if not r_port and resolved_remote_port:
+                        r_is_mac = bool(
+                            r_port
+                            and re.fullmatch(
+                                r"[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}|[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}|[0-9a-f]{12}",
+                                r_port.strip().lower(),
+                            )
+                        )
+                        if (not r_port or r_is_mac) and resolved_remote_port:
                             nbr["remote_port"] = resolved_remote_port
                         nbr["link_confidence"] = "two-way" if lk["status"] == "confirmed" else "one-way"
                     else:
@@ -495,3 +534,150 @@ class DeviceRegistry:
                                         "link_confidence": "INFERRED",
                                     }
                                 )
+
+    def infer_mac_table_links(self, raw_devices: list[dict]) -> None:
+        """
+        For crawled infrastructure devices with zero LLDP/CDP neighbors (e.g., OPNsense without lldpd,
+        FortiGate with LLDP disabled, or FRR), infer L2 switch attachment from crawled switch MAC tables
+        when the switch port has no conflicting LLDP/CDP neighbor.
+        """
+        mac_to_dev: dict[str, tuple[dict, str]] = {}
+        for dev in raw_devices:
+            if dev.get("status", "success") != "success":
+                continue
+            base_mac = oui_lookup.normalize_mac(dev.get("mac_address", "") or "").lower()
+            if base_mac:
+                mac_to_dev.setdefault(base_mac, (dev, ""))
+            for intf_name, intf_info in (dev.get("interfaces_detail") or {}).items():
+                imac = oui_lookup.normalize_mac((intf_info or {}).get("mac_address", "") or "").lower()
+                if imac:
+                    mac_to_dev.setdefault(imac, (dev, intf_name))
+
+        for dev in raw_devices:
+            if dev.get("status", "success") != "success":
+                continue
+            if dev.get("neighbors"):
+                continue
+            target_host, _ = normalize_hostname(dev.get("hostname") or dev.get("ip", ""))
+            if not target_host:
+                continue
+
+            # Collect all MACs belonging to this unlinked device
+            target_macs = [mac for mac, (d, _) in mac_to_dev.items() if d is dev]
+            if not target_macs:
+                continue
+
+            found_for_dev = False
+            for sw in raw_devices:
+                if found_for_dev:
+                    break
+                if sw is dev or sw.get("status", "success") != "success":
+                    continue
+                if not sw.get("mac_table"):
+                    continue
+                sw_host, _ = normalize_hostname(sw.get("hostname") or sw.get("ip", ""))
+                if not sw_host:
+                    continue
+
+                # Ports on sw that already have a confirmed LLDP/CDP neighbor to another infra device
+                occupied_ports = {
+                    normalize_interface(n.get("local_port", "")).lower()
+                    for n in (sw.get("neighbors") or [])
+                    if n.get("local_port")
+                }
+
+                for entry in sw.get("mac_table", []):
+                    emac = oui_lookup.normalize_mac(entry.get("mac", "") or "").lower()
+                    if emac not in target_macs:
+                        continue
+                    sw_port = (entry.get("interface") or entry.get("port") or "").strip()
+                    if not sw_port or sw_port.lower() in ("cpu", "self", "router", "switch"):
+                        continue
+                    if normalize_interface(sw_port).lower() in occupied_ports:
+                        continue
+
+                    _, target_port = mac_to_dev[emac]
+                    note = "Inferred from switch MAC forwarding table (LLDP/CDP unavailable on peer)"
+                    dev.setdefault("neighbors", []).append(
+                        {
+                            "local_port": target_port or "eth0",
+                            "remote_device": sw_host,
+                            "remote_port": sw_port,
+                            "remote_ip": sw.get("ip", ""),
+                            "remote_mac": sw.get("mac_address", ""),
+                            "platform": f"{sw.get('vendor', '')} {sw.get('model', '')}".strip(),
+                            "remote_platform": f"{sw.get('vendor', '')} {sw.get('model', '')}".strip(),
+                            "device_type": sw.get("device_type", "switch"),
+                            "link_confidence": "INFERRED",
+                            "l2_accuracy": "mac_inferred",
+                            "l2_accuracy_note": note,
+                        }
+                    )
+                    sw.setdefault("neighbors", []).append(
+                        {
+                            "local_port": sw_port,
+                            "remote_device": target_host,
+                            "remote_port": target_port or "",
+                            "remote_ip": dev.get("ip", ""),
+                            "remote_mac": emac,
+                            "platform": f"{dev.get('vendor', '')} {dev.get('model', '')}".strip(),
+                            "remote_platform": f"{dev.get('vendor', '')} {dev.get('model', '')}".strip(),
+                            "device_type": dev.get("device_type", "switch"),
+                            "link_confidence": "INFERRED",
+                            "l2_accuracy": "mac_inferred",
+                            "l2_accuracy_note": note,
+                        }
+                    )
+                    self.add_bidirectional_link(
+                        local_node=sw_host,
+                        local_port=sw_port,
+                        remote_node=target_host,
+                        remote_port=target_port or "",
+                        link_type="mac_inferred",
+                        link_class="infra_uplink",
+                    )
+                    found_for_dev = True
+                    break
+
+    def detect_l2_anomalies(self, raw_devices: list[dict]) -> None:
+        """
+        Annotate neighbors that show signs of virtual bridge / LLDP-passthrough transit:
+        1. Multiple distinct remote devices learned on a single physical local_port.
+        2. Neighbor MAC addresses belonging to hypervisor virtual NICs (Proxmox, QEMU/KVM, VMware, etc.).
+        """
+        from net_docu_crawler.drivers.detector import is_hypervisor_mac
+
+        crawled_mac_by_host: dict[str, str] = {}
+        for dev in raw_devices:
+            if dev.get("status", "success") != "success":
+                continue
+            h, _ = normalize_hostname(dev.get("hostname") or dev.get("ip", ""))
+            if h and dev.get("mac_address"):
+                crawled_mac_by_host[h.lower()] = dev["mac_address"]
+
+        for dev in raw_devices:
+            if dev.get("status", "success") != "success":
+                continue
+            port_peers: dict[str, set[str]] = {}
+            for nbr in dev.get("neighbors", []):
+                lp = normalize_interface(nbr.get("local_port", "")).lower()
+                rp_host, _ = normalize_hostname(nbr.get("remote_device", ""))
+                if lp and rp_host:
+                    port_peers.setdefault(lp, set()).add(rp_host.lower())
+
+            for nbr in dev.get("neighbors", []):
+                if nbr.get("l2_accuracy") == "mac_inferred":
+                    continue
+                lp = normalize_interface(nbr.get("local_port", "")).lower()
+                rp_host, _ = normalize_hostname(nbr.get("remote_device", ""))
+                rmac = nbr.get("remote_mac", "") or crawled_mac_by_host.get(rp_host.lower(), "")
+                if lp and len(port_peers.get(lp, set())) >= 2:
+                    nbr["l2_accuracy"] = "multi_neighbor_port"
+                    nbr["l2_accuracy_note"] = (
+                        "Multiple LLDP/CDP neighbors on one port (unmanaged switch or L2 passthrough transit hop)"
+                    )
+                elif rmac and is_hypervisor_mac(rmac):
+                    nbr["l2_accuracy"] = "virtual_passthrough"
+                    nbr["l2_accuracy_note"] = (
+                        "Hypervisor/VM virtual NIC; physical path traverses host vSwitch/bridge (possible LLDP passthrough)"
+                    )

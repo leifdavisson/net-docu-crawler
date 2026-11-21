@@ -177,8 +177,15 @@ class CiscoSMBDriver(BaseDriver):
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw_lldp = conn.send_command("show lldp neighbors")
+            if "lldp is not enabled" in (raw_lldp or "").lower():
+                lldp_status = "disabled"
+                notes = "LLDP is disabled on Cisco SMB."
+            elif raw_lldp is not None:
+                lldp_status = "enabled"
             for line in raw_lldp.splitlines():
                 # Format: Port  Device ID  Port ID  System Name  Capabilities  TTL
                 m_n = re.match(
@@ -214,6 +221,12 @@ class CiscoSMBDriver(BaseDriver):
                     )
         except Exception as exc:
             logger.debug("[%s] CiscoSMB show lldp neighbors failed: %s", self.ip, exc)
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:

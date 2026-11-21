@@ -455,6 +455,30 @@ class JuniperDriver(BaseDriver):
 
         return neighbors
 
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        if neighbors:
+            return {"lldp": "enabled", "cdp": "unsupported", "mndp": "unsupported", "notes": ""}
+        cfg_low = (raw_config or "").lower()
+        if re.search(r"\blldp\s*\{[^}]*\bdisable\s*;", cfg_low, re.DOTALL):
+            return {
+                "lldp": "disabled",
+                "cdp": "unsupported",
+                "mndp": "unsupported",
+                "notes": "LLDP is explicitly disabled under [protocols lldp] in Junos config.",
+            }
+        if re.search(r"\blldp\s*\{", cfg_low) or "set protocols lldp" in cfg_low:
+            return {"lldp": "enabled", "cdp": "unsupported", "mndp": "unsupported", "notes": ""}
+        if raw_config:
+            return {
+                "lldp": "disabled",
+                "cdp": "unsupported",
+                "mndp": "unsupported",
+                "notes": "No [protocols lldp] stanza found in Junos configuration.",
+            }
+        return {"lldp": "unknown", "cdp": "unsupported", "mndp": "unsupported", "notes": ""}
+
     def get_stp(self, conn) -> dict:
         stp = {
             "enabled": False,

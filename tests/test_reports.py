@@ -434,3 +434,70 @@ def test_port_utilization_filters_zero_port_and_asset_inventory_types(tmp_path):
     assert rows["10.1.0.1"]["Role"] == "Core"
     assert rows["10.1.0.225"]["Device Type"] == "Display"
     assert rows["10.1.0.180"]["Device Type"] == "AV Control"
+
+
+def test_wireless_overlay_excludes_arubaos_switch_and_l3_svi_map_multi_ip(tmp_path):
+    devices = {
+        "192.168.1.220": {
+            "ip": "192.168.1.220",
+            "hostname": "SW-2920-24G",
+            "vendor": "HP ProCurve / ArubaOS-S",
+            "model": "HP 2920-24G-PoE+",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "status": "success",
+            "l3_interfaces": [
+                {"interface": "DEFAULT_VLAN", "ip_address": "10.10.10.1/24", "status": "up"},
+                {"interface": "DEFAULT_VLAN", "ip_address": "192.168.1.220/24", "status": "up"},
+            ],
+            "interfaces_detail": {},
+            "neighbors": [],
+            "routes": [],
+            "vlans": {"1": {"name": "DEFAULT_VLAN"}},
+        },
+        "192.168.1.251": {
+            "ip": "192.168.1.251",
+            "hostname": "MikroTik",
+            "vendor": "MikroTik",
+            "model": "CHR",
+            "device_type": "router",
+            "device_persona": "router",
+            "status": "success",
+            "l3_interfaces": [{"interface": "ether1", "ip_address": "192.168.1.251/24", "status": "up"}],
+            "interfaces_detail": {},
+            "neighbors": [
+                {
+                    "local_port": "ether1",
+                    "remote_device": "SW-2920-24G",
+                    "remote_port": "23",
+                    "remote_ip": "192.168.1.220",
+                    "platform": "HP ProCurve / ArubaOS-S HP 2920-24G-PoE+",
+                },
+                {
+                    "local_port": "ether2",
+                    "remote_device": "Office",
+                    "remote_port": "eth0",
+                    "remote_ip": "192.168.1.4",
+                    "platform": "Aruba AP-215",
+                    "device_type": "ap",
+                },
+            ],
+            "routes": [],
+        },
+    }
+    l2_path = str(tmp_path / "L2.md")
+    l3_path = str(tmp_path / "L3.md")
+    report_generator.generate_l2_diagram(devices, output_path=l2_path)
+    report_generator.generate_l3_diagram(devices, output_path=l3_path)
+
+    with open(l2_path, encoding="utf-8") as f:
+        l2_txt = f.read()
+    overlay = l2_txt.split("## Wireless Overlay Layout")[1].split("## ")[0]
+    assert "Total Discovered Access Points: **1**" in overlay
+    assert "SW-2920-24G" not in overlay
+    assert "Office" in overlay
+
+    with open(l3_path, encoding="utf-8") as f:
+        l3_txt = f.read()
+    assert "| SW-2920-24G | DEFAULT_VLAN | 1 | DEFAULT_VLAN | N/A | 10.10.10.1/24 | 10.10.10.0/24 | up |" in l3_txt
+    assert "| SW-2920-24G | DEFAULT_VLAN | 1 | DEFAULT_VLAN | N/A | 192.168.1.220/24 | 192.168.1.0/24 | up |" in l3_txt

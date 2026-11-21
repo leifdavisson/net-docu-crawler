@@ -66,7 +66,20 @@ class AristaDriver(BaseDriver):
             if sys_mac:
                 info["mac_address"] = oui_lookup.normalize_mac(sys_mac).lower()
         except Exception as exc:
-            logger.debug("[%s] Arista show version | json failed: %s", self.ip, exc)
+            logger.debug("[%s] Arista show version | json failed, falling back to text: %s", self.ip, exc)
+            raw_txt = getattr(self, "_prefetched_sh_ver", "") or self._safe_send_command(conn, "show version")
+            m_mod = re.search(r"^\s*Arista\s+(\S+)", raw_txt, re.MULTILINE)
+            if m_mod:
+                info["model"] = m_mod.group(1).strip()
+            m_ser = re.search(r"Serial\s+number\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+            if m_ser:
+                info["serial"] = m_ser.group(1).strip()
+            m_ver = re.search(r"Software\s+image\s+version\s*:\s*(\S+)", raw_txt, re.IGNORECASE)
+            if m_ver:
+                info["firmware"] = f"EOS {m_ver.group(1).strip()}"
+            m_mac = re.search(r"(?:System|Hardware)\s+MAC\s+address\s*:\s*([0-9a-fA-F:.-]+)", raw_txt, re.IGNORECASE)
+            if m_mac:
+                info["mac_address"] = oui_lookup.normalize_mac(m_mac.group(1)).lower()
 
         try:
             raw_host = conn.send_command("show hostname | json")
@@ -76,7 +89,13 @@ class AristaDriver(BaseDriver):
             logger.debug("[%s] Arista show hostname | json failed, falling back to prompt: %s", self.ip, exc)
             prompt = self._safe_find_prompt(conn)
             if prompt:
-                info["hostname"] = prompt.rstrip(">#")
+                info["hostname"] = prompt.rstrip(">#").strip()
+
+        if not info["hostname"]:
+            raw_cfg = self._safe_send_command(conn, "show running-config")
+            m_h = re.search(r"^\s*hostname\s+(\S+)", raw_cfg, re.MULTILINE)
+            if m_h:
+                info["hostname"] = m_h.group(1).strip()
 
         return info
 
@@ -124,37 +143,104 @@ class AristaDriver(BaseDriver):
                     "drops": int(counters.get("inDiscards", 0) or 0) + int(counters.get("outDiscards", 0) or 0),
                 }
         except Exception as exc:
-            logger.debug("[%s] Arista show ip interface | json failed: %s", self.ip, exc)
+            logger.debug("[%s] Arista show ip interface | json failed, falling back to text: %s", self.ip, exc)
+
+        # Enrich non-L3 switched ports via `show interfaces | json` or plain-text fallback
+        try:
+            raw_all = conn.send_command("show interfaces | json")
+            if isinstance(raw_all, str) and raw_all.strip().startswith("{"):
+                all_data = json.loads(raw_all)
+                for intf_name, intf_data in all_data.get("interfaces", {}).items():
+                    if intf_name.lower().startswith("loopback") or intf_name in interfaces_detail:
+                        continue
+                    status = "up" if intf_data.get("lineProtocolStatus") == "up" else "down"
+                    raw_mac = intf_data.get("burnedInAddress") or intf_data.get("physicalAddress") or ""
+                    norm_mac = oui_lookup.normalize_mac(raw_mac).lower() if raw_mac else ""
+                    counters = intf_data.get("interfaceCounters", {})
+                    interfaces_detail[intf_name] = {
+                        "ip_address": "",
+                        "status": status,
+                        "mac_address": norm_mac,
+                        "description": intf_data.get("description", ""),
+                        "input_errors": int(counters.get("inErrors", 0) or 0),
+                        "crc": int(counters.get("fcsErrors", 0) or 0),
+                        "output_errors": int(counters.get("outErrors", 0) or 0),
+                        "drops": int(counters.get("inDiscards", 0) or 0) + int(counters.get("outDiscards", 0) or 0),
+                    }
+        except Exception as exc:
+            logger.debug("[%s] Arista show interfaces | json failed: %s", self.ip, exc)
+
+        if not l3_interfaces and not interfaces_detail:
+            import parser as cli_parser
+
+            sh_ip_int = self._safe_send_command(conn, "show ip interface brief")
+            for entry in cli_parser.parse_ip_interface_brief(sh_ip_int, "cisco_ios"):
+                if not entry.get("interface", "").lower().startswith("loopback"):
+                    l3_interfaces.append(entry)
+            sh_ints = self._safe_send_command(conn, "show interfaces")
+            for intf_name, stats in cli_parser.parse_show_interfaces(sh_ints, "cisco_ios").items():
+                if intf_name.lower().startswith("loopback"):
+                    continue
+                if stats.get("mac_address"):
+                    stats["mac_address"] = oui_lookup.normalize_mac(stats["mac_address"]).lower()
+                interfaces_detail[intf_name] = stats
+
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw = conn.send_command("show lldp neighbors detail | json")
-            data = json.loads(raw)
-            for local_port, nbr_list in data.get("lldpNeighbors", {}).items():
-                for nbr in nbr_list.get("lldpNeighborInfo", []):
-                    rem_dev = nbr.get("systemName") or nbr.get("chassisId", "Unknown")
-                    rem_port = nbr.get("portId", "Unknown")
-                    rem_sys = nbr.get("systemDescription", "")[:60]
-                    rem_ip = ""
-                    mgmt_addrs = nbr.get("managementAddresses", [])
-                    if mgmt_addrs:
-                        rem_ip = mgmt_addrs[0].get("address", "")
-                    neighbors.append(
-                        {
-                            "local_port": local_port,
-                            "remote_device": rem_dev,
-                            "remote_port": rem_port,
-                            "remote_ip": rem_ip,
-                            "platform": rem_sys,
-                            "remote_platform": rem_sys,
-                            "device_type": "switch",
-                        }
-                    )
+            raw_low = (raw or "").lower()
+            if "lldp is not enabled" in raw_low or "lldp is disabled" in raw_low:
+                lldp_status = "disabled"
+                notes = "LLDP is disabled on Arista EOS."
+            elif raw and raw.strip().startswith("{"):
+                lldp_status = "enabled"
+                data = json.loads(raw)
+                for local_port, nbr_list in data.get("lldpNeighbors", {}).items():
+                    for nbr in nbr_list.get("lldpNeighborInfo", []):
+                        rem_dev = nbr.get("systemName") or nbr.get("chassisId", "Unknown")
+                        rem_port = nbr.get("portId", "Unknown")
+                        rem_sys = nbr.get("systemDescription", "")[:60]
+                        rem_ip = ""
+                        mgmt_addrs = nbr.get("managementAddresses", [])
+                        if mgmt_addrs:
+                            rem_ip = mgmt_addrs[0].get("address", "")
+                        neighbors.append(
+                            {
+                                "local_port": local_port,
+                                "remote_device": rem_dev,
+                                "remote_port": rem_port,
+                                "remote_ip": rem_ip,
+                                "platform": rem_sys,
+                                "remote_platform": rem_sys,
+                                "device_type": "switch",
+                            }
+                        )
         except Exception as exc:
             logger.debug("[%s] Arista show lldp neighbors detail | json failed: %s", self.ip, exc)
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
+
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        status = super().get_discovery_protocols(conn, raw_config=raw_config, neighbors=neighbors)
+        cfg_low = (raw_config or "").lower()
+        if re.search(r"^\s*no lldp run\b", cfg_low, re.MULTILINE):
+            status["lldp"] = "disabled"
+            status["notes"] = "LLDP disabled via 'no lldp run' in EOS configuration."
+        elif status["lldp"] == "unknown" and raw_config:
+            status["lldp"] = "enabled"
+        return status
 
     def get_stp(self, conn) -> dict:
         stp = {"enabled": False, "is_root": False, "root_bridge": "", "vlans": {}}
@@ -170,8 +256,20 @@ class AristaDriver(BaseDriver):
                         if is_root:
                             stp["is_root"] = True
                         stp["vlans"][inst_id] = {}
+                return stp
         except Exception as exc:
             logger.debug("[%s] Arista show spanning-tree | json failed: %s", self.ip, exc)
+
+        raw_txt = self._safe_send_command(conn, "show spanning-tree")
+        if "spanning tree enabled" in raw_txt.lower():
+            stp["enabled"] = True
+            if "this bridge is the root" in raw_txt.lower():
+                stp["is_root"] = True
+            m_addr = re.search(r"Root ID.*?Address\s+([0-9a-fA-F:.-]+)", raw_txt, re.DOTALL | re.IGNORECASE)
+            if m_addr:
+                stp["root_bridge"] = oui_lookup.normalize_mac(m_addr.group(1)).lower()
+            for m_inst in re.finditer(r"^(MST\d+|VLAN\d+)\s*$", raw_txt, re.MULTILINE):
+                stp["vlans"][m_inst.group(1)] = {}
         return stp
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -193,8 +291,65 @@ class AristaDriver(BaseDriver):
                         "interface": intf,
                     }
                 )
+            return routes
         except Exception as exc:
-            logger.debug("[%s] Arista show ip route | json failed: %s", self.ip, exc)
+            logger.debug("[%s] Arista show ip route | json failed, falling back to text: %s", self.ip, exc)
+
+        raw_txt = self._safe_send_command(conn, "show ip route")
+        proto_map = {"C": "connected", "S": "static", "O": "ospf", "B": "bgp", "R": "rip", "K": "kernel"}
+        cur_proto = ""
+        cur_subnet = ""
+        for line in raw_txt.splitlines():
+            m_hdr = re.match(r"^\s*([CSOBRK])(?:\s+[A-Z0-9]+)?\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+            if m_hdr:
+                cur_proto = proto_map.get(m_hdr.group(1), m_hdr.group(1))
+                cur_subnet = m_hdr.group(2)
+                m_inline_via = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)(?:,\s*([A-Za-z0-9/._-]+))?", line)
+                m_inline_conn = re.search(r"directly connected,\s*([A-Za-z0-9/._-]+)", line, re.IGNORECASE)
+                if m_inline_via:
+                    routes.append(
+                        {
+                            "subnet": cur_subnet,
+                            "protocol": cur_proto,
+                            "next_hop": m_inline_via.group(1),
+                            "interface": m_inline_via.group(2) or "",
+                        }
+                    )
+                    cur_subnet = ""
+                elif m_inline_conn:
+                    routes.append(
+                        {
+                            "subnet": cur_subnet,
+                            "protocol": cur_proto,
+                            "next_hop": "directly connected",
+                            "interface": m_inline_conn.group(1),
+                        }
+                    )
+                    cur_subnet = ""
+                continue
+            if cur_subnet:
+                m_via = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)(?:,\s*([A-Za-z0-9/._-]+))?", line)
+                m_conn = re.search(r"directly connected,\s*([A-Za-z0-9/._-]+)", line, re.IGNORECASE)
+                if m_via:
+                    routes.append(
+                        {
+                            "subnet": cur_subnet,
+                            "protocol": cur_proto,
+                            "next_hop": m_via.group(1),
+                            "interface": m_via.group(2) or "",
+                        }
+                    )
+                    cur_subnet = ""
+                elif m_conn:
+                    routes.append(
+                        {
+                            "subnet": cur_subnet,
+                            "protocol": cur_proto,
+                            "next_hop": "directly connected",
+                            "interface": m_conn.group(1),
+                        }
+                    )
+                    cur_subnet = ""
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -217,8 +372,24 @@ class AristaDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
+            return arp_entries
         except Exception as exc:
-            logger.debug("[%s] Arista show ip arp | json failed: %s", self.ip, exc)
+            logger.debug("[%s] Arista show ip arp | json failed, falling back to text: %s", self.ip, exc)
+
+        raw_txt = self._safe_send_command(conn, "show ip arp")
+        for line in raw_txt.splitlines():
+            m_arp = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-fA-F:.-]{12,17})\s+([A-Za-z0-9/._-]+)", line)
+            if m_arp:
+                norm_mac = oui_lookup.normalize_mac(m_arp.group(2)).lower()
+                arp_entries.append(
+                    {
+                        "ip": m_arp.group(1),
+                        "mac": norm_mac,
+                        "interface": m_arp.group(3),
+                        "type": "dynamic",
+                        "vendor": oui_lookup.lookup_oui(norm_mac),
+                    }
+                )
         return arp_entries
 
     def get_poe(self, conn) -> dict:

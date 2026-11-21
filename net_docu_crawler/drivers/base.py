@@ -459,6 +459,28 @@ class BaseDriver(ABC):
         """Optional hook to collect live operational L2 trunk, LACP, STP port, and 802.1X state."""
         return {}
 
+    def get_discovery_protocols(
+        self, conn, raw_config: str = "", neighbors: list[dict] | None = None
+    ) -> dict[str, str]:
+        """
+        Optional hook to report L2 neighbor discovery protocol status (LLDP, CDP, MNDP).
+        Values: 'enabled' | 'disabled' | 'not_installed' | 'unsupported' | 'unknown'.
+        """
+        cached = getattr(self, "_discovery_protocols", None)
+        if isinstance(cached, dict):
+            return {
+                "lldp": cached.get("lldp", "unknown"),
+                "cdp": cached.get("cdp", "unsupported"),
+                "mndp": cached.get("mndp", "unsupported"),
+                "notes": cached.get("notes", ""),
+            }
+        return {
+            "lldp": "enabled" if neighbors else "unknown",
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": "",
+        }
+
     def crawl(self, conn) -> dict:
         """
         Template method executing the safe read-only discovery sequence.
@@ -496,6 +518,7 @@ class BaseDriver(ABC):
             "dhcp": {"pools": [], "reservations": [], "relays": []},
             "security_policy": {"firewall_rules": [], "nat_rules": [], "vpn_tunnels": []},
             "services": {},
+            "discovery_protocols": {"lldp": "unknown", "cdp": "unsupported", "mndp": "unsupported", "notes": ""},
             "raw_config": "",
         }
 
@@ -540,6 +563,9 @@ class BaseDriver(ABC):
         # 9. Configuration Backup & Infrastructure Services
         device_data["raw_config"] = self.get_running_config(conn)
         device_data["services"] = self.get_services(conn, device_data["raw_config"])
+        device_data["discovery_protocols"] = self.get_discovery_protocols(
+            conn, raw_config=device_data["raw_config"], neighbors=device_data["neighbors"]
+        )
 
         # 10. Vendor-Neutral Migration Intent (Port Profiles, Routing Peers/FHRP, DHCP, Firewall/NAT/VPN)
         from net_docu_crawler.migration_parsers import (

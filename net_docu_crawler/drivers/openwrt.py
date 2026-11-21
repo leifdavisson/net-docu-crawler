@@ -205,9 +205,12 @@ class OpenWrtDriver(BaseDriver):
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        lldp_status = "unknown"
+        notes = ""
         try:
             raw_lldp = conn.send_command("lldpcli show neighbors -f json 2>/dev/null").strip()
             if raw_lldp.startswith("{"):
+                lldp_status = "enabled"
                 data = json.loads(raw_lldp)
                 for lldp_entry in data.get("lldp", {}).get("interface", []):
                     for intf_name, info in lldp_entry.items():
@@ -227,6 +230,13 @@ class OpenWrtDriver(BaseDriver):
                                 "device_type": "switch",
                             }
                         )
+            elif not raw_lldp:
+                chk = (conn.send_command("command -v lldpcli >/dev/null 2>&1 || echo __NO_LLDPD__") or "").strip()
+                if "__NO_LLDPD__" in chk:
+                    lldp_status = "not_installed"
+                    notes = "lldpd is not installed on OpenWrt."
+                else:
+                    lldp_status = "disabled"
         except Exception as exc:
             logger.debug("[%s] OpenWrt lldpcli neighbor query failed: %s", self.ip, exc)
 
@@ -250,6 +260,12 @@ class OpenWrtDriver(BaseDriver):
         except Exception as exc:
             logger.debug("[%s] OpenWrt hostapd get_clients failed: %s", self.ip, exc)
 
+        self._discovery_protocols = {
+            "lldp": lldp_status,
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": notes,
+        }
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:

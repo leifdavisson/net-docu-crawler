@@ -2321,3 +2321,369 @@ def test_format_duration_breakdown():
     assert format_duration(95.4) == "95.40 seconds (1m 35.40s)"
     assert format_duration(3725.0) == "3725.00 seconds (1h 2m 5.00s)"
     assert format_duration(90061.5) == "90061.50 seconds (1d 1h 1m 1.50s)"
+
+
+def test_cisco_driver_delegates_to_arista_on_eos_and_text_fallback():
+    driver = CiscoDriver(ip="192.168.1.253")
+    mock_conn = MagicMock()
+    mock_conn.find_prompt.return_value = "Arista-Test-Switch#"
+    mock_conn.send_command.side_effect = lambda cmd: {
+        "show version": (
+            "Arista vEOS-lab\n"
+            "Serial number: E8EDC82A15B9E76D6D29D1EF09C8999D\n"
+            "System MAC address: bc24.11ed.c2e4\n"
+            "Software image version: 4.37.0F\n"
+        ),
+        "show ip interface brief": (
+            "Interface    IP Address        Status Protocol  MTU Owner\n"
+            "------------ ----------------- ------ -------- ---- -------\n"
+            "Management1  192.168.1.253/24  up     up       1500\n"
+        ),
+        "show interfaces": (
+            "Ethernet1 is up, line protocol is up (connected)\n"
+            "  Hardware is Ethernet, address is bc24.1168.1e51 (bia bc24.1168.1e51)\n"
+            "Management1 is up, line protocol is up (connected)\n"
+            "  Hardware is Ethernet, address is bc24.1184.1a90 (bia bc24.1184.1a90)\n"
+            "  Internet address is 192.168.1.253/24\n"
+        ),
+        "show ip route": (
+            "Gateway of last resort:\n"
+            " S        0.0.0.0/0 [1/0]\n"
+            "           via 192.168.1.1, Management1\n"
+            " C        192.168.1.0/24\n"
+            "           directly connected, Management1\n"
+        ),
+        "show spanning-tree": (
+            "MST0\n"
+            "  Spanning tree enabled protocol mstp\n"
+            "  Root ID    Priority    32768\n"
+            "             Address     bc24.11ed.c2e4\n"
+            "             This bridge is the root\n"
+        ),
+        "show ip arp": "192.168.1.1       0:00:37  bc24.11b4.a982  Management1\n",
+        "show running-config": "hostname Arista-Test-Switch\ninterface Management1\n   ip address 192.168.1.253/24\n",
+    }.get(cmd, "")
+
+    data = driver.crawl(mock_conn)
+    assert data["vendor"] == "Arista"
+    assert data["hostname"] == "Arista-Test-Switch"
+    assert data["model"] == "vEOS-lab"
+    assert data["serial"] == "E8EDC82A15B9E76D6D29D1EF09C8999D"
+    assert data["firmware"] == "EOS 4.37.0F"
+    assert data["mac_address"] == "bc:24:11:ed:c2e4".replace(":c2e4", ":c2:e4")
+    assert data["l3_interfaces"] == [
+        {"interface": "Management1", "ip_address": "192.168.1.253/24", "status": "up", "protocol": "up"}
+    ]
+    assert len(data["routes"]) == 2
+    assert {r["subnet"] for r in data["routes"]} == {"0.0.0.0/0", "192.168.1.0/24"}
+    assert data["stp"]["enabled"] is True
+
+
+def test_aruba_iap_swarm_lldp_serial_enrichment_and_vc_dedup():
+    from net_docu_crawler.crawler import reconcile_and_deduplicate_dataset
+    from net_docu_crawler.drivers.aruba import ArubaDriver
+
+    vc_drv = ArubaDriver(ip="192.168.1.4")
+    vc_conn = MagicMock()
+    vc_conn.find_prompt.return_value = "Office#"
+    vc_conn.send_command.side_effect = lambda cmd: {
+        "show version": "ArubaOS (MODEL: 215), Version 8.6.0.25\n",
+        "show aps": (
+            "Name      IP Address      Mode    Spectrum  Clients  Type         IPv6 Address  Mesh Role  Zone  Serial #\n"
+            "----      ----------      ----    --------  -------  ----         ------------  ---------  ----  --------\n"
+            "Office    192.168.1.215*  access  disable   3        215(indoor)  --            N/A        -     CK0234094\n"
+            "Garage    192.168.1.218   access  disable   6        215(indoor)  --            N/A        -     CK0233736\n"
+            "Backyard  192.168.1.201   access  disable   1        215(indoor)  --            N/A        -     CK0233645\n"
+        ),
+        "show ap debug lldp info": (
+            "Swarm AP lldp info\n"
+            "------------------\n"
+            "ap name   interface_name  neighbor_id        remote_interface  mau  power supply  neighbor_vlan  neighbor_basemac   neighbor_hostname                neighbor_capability\n"
+            "-------   --------------  -----------        ----------------  ---  ------------  -------------  ----------------   -----------------                -------------------\n"
+            "Office    eth0            fc:33:42:e6:b5:9d  ge-0/0/1               POE-AT                       fc:33:42:e6:b5:99  desktop-switch.lan.andrews.best  Bridge, Router\n"
+            "Garage    eth0            fc:33:42:e6:b5:9f  ge-0/0/3               POE-AT                       fc:33:42:e6:b5:99  desktop-switch.lan.andrews.best  Bridge, Router\n"
+            "Backyard  eth0            fc:33:42:e6:b5:a1  ge-0/0/5               POE-AT                       fc:33:42:e6:b5:99  desktop-switch.lan.andrews.best  Bridge, Router\n"
+        ),
+        "show clients": (
+            "Name         IP Address      MAC Address        OS       ESSID\n"
+            "Holly-s-S25  192.168.10.106  a6:ff:3b:46:62:34  Android  Nacho-Trusted\n"
+            "             192.168.1.177   d8:be:65:bf:a3:76  Linux    NachoWireless\n"
+        ),
+        "show configuration": "virtual-controller-ip 192.168.1.4\n",
+    }.get(cmd, "")
+
+    vc_data = vc_drv.crawl(vc_conn)
+    vc_data["mac_address"] = "40:e3:d6:c1:31:26"
+    assert len(vc_data["neighbors"]) == 1
+    assert vc_data["neighbors"][0]["remote_port"] == "ge-0/0/1"
+    assert len(vc_data["arp_table"]) == 2
+
+    member_garage = {
+        "ip": "192.168.1.218",
+        "status": "success",
+        "vendor": "Aruba Networks / HPE",
+        "hostname": "Garage",
+        "serial": "Unknown",
+        "mac_address": "40:e3:d6:c1:2e:5a",
+        "l3_interfaces": [{"interface": "br0", "ip_address": "192.168.1.218", "status": "up", "protocol": "up"}],
+        "neighbors": [],
+    }
+    unauth_shadow = {
+        "ip": "192.168.1.215",
+        "status": "unauthenticated",
+        "vendor": "aruba",
+        "hostname": "Office",
+        "mac_address": "40:e3:d6:c1:31:26",
+    }
+
+    raw = [vc_data, member_garage, unauth_shadow]
+    reconcile_and_deduplicate_dataset(raw)
+    assert [d["ip"] for d in raw] == ["192.168.1.4", "192.168.1.218"]
+    assert member_garage["serial"] == "CK0233736"
+    assert member_garage["neighbors"][0]["remote_port"] == "ge-0/0/3"
+
+
+def test_mikrotik_ros7_unnumbered_routes_and_secondary_ip_dedup():
+    from net_docu_crawler.crawler import reconcile_and_deduplicate_dataset
+
+    driver = MikroTikDriver(ip="192.168.1.240")
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = lambda cmd: {
+        "/system identity print": "  name: MikroTik\n",
+        "/system resource print": "  version: 7.16.1 (stable)\n  platform: MikroTik\n  board-name: CHR\n",
+        "/interface ethernet print detail": ' 0 R name="ether1" mac-address=BC:24:11:FD:10:28 \n',
+        "/ip address print detail": (
+            "Flags: D - dynamic\n"
+            " 0 D  address=192.168.1.240/24 network=192.168.1.0 interface=ether1\n"
+            " 1    address=192.168.1.251/24 network=192.168.1.0 interface=ether1\n"
+        ),
+        "/ip route print detail": (
+            "Flags: D - dynamic; A - active; c - connect, s - static, d - dhcp; + - ecmp\n"
+            "   DAd + dst-address=0.0.0.0/0 routing-table=main gateway=192.168.1.1 immediate-gw=192.168.1.1%ether1\n"
+            " 0  As + dst-address=0.0.0.0/0 routing-table=main gateway=192.168.1.1 immediate-gw=192.168.1.1%ether1\n"
+            "   DAc + dst-address=192.168.1.0/24 routing-table=main gateway=ether1 immediate-gw=ether1 local-address=192.168.1.240%ether1\n"
+            "   DAc + dst-address=192.168.1.0/24 routing-table=main gateway=ether1 immediate-gw=ether1 local-address=192.168.1.251%ether1\n"
+        ),
+        "/export compact": "/ip address\nadd address=192.168.1.251/24 interface=ether1 network=192.168.1.0\n",
+    }.get(cmd, "")
+
+    d_dhcp = driver.crawl(mock_conn)
+    d_static = MikroTikDriver(ip="192.168.1.251").crawl(mock_conn)
+    assert len(d_dhcp["routes"]) == 2
+    by_sub = {r["subnet"]: r for r in d_dhcp["routes"]}
+    assert by_sub["0.0.0.0/0"]["protocol"] == "static"
+    assert by_sub["192.168.1.0/24"] == {
+        "subnet": "192.168.1.0/24",
+        "protocol": "connected",
+        "next_hop": "connected",
+        "interface": "ether1",
+    }
+
+    raw = [d_dhcp, d_static]
+    reconcile_and_deduplicate_dataset(raw)
+    assert len(raw) == 1
+    assert raw[0]["ip"] == "192.168.1.251"
+
+
+def test_opnsense_route_truncated_vlan_netif_restoration():
+    driver = OPNsenseDriver(ip="192.168.1.1")
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = lambda cmd, timeout=15: {
+        "hostname": "opnsense.lan\n",
+        "opnsense-version": "OPNsense 25.7\n",
+        "ifconfig -a": (
+            "vtnet0: flags=8843<UP,BROADCAST,RUNNING>\n"
+            "\tether bc:24:11:b4:a9:82\n"
+            "\tinet 192.168.1.1 netmask 0xffffff00\n"
+            "vtnet0_vlan10: flags=8843<UP,BROADCAST,RUNNING>\n"
+            "\tinet 192.168.10.1 netmask 0xffffff00\n"
+            "vtnet0_vlan20: flags=8843<UP,BROADCAST,RUNNING>\n"
+            "\tinet 192.168.20.1 netmask 0xffffff00\n"
+        ),
+        "netstat -rn -f inet": (
+            "Internet:\n"
+            "Destination        Gateway            Flags     Netif Expire\n"
+            "192.168.10.0/24    link#8             U        vtnet0_vlan1\n"
+            "192.168.20.0/24    link#9             U        vtnet0_vlan2\n"
+        ),
+        "cat /conf/config.xml": "<opnsense></opnsense>\n",
+    }.get(cmd, "")
+
+    data = driver.crawl(mock_conn)
+    route_intfs = {r["subnet"]: r["interface"] for r in data["routes"]}
+    assert route_intfs["192.168.10.0/24"] == "vtnet0_vlan10"
+    assert route_intfs["192.168.20.0/24"] == "vtnet0_vlan20"
+
+    # Also verify FreeBSD 14 `netstat -rnW -f inet` wide header with Nhop# and Mtu columns
+    mock_conn_w = MagicMock()
+    mock_conn_w.send_command.side_effect = lambda cmd, timeout=15: {
+        "hostname": "opnsense.lan\n",
+        "opnsense-version": "OPNsense 25.7\n",
+        "ifconfig -a": ("vtnet0_vlan10: flags=8843<UP,BROADCAST,RUNNING>\n\tinet 192.168.10.1 netmask 0xffffff00\n"),
+        "netstat -rnW -f inet": (
+            "Internet:\n"
+            "Destination        Gateway            Flags   Nhop#    Mtu            Netif Expire\n"
+            "default            107.146.224.1      UGS        14   1500           vtnet1\n"
+            "107.146.224.70     link#4             UHS        13  16384              lo0\n"
+            "192.168.10.0/24    link#8             U           8   1500    vtnet0_vlan10\n"
+        ),
+        "cat /conf/config.xml": "<opnsense></opnsense>\n",
+    }.get(cmd, "")
+    data_w = OPNsenseDriver(ip="192.168.1.1").crawl(mock_conn_w)
+    assert data_w["routes"] == [
+        {"subnet": "0.0.0.0/0", "protocol": "static", "next_hop": "107.146.224.1", "interface": "vtnet1"},
+        {"subnet": "192.168.10.0/24", "protocol": "connected", "next_hop": "link#8", "interface": "vtnet0_vlan10"},
+    ]
+
+
+def test_lldp_mac_port_id_stitches_confirmed_bidirectional_ap_link():
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    reg = DeviceRegistry()
+    reg.add_bidirectional_link("desktop-switch", "ge-0/0/1", "Office", "40:e3:d6:c1:31:26")
+    reg.add_bidirectional_link("Office", "eth0", "desktop-switch", "ge-0/0/1")
+    assert len(reg.links) == 1
+    assert reg.links[0]["status"] == "confirmed"
+    assert {reg.links[0]["port_a"], reg.links[0]["port_b"]} == {"ge-0/0/1", "eth0"}
+
+
+def test_cisco_lldp_disabled_and_summary_port_recovery():
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = lambda cmd, **kwargs: {
+        "show cdp neighbors detail": "% CDP is not enabled\n",
+        "show lldp neighbors detail": "% LLDP is not enabled\n",
+    }.get(cmd, "")
+    drv = CiscoDriver(ip="10.0.0.10")
+    assert drv.get_neighbors(mock_conn) == []
+    proto = drv.get_discovery_protocols(mock_conn, raw_config="hostname sw1\nno cdp run\n", neighbors=[])
+    assert proto["lldp"] == "disabled"
+    assert proto["cdp"] == "disabled"
+    assert "lldp run" in proto["notes"]
+
+    # IOS 12.x LLDP detail omitting Local Intf, recovered via `show lldp neighbors`
+    mock_conn2 = MagicMock()
+    mock_conn2.send_command.side_effect = lambda cmd, **kwargs: {
+        "show cdp neighbors detail": "% CDP is not enabled\n",
+        "show lldp neighbors detail": (
+            "------------------------------------------------\n"
+            "Chassis id: 0011.2233.4455\n"
+            "Port id: ge-0/0/1\n"
+            "System Name: juniper-sw\n"
+            "System Description: Juniper Networks EX2300\n"
+        ),
+        "show lldp neighbors": (
+            "Device ID           Local Intf     Hold-time  Capability      Port ID\n"
+            "juniper-sw          Gi0/1          120        B               ge-0/0/1\n"
+        ),
+    }.get(cmd, "")
+    drv2 = CiscoDriver(ip="10.0.0.11")
+    nbrs = drv2.get_neighbors(mock_conn2)
+    assert len(nbrs) == 1
+    assert nbrs[0]["local_port"] == "Gi0/1"
+    assert nbrs[0]["remote_device"] == "juniper-sw"
+
+
+def test_opnsense_frr_fortinet_arista_discovery_protocol_status():
+    mock_opn = MagicMock()
+    mock_opn.send_command.side_effect = lambda cmd, **kwargs: "__NO_LLDPD__\n" if "lldpctl" in cmd else ""
+    opn = OPNsenseDriver(ip="192.168.1.1")
+    assert opn.get_neighbors(mock_opn) == []
+    assert opn.get_discovery_protocols(mock_opn)["lldp"] == "not_installed"
+
+    mock_frr = MagicMock()
+    mock_frr.send_command.side_effect = lambda cmd, **kwargs: "__NO_LLDPD__\n" if "lldpcli" in cmd else ""
+    frr = FRRDriver(ip="10.0.0.2")
+    assert frr.get_neighbors(mock_frr) == []
+    frr_proto = frr.get_discovery_protocols(mock_frr)
+    assert frr_proto["lldp"] == "not_installed"
+    assert "L3-only router" in frr_proto["notes"]
+
+    fg = FortinetDriver(ip="10.0.0.3")
+    assert (
+        fg.get_discovery_protocols(MagicMock(), raw_config="config system interface\nend", neighbors=[])["lldp"]
+        == "disabled"
+    )
+    assert (
+        fg.get_discovery_protocols(MagicMock(), raw_config="set lldp-transmission enable", neighbors=[])["lldp"]
+        == "enabled"
+    )
+
+    ar = AristaDriver(ip="10.0.0.4")
+    assert (
+        ar.get_discovery_protocols(MagicMock(), raw_config="hostname eos1\nno lldp run\n", neighbors=[])["lldp"]
+        == "disabled"
+    )
+
+
+def test_topology_resolver_mac_inference_and_passthrough_detection(tmp_path):
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+    from report_generator import generate_l2_diagram
+
+    reg = DeviceRegistry()
+    raw_devices = [
+        {
+            "ip": "192.168.1.2",
+            "hostname": "hp-2920",
+            "vendor": "HP",
+            "model": "2920",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "mac_address": "00:11:22:33:44:55",
+            "interfaces_detail": {"23": {"status": "up"}, "10": {"status": "up"}},
+            "neighbors": [
+                {
+                    "local_port": "23",
+                    "remote_device": "mikrotik-vm",
+                    "remote_port": "ether1",
+                    "remote_mac": "bc:24:11:aa:bb:cc",
+                    "device_type": "router",
+                    "platform": "MikroTik CHR",
+                }
+            ],
+            "mac_table": [
+                {"mac": "52:54:00:12:34:56", "interface": "10", "vlan": "1"},
+                {"mac": "aa:bb:cc:dd:ee:ff", "interface": "23", "vlan": "1"},
+            ],
+            "discovery_protocols": {"lldp": "enabled", "cdp": "enabled", "mndp": "unsupported", "notes": ""},
+        },
+        {
+            "ip": "192.168.1.1",
+            "hostname": "opnsense-fw",
+            "vendor": "OPNsense",
+            "model": "OPNsense Gateway",
+            "device_type": "firewall",
+            "device_persona": "firewall",
+            "mac_address": "52:54:00:12:34:56",
+            "interfaces_detail": {"vtnet0": {"status": "up", "mac_address": "52:54:00:12:34:56"}},
+            "neighbors": [],
+            "discovery_protocols": {
+                "lldp": "not_installed",
+                "cdp": "unsupported",
+                "mndp": "unsupported",
+                "notes": "lldpd (os-lldpd plugin) is not installed on OPNsense.",
+            },
+        },
+    ]
+
+    reg.infer_mac_table_links(raw_devices)
+    reg.detect_l2_anomalies(raw_devices)
+
+    # OPNsense should now have a MAC-inferred link to hp-2920 port 10
+    opn_nbrs = raw_devices[1]["neighbors"]
+    assert len(opn_nbrs) == 1
+    assert opn_nbrs[0]["remote_device"] == "hp-2920"
+    assert opn_nbrs[0]["remote_port"] == "10"
+    assert opn_nbrs[0]["l2_accuracy"] == "mac_inferred"
+
+    # HP port 23 -> mikrotik-vm should be flagged as virtual_passthrough (Proxmox OUI bc:24:11)
+    hp_port23 = [n for n in raw_devices[0]["neighbors"] if n["local_port"] == "23"][0]
+    assert hp_port23["l2_accuracy"] == "virtual_passthrough"
+
+    out_md = tmp_path / "L2_network_diagrams.md"
+    devices_map = {d["ip"]: d for d in raw_devices}
+    generate_l2_diagram(devices_map, output_path=str(out_md))
+    content = out_md.read_text(encoding="utf-8")
+    assert "[MAC Inferred]" in content
+    assert "[Passthrough/Transit]" in content
+    assert "## L2 Discovery Coverage & Accuracy Audit" in content
+    assert "lldpd (os-lldpd plugin) is not installed on OPNsense." in content

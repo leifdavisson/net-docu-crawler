@@ -71,3 +71,17 @@ def test_compute_organized_output_dir_site_auto_and_override():
     assert p_explicit.endswith("_campus-a")
     p_legacy = compute_organized_output_dir(["10.1.0.1"], base_dir="deliverables", domain="legacy")
     assert p_legacy.endswith("_legacy")
+
+
+def test_detect_environment_dns_domain_ignores_ssh_banner_models():
+    res = detect_environment_dns_domain(
+        devices=[
+            {"hostname": "10.1.0.50", "status": "unsupported", "model": "SSH-1.99-Cisco-1.25"},
+            {"hostname": "10.1.0.51", "status": "unsupported", "model": "SSH-2.0-CrestronSSH"},
+            {"hostname": "sw1", "status": "success", "raw_config": "ip domain-name norris.k12.ca.us\n"},
+        ],
+        local_suffix="",
+    )
+    assert res["primary_domain"] == "norris.k12.ca.us"
+    assert "ssh-1.99-cisco-1.25" not in res["device_domains"]
+    assert "ssh-2.0-crestronssh" not in res["device_domains"]

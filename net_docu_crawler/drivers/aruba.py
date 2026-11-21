@@ -48,7 +48,12 @@ class ArubaDriver(BaseDriver):
             "os_type": "aruba_os",
             "device_persona": self.device_persona,
         }
-        raw = conn.send_command("show version")
+        sh_ver = getattr(self, "_prefetched_sh_ver", None)
+        if sh_ver is not None:
+            self._prefetched_sh_ver = None
+            raw = sh_ver
+        else:
+            raw = conn.send_command("show version")
         raw_str = raw if isinstance(raw, str) else ""
 
         # Detect Aruba AOS-CX switch platform (`ArubaOS-CX` / `AOS-CX`)
@@ -101,6 +106,10 @@ class ArubaDriver(BaseDriver):
             return info
 
         self._is_aoscx = False
+        self._ap_hostname = ""
+        self._ap_member_ip = ""
+        self._swarm_lldp: dict[str, list[dict]] = {}
+
         m_model = re.search(r"MODEL:\s*(\w+)", raw_str)
         if m_model:
             info["model"] = f"Aruba AP-{m_model.group(1)}"
@@ -112,23 +121,125 @@ class ArubaDriver(BaseDriver):
         if prompt:
             info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
 
-        # Query AP cluster details if IAP
+        # Query AP cluster details if IAP (`show aps` returns full swarm roster on Virtual Controller)
+        swarm_aps: list[dict] = []
         try:
             raw_aps = conn.send_command("show aps")
             if isinstance(raw_aps, str):
                 for line in raw_aps.splitlines():
                     parts = line.split()
-                    if len(parts) >= 10 and "*" in parts[1]:  # Master IAP indicator
-                        info["hostname"] = parts[0]
-                        info["serial"] = parts[9]
-                        break
+                    if len(parts) >= 10 and re.match(r"^\d{1,3}(?:\.\d{1,3}){3}\*?$", parts[1]):
+                        is_master = parts[1].endswith("*")
+                        ap_ip = parts[1].rstrip("*")
+                        ap_serial = parts[9] if parts[9] not in ("-", "--") else "Unknown"
+                        swarm_aps.append(
+                            {
+                                "name": parts[0],
+                                "ip": ap_ip,
+                                "serial": ap_serial,
+                                "is_master": is_master,
+                            }
+                        )
         except Exception as exc:
             logger.debug("[%s] Aruba show aps failed: %s", self.ip, exc)
 
+        if swarm_aps:
+            info["swarm_aps"] = swarm_aps
+            matched = next((a for a in swarm_aps if a["ip"] == self.ip), None)
+            if not matched and info["hostname"]:
+                matched = next((a for a in swarm_aps if a["name"].lower() == info["hostname"].lower()), None)
+            if not matched:
+                matched = next((a for a in swarm_aps if a["is_master"]), None)
+            if matched:
+                info["hostname"] = matched["name"]
+                if matched["serial"] != "Unknown":
+                    info["serial"] = matched["serial"]
+                self._ap_member_ip = matched["ip"]
+
+        self._ap_hostname = info["hostname"]
         return info
 
+    def crawl(self, conn) -> dict:
+        sh_ver = self._safe_send_command(conn, "show version")
+        if re.search(
+            r"Image\s+stamp\s*:|ProCurve|\b(?:WB|WC|YA|YB|YC|KB|KA|RA)\.\d{2}\.\d{2}\b",
+            sh_ver,
+            re.IGNORECASE,
+        ):
+            from net_docu_crawler.drivers.hpprocurve import HPProCurveDriver
+
+            logger.info("[%s] Detected ArubaOS-S / ProCurve in ArubaDriver; delegating to HPProCurveDriver.", self.ip)
+            procurve_drv = HPProCurveDriver(
+                ip=self.ip,
+                username=self.username,
+                password=self.password,
+                secret=self.secret,
+                timeout=self.timeout,
+                session_log=self.session_log,
+                port=self.port,
+                transport=self.transport,
+            )
+            return procurve_drv.crawl(conn)
+
+        self._prefetched_sh_ver = sh_ver
+        data = super().crawl(conn)
+        if getattr(self, "_swarm_lldp", None):
+            data["swarm_lldp"] = self._swarm_lldp
+        return data
+
     def get_interfaces(self, conn) -> tuple[list, dict]:
+        if getattr(self, "_is_aoscx", False):
+            l3_interfaces: list[dict] = []
+            interfaces_detail: dict[str, dict] = {}
+            try:
+                raw_ip = conn.send_command("show ip interface brief")
+                for line in (raw_ip if isinstance(raw_ip, str) else "").splitlines():
+                    m_ip = re.match(
+                        r"^\s*([A-Za-z0-9/._-]+)\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+(up|down)\s+(up|down)",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m_ip:
+                        intf_n, ip_v, st_a, st_p = m_ip.groups()
+                        if not ip_v.startswith("127."):
+                            l3_interfaces.append(
+                                {
+                                    "interface": intf_n,
+                                    "ip_address": ip_v,
+                                    "status": st_a.lower(),
+                                    "protocol": st_p.lower(),
+                                }
+                            )
+                            interfaces_detail[intf_n] = {
+                                "ip_address": ip_v,
+                                "status": st_p.lower(),
+                                "mac_address": "",
+                                "description": "",
+                            }
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show ip interface brief failed: %s", self.ip, exc)
+            try:
+                raw_br = conn.send_command("show interface brief")
+                for line in (raw_br if isinstance(raw_br, str) else "").splitlines():
+                    m_br = re.match(
+                        r"^\s*(\d+/\d+/\d+(?::\d+)?|lag\d+|vlan\d+)\s+\S+\s+\S+\s+\S+\s+(up|down)\b",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m_br:
+                        p_name, p_st = m_br.group(1), m_br.group(2).lower()
+                        interfaces_detail.setdefault(
+                            p_name,
+                            {"ip_address": "", "status": p_st, "mac_address": "", "description": ""},
+                        )
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show interface brief failed: %s", self.ip, exc)
+            return l3_interfaces, interfaces_detail
+
         l3_interfaces = [{"interface": "br0", "ip_address": self.ip, "status": "up", "protocol": "up"}]
+        member_ip = getattr(self, "_ap_member_ip", "")
+        if member_ip and member_ip != self.ip:
+            l3_interfaces.append({"interface": "br0", "ip_address": member_ip, "status": "up", "protocol": "up"})
         interfaces_detail = {
             "eth0": {
                 "status": "up",
@@ -143,45 +254,125 @@ class ArubaDriver(BaseDriver):
 
     def get_neighbors(self, conn) -> list[dict]:
         neighbors = []
+        if getattr(self, "_is_aoscx", False):
+            try:
+                import parser as cli_parser
+
+                raw_cx = conn.send_command("show lldp neighbor-info detail")
+                for n in cli_parser.parse_lldp_neighbors_detail(raw_cx if isinstance(raw_cx, str) else ""):
+                    n["remote_platform"] = n.get("platform", "")
+                    neighbors.append(n)
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show lldp neighbor-info detail failed: %s", self.ip, exc)
+            return neighbors
+
+        swarm_lldp: dict[str, list[dict]] = {}
+        target_ap = (getattr(self, "_ap_hostname", "") or "").strip().lower()
         try:
             raw = conn.send_command("show ap debug lldp info")
             for line in raw.splitlines():
-                parts = line.split()
-                if len(parts) >= 9 and "." in parts[8]:
-                    rem_intf = re.sub(r"\.0$", "", parts[3])
-                    rem_mac = parts[7]
-                    rem_host = parts[8]
+                stripped = line.strip()
+                if not stripped or stripped.lower().startswith(("swarm ap", "ap name")) or set(stripped) <= {"-", " "}:
+                    continue
+                m = re.match(
+                    r"^\s*(\S+)\s+(\S+)\s+([0-9a-fA-F:.-]{12,17})\s+(\S+)\s+.*?\b([0-9a-fA-F:]{17})\s+(\S+)(?:\s+(.+))?$",
+                    line,
+                )
+                if m:
+                    ap_name, local_port, _nbr_id, rem_port_raw, rem_basemac, rem_host, _cap = m.groups()
+                    rem_intf = re.sub(r"\.0$", "", rem_port_raw)
+                    rem_mac = oui_lookup.normalize_mac(rem_basemac).lower()
                     plat = f"Switch ({oui_lookup.lookup_oui(rem_mac)})"
-                    neighbors.append(
-                        {
-                            "local_port": parts[1],
-                            "remote_device": rem_host.split(".")[0],
-                            "remote_port": rem_intf,
-                            "remote_ip": "",
-                            "remote_mac": rem_mac,
-                            "platform": plat,
-                            "remote_platform": plat,
-                            "device_type": "switch",
-                        }
-                    )
+                    entry = {
+                        "local_port": local_port,
+                        "remote_device": rem_host.split(".")[0],
+                        "remote_port": rem_intf,
+                        "remote_ip": "",
+                        "remote_mac": rem_mac,
+                        "platform": plat,
+                        "remote_platform": plat,
+                        "device_type": "switch",
+                    }
+                    swarm_lldp.setdefault(ap_name.lower(), []).append(entry)
+                    if not target_ap or ap_name.lower() == target_ap:
+                        neighbors.append(entry)
         except Exception as exc:
             logger.debug("[%s] Aruba show ap debug lldp info failed: %s", self.ip, exc)
+        self._swarm_lldp = swarm_lldp
+        self._discovery_protocols = {
+            "lldp": "enabled",
+            "cdp": "unsupported",
+            "mndp": "unsupported",
+            "notes": "",
+        }
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
+        if getattr(self, "_is_aoscx", False):
+            routes: list[dict] = []
+            try:
+                raw_rt = conn.send_command("show ip route")
+                for line in (raw_rt if isinstance(raw_rt, str) else "").splitlines():
+                    m_rt = re.match(
+                        r"^\s*(\d+\.\d+\.\d+\.\d+/\d+)\s*,\s*vrf\s+\S+\s+via\s+(\S+)\s*,\s*\[[^\]]+\]\s*,\s*(\S+)",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m_rt:
+                        sub, nh, proto = m_rt.groups()
+                        routes.append(
+                            {
+                                "subnet": sub,
+                                "protocol": proto,
+                                "next_hop": "connected" if proto.lower() == "connected" else nh,
+                                "interface": nh if proto.lower() == "connected" else "",
+                            }
+                        )
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show ip route failed: %s", self.ip, exc)
+            return routes
         return [{"subnet": "0.0.0.0/0", "protocol": "Default", "next_hop": "Gateway", "interface": "eth0"}]
 
     def get_arp_table(self, conn) -> list[dict]:
         arp_entries = []
+        seen_ips = set()
+        if getattr(self, "_is_aoscx", False):
+            try:
+                raw_arp = conn.send_command("show arp")
+                for line in (raw_arp if isinstance(raw_arp, str) else "").splitlines():
+                    m_a = re.match(
+                        r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F:.-]{12,17})\s+(\S+)\s+(\S+)",
+                        line,
+                    )
+                    if m_a:
+                        a_ip, a_mac, a_port, _phys = m_a.groups()
+                        norm_mac = oui_lookup.normalize_mac(a_mac).lower()
+                        arp_entries.append(
+                            {
+                                "ip": a_ip,
+                                "mac": norm_mac,
+                                "interface": a_port,
+                                "type": "dynamic",
+                                "vendor": oui_lookup.lookup_oui(norm_mac),
+                            }
+                        )
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show arp failed: %s", self.ip, exc)
+            return arp_entries
+
         try:
             raw = conn.send_command("show clients")
             for line in raw.splitlines():
-                parts = line.split()
-                if len(parts) >= 3 and "." in parts[0] and ":" in parts[1]:
-                    norm_mac = oui_lookup.normalize_mac(parts[1]).lower()
+                m_cli = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F:]{17})\b", line)
+                if m_cli:
+                    c_ip = m_cli.group(1)
+                    if c_ip in ("0.0.0.0",) or c_ip in seen_ips:
+                        continue
+                    seen_ips.add(c_ip)
+                    norm_mac = oui_lookup.normalize_mac(m_cli.group(2)).lower()
                     arp_entries.append(
                         {
-                            "ip": parts[0],
+                            "ip": c_ip,
                             "mac": norm_mac,
                             "interface": "wlan",
                             "age": "1",

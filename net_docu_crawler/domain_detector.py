@@ -113,10 +113,17 @@ def extract_device_dns_domains(devices: list[dict] | None) -> list[str]:
                     counts[dom] += 1
 
         model = (dev.get("model") or "").strip()
-        if model.startswith("*.") or ("." in model and " " not in model):
-            dom = _clean_domain(model)
-            if dom:
-                counts[dom] += 1
+        # Only inspect model as a DNS domain when it looks like a TLS wildcard/CN
+        # (not an SSH banner like "SSH-2.0-CrestronSSH" or "SSH-1.99-Cisco-1.25").
+        if (
+            model
+            and not model.lower().startswith("ssh-")
+            and (model.startswith("*.") or ("." in model and " " not in model))
+        ):
+            if dev.get("status") == "success" or model.startswith("*."):
+                dom = _clean_domain(model)
+                if dom:
+                    counts[dom] += 1
 
     return [dom for dom, _ in counts.most_common()]
 

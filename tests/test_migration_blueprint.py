@@ -25,6 +25,7 @@ import tempfile
 from net_docu_crawler.crawler import _log_event, compute_organized_output_dir
 from net_docu_crawler.drivers.base import extract_services_from_config, sanitize_raw_config
 from report_generator import (
+    generate_cutover_runbook,
     generate_cutover_validation_script,
     generate_master_network_analysis_migration_blueprint,
     generate_port_endpoint_mapping,
@@ -172,9 +173,15 @@ def test_generate_master_network_analysis_migration_blueprint():
         with open(bp_file, encoding="utf-8") as f:
             content = f.read()
 
-        # Check for all key engineering sections
+        # Check for all key engineering sections and executive readiness subsections
         assert "# Network Migration Analysis Blueprint" in content
         assert "## 1. Executive Summary & Current Hardware Estate" in content
+        assert "### 1.1 Discovery Confidence & Cutover Readiness Scorecard" in content
+        assert "### 1.2 Deliverables & Breakout Reports Index" in content
+        assert "[L2_network_diagrams.md](./L2_network_diagrams.md)" in content
+        assert "[cutover_runbook.md](./cutover_runbook.md)" in content
+        assert "### 1.3 Cutover Risks, Blind Spots & Single Points of Failure (SPOF)" in content
+        assert "Arista 7050 / Juniper EX4400" not in content
         assert "## 2. Physical Layer 1/2 Cabling, Optics & MTU Matrix" in content
         assert "## 3. Power over Ethernet (PoE) Budget" in content
         assert "## 4. Layer 2 VLANs, 802.1Q Trunks" in content
@@ -186,6 +193,16 @@ def test_generate_master_network_analysis_migration_blueprint():
         assert "## 12. Maintenance Window Cutover Runbook" in content
         assert "CW0217120312" in content
         assert "192.168.1.200" in content
+
+        runbook_file = os.path.join(tmpdir, "cutover_runbook.md")
+        generate_cutover_runbook(mock_devices, output_path=runbook_file, scope="192.168.1.0/24")
+        assert os.path.exists(runbook_file)
+        with open(runbook_file, encoding="utf-8") as rf:
+            rb_content = rf.read()
+        assert "# Maintenance Window Cutover Runbook & Rollback Plan" in rb_content
+        assert "## 1. Pre-Cutover T-Minus Checklist" in rb_content
+        assert "## 3. Rollback Plan & Hard Abort Gate" in rb_content
+        assert "192.168.1.200" in rb_content
 
 
 def test_generate_cutover_validation_script():

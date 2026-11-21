@@ -1404,6 +1404,7 @@ def _collect_neighbor_observations(
 def _should_include_candidate_observation(
     obs: _NeighborObservation,
     endpoint_kind: str,
+    local_dev: dict | None,
     peer_dev: dict | None,
     local_state: TrunkPortState | None,
     states_by_dev_port: dict[tuple[str, str], TrunkPortState],
@@ -1411,11 +1412,18 @@ def _should_include_candidate_observation(
     """Return False for non-trunk peripherals and normal unprofiled/uncrawled wireless AP uplinks."""
     if endpoint_kind == "peripheral":
         return False
-    if endpoint_kind == "ap":
-        if local_state is None or not _is_trunk_like(local_state) or peer_dev is None:
+    local_is_ap = bool(local_dev and str(local_dev.get("device_type") or "").lower() == "ap")
+    if endpoint_kind == "ap" or local_is_ap:
+        ap_dev = local_dev if local_is_ap else peer_dev
+        sw_state = states_by_dev_port.get((obs.remote_host, obs.remote_port)) if local_is_ap else local_state
+        ap_state = (
+            local_state
+            if local_is_ap
+            else (states_by_dev_port.get((obs.remote_host, obs.remote_port)) if obs.remote_port else None)
+        )
+        if sw_state is None or not _is_trunk_like(sw_state) or ap_dev is None:
             return False
-        peer_port_state = states_by_dev_port.get((obs.remote_host, obs.remote_port)) if obs.remote_port else None
-        if not bool(peer_dev.get("port_profiles") or {}) or peer_port_state is None:
+        if not bool(ap_dev.get("port_profiles") or {}) or ap_state is None:
             return False
     return True
 
@@ -1428,11 +1436,14 @@ def _group_candidate_edges(
     """Group directional observations into canonical undirected switchport edge candidates."""
     edges: dict[tuple[tuple[str, str], tuple[str, str]], _EdgeCandidate] = {}
     for obs in observations:
+        local_dev = dev_by_host.get(obs.local_host)
         peer_dev = dev_by_host.get(obs.remote_host)
         endpoint_kind = _classify_neighbor_endpoint(obs.raw_neighbor, peer_dev=peer_dev)
         local_state = states_by_dev_port.get((obs.local_host, obs.local_port))
 
-        if not _should_include_candidate_observation(obs, endpoint_kind, peer_dev, local_state, states_by_dev_port):
+        if not _should_include_candidate_observation(
+            obs, endpoint_kind, local_dev, peer_dev, local_state, states_by_dev_port
+        ):
             continue
 
         if local_state is not None:
