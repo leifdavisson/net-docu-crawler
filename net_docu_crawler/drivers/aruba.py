@@ -15,7 +15,9 @@
 
 """
 Aruba Networks / HPE Driver: Aruba Instant AP (IAP) clusters & ArubaOS-CX switches.
-Official Documentation: https://www.arubanetworks.com/techdocs/ArubaDocPortal/content/cons-instant-home.htm
+Official Documentation:
+- Aruba Instant: https://www.arubanetworks.com/techdocs/ArubaDocPortal/content/cons-instant-home.htm
+- Aruba AOS-CX: https://www.arubanetworks.com/techdocs/AOS-CX/help_portal/Content/home.htm
 """
 
 import re
@@ -55,24 +57,85 @@ class ArubaDriver(BaseDriver):
             "device_persona": self.device_persona,
         }
         raw = conn.send_command("show version")
-        m_model = re.search(r"MODEL:\s*(\w+)", raw)
+        raw_str = raw if isinstance(raw, str) else ""
+
+        # Detect Aruba AOS-CX switch platform (`ArubaOS-CX` / `AOS-CX`)
+        if re.search(r"ArubaOS-CX|AOS-CX", raw_str, re.IGNORECASE):
+            self._is_aoscx = True
+            info["device_persona"] = "switch"
+            info["device_type"] = "switch"
+            info["os_type"] = "aruba_aoscx"
+            info["model"] = "Aruba AOS-CX Switch"
+            info["firmware"] = "ArubaOS-CX"
+
+            m_ver = re.search(r"Version\s*:\s*(\S+)", raw_str, re.IGNORECASE)
+            if m_ver:
+                info["firmware"] = m_ver.group(1).strip()
+            m_prod = re.search(r"(?:Product Name|Model|Chassis)\s*:\s*(.+)", raw_str, re.IGNORECASE)
+            if m_prod:
+                info["model"] = m_prod.group(1).strip()
+            m_ser = re.search(r"(?:Chassis\s+)?Serial\s+(?:Number|Nbr)\s*:\s*(\S+)", raw_str, re.IGNORECASE)
+            if m_ser:
+                info["serial"] = m_ser.group(1).strip()
+            m_mac = re.search(r"(?:Base\s+)?MAC\s+Address\s*:\s*([0-9a-fA-F:.-]+)", raw_str, re.IGNORECASE)
+            if m_mac:
+                info["mac_address"] = oui_lookup.normalize_mac(m_mac.group(1)).lower()
+
+            try:
+                raw_sys = conn.send_command("show system")
+                if isinstance(raw_sys, str) and raw_sys.strip() and "Invalid input" not in raw_sys:
+                    m_host = re.search(r"Hostname\s*:\s*(\S+)", raw_sys, re.IGNORECASE)
+                    if m_host:
+                        info["hostname"] = m_host.group(1).strip()
+                    if info["model"] == "Aruba AOS-CX Switch":
+                        m_p2 = re.search(r"Product\s+Name\s*:\s*(.+)", raw_sys, re.IGNORECASE)
+                        if m_p2:
+                            info["model"] = m_p2.group(1).strip()
+                    if info["serial"] == "Unknown":
+                        m_s2 = re.search(r"(?:Chassis\s+)?Serial\s+(?:Number|Nbr)\s*:\s*(\S+)", raw_sys, re.IGNORECASE)
+                        if m_s2:
+                            info["serial"] = m_s2.group(1).strip()
+                    if not info.get("mac_address"):
+                        m_m2 = re.search(r"(?:Base\s+)?MAC\s+Address\s*:\s*([0-9a-fA-F:.-]+)", raw_sys, re.IGNORECASE)
+                        if m_m2:
+                            info["mac_address"] = oui_lookup.normalize_mac(m_m2.group(1)).lower()
+            except Exception:
+                pass
+
+            if not info["hostname"]:
+                try:
+                    prompt = conn.find_prompt()
+                    if isinstance(prompt, str):
+                        info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
+                except Exception:
+                    pass
+            return info
+
+        self._is_aoscx = False
+        m_model = re.search(r"MODEL:\s*(\w+)", raw_str)
         if m_model:
             info["model"] = f"Aruba AP-{m_model.group(1)}"
-        m_ver = re.search(r"Version\s*(\S+)", raw)
+        m_ver = re.search(r"Version\s*(\S+)", raw_str)
         if m_ver:
             info["firmware"] = m_ver.group(1)
 
-        info["hostname"] = conn.find_prompt().replace("#", "").replace(">", "").strip()
+        try:
+            prompt = conn.find_prompt()
+            if isinstance(prompt, str):
+                info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
+        except Exception:
+            pass
 
         # Query AP cluster details if IAP
         try:
             raw_aps = conn.send_command("show aps")
-            for line in raw_aps.splitlines():
-                parts = line.split()
-                if len(parts) >= 10 and "*" in parts[1]:  # Master IAP indicator
-                    info["hostname"] = parts[0]
-                    info["serial"] = parts[9]
-                    break
+            if isinstance(raw_aps, str):
+                for line in raw_aps.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 10 and "*" in parts[1]:  # Master IAP indicator
+                        info["hostname"] = parts[0]
+                        info["serial"] = parts[9]
+                        break
         except Exception:
             pass
 
@@ -184,7 +247,106 @@ class ArubaDriver(BaseDriver):
         return optics
 
     def get_running_config(self, conn) -> str:
+        if getattr(self, "_is_aoscx", False):
+            try:
+                raw = conn.send_command("show running-config")
+                if isinstance(raw, str) and raw.strip() and "Invalid input" not in raw:
+                    return raw
+            except Exception:
+                pass
         try:
             return conn.send_command("show configuration")
         except Exception:
             return conn.send_command("show run")
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        """Collect operational trunk & LACP state on Aruba AOS-CX switches (no-op on IAP APs)."""
+        if getattr(self, "_is_aoscx", None) is False:
+            return {}
+
+        ops: dict[str, dict] = {}
+        try:
+            raw_trunk = conn.send_command("show interface trunk")
+            if (
+                isinstance(raw_trunk, str)
+                and raw_trunk.strip()
+                and "Invalid input" not in raw_trunk
+                and "Unknown command" not in raw_trunk
+                and "Incomplete command" not in raw_trunk
+            ):
+                for line in raw_trunk.splitlines():
+                    stripped = line.strip()
+                    if not stripped or set(stripped) <= {"-", "="}:
+                        continue
+                    low = stripped.lower()
+                    if low.startswith(("port", "native", "vlan")):
+                        continue
+                    # Match AOS-CX rows:
+                    # `1/1/24   99   trunk            10G-SR   up         10,20,99`
+                    # `lag1     1    native-tagged    --       up         1,10,20`
+                    # `1/1/23   1    native-untagged           down Admin 10,20`
+                    m_tr = re.match(
+                        r"^\s*(lag\s*\d+|\d+/\d+/\d+(?::\d+)?)\s+(\d+|none|--)\s+"
+                        r"(trunk|native-tagged|native-untagged)\s+.*?\b(up|down)\b.*?\s+([\d,-]+|all|none)\s*$",
+                        line,
+                        re.I,
+                    )
+                    if m_tr:
+                        raw_p, nat, mode_tok, status_tok, allowed = m_tr.groups()
+                        port = re.sub(r"^lag\s+(\d+)$", r"lag\1", raw_p.strip(), flags=re.I)
+                        mode_l = mode_tok.lower()
+                        status_l = status_tok.lower()
+                        rec = ops.setdefault(port, {})
+                        rec["mode"] = "trunk"
+                        rec["admin_mode"] = "trunk"
+                        rec["oper_mode"] = "trunk" if status_l == "up" else "down"
+                        rec["encapsulation"] = "dot1q"
+                        if nat.lower() not in ("--",):
+                            rec["native_vlan"] = nat.lower()
+                        if mode_l == "native-tagged":
+                            rec["native_vlan_tagged"] = True
+                        elif mode_l == "native-untagged":
+                            rec["native_vlan_tagged"] = False
+                        allowed_clean = allowed.strip().lower()
+                        rec["trunk_allowed_vlans"] = allowed_clean
+                        if status_l == "up":
+                            rec["trunk_active_vlans"] = allowed_clean
+        except Exception:
+            pass
+
+        try:
+            raw_lacp = conn.send_command("show lacp interfaces")
+            if (
+                isinstance(raw_lacp, str)
+                and raw_lacp.strip()
+                and "Invalid input" not in raw_lacp
+                and "Unknown command" not in raw_lacp
+                and "Incomplete command" not in raw_lacp
+            ):
+                cur_lag = ""
+                for line in raw_lacp.splitlines():
+                    m_agg = re.search(r"Aggregate\s+name\s*:\s*(lag\s*\d+|\S+)", line, re.I)
+                    if m_agg:
+                        cur_lag = re.sub(r"^lag\s+(\d+)$", r"lag\1", m_agg.group(1).strip(), flags=re.I)
+                        continue
+                    if cur_lag:
+                        m_mem = re.match(r"^\s*(\d+/\d+/\d+(?::\d+)?)\s+\d+\s+\d+\s+([A-Z]+)\b", line)
+                        if m_mem:
+                            pname, state_flags = m_mem.group(1), m_mem.group(2)
+                            rec = ops.setdefault(pname, {})
+                            rec["lag_group"] = cur_lag
+                            rec["lacp_mode"] = (
+                                "passive" if ("P" in state_flags and "A" not in state_flags) else "active"
+                            )
+                            continue
+                    # Tabular single-line format: `1/1/1   lag1   active   up`
+                    m_tab = re.match(r"^\s*(\d+/\d+/\d+(?::\d+)?)\s+(lag\d+)\s+(active|passive)\b", line, re.I)
+                    if m_tab:
+                        pname, lag_name, lmode = m_tab.groups()
+                        rec = ops.setdefault(pname, {})
+                        rec["lag_group"] = lag_name.lower()
+                        rec["lacp_mode"] = lmode.lower()
+        except Exception:
+            pass
+
+        return ops

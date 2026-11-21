@@ -375,3 +375,188 @@ class AristaDriver(BaseDriver):
             return conn.send_command("show running-config")
         except Exception:
             return ""
+
+    @staticmethod
+    def _eos_vlans_to_str(val) -> str:
+        """Normalize Arista EOS JSON VLAN container (dict, list, or str) into a comma-separated string."""
+        if not val:
+            return ""
+        if isinstance(val, str):
+            return val.strip().lower()
+        if isinstance(val, dict):
+            inner = val.get("vlanIds")
+            if inner is None:
+                inner = val.get("vlans")
+            if inner is None:
+                return ""
+            val = inner
+        if isinstance(val, list):
+            parts = [str(v).strip() for v in val if str(v).strip()]
+            return ",".join(parts)
+        return str(val).strip()
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        ops: dict[str, dict] = {}
+
+        # 1. Operational trunk state (`show interfaces trunk | json` with text fallback)
+        parsed_trunk_json = False
+        try:
+            raw_trunk = conn.send_command("show interfaces trunk | json")
+            if isinstance(raw_trunk, str) and raw_trunk.strip().startswith("{"):
+                data = json.loads(raw_trunk)
+                trunks = data.get("trunks") or data.get("interfaces") or {}
+                if isinstance(trunks, dict):
+                    for port, pdata in trunks.items():
+                        if not isinstance(pdata, dict):
+                            continue
+                        parsed_trunk_json = True
+                        status = str(pdata.get("status") or "trunking").lower()
+                        oper_m = (
+                            "trunk"
+                            if ("trunk" in status or status == "up")
+                            else ("down" if status == "down" else "access")
+                        )
+                        encap_raw = str(pdata.get("encapsulation") or "dot1q").lower()
+                        encap = "isl" if "isl" in encap_raw else "dot1q"
+                        rec = ops.setdefault(port, {})
+                        rec["mode"] = "trunk" if oper_m == "trunk" else rec.get("mode", "trunk")
+                        rec["oper_mode"] = oper_m
+                        rec["encapsulation"] = encap
+                        nat = pdata.get("nativeVlan", pdata.get("nativeVlanId"))
+                        if nat is not None and str(nat).strip():
+                            rec["native_vlan"] = str(nat).strip()
+                        allowed = self._eos_vlans_to_str(pdata.get("allowedVlans") or pdata.get("allowed"))
+                        if allowed:
+                            rec["trunk_allowed_vlans"] = allowed
+                        active = self._eos_vlans_to_str(
+                            pdata.get("activeVlans") or pdata.get("forwardingVlans") or pdata.get("active")
+                        )
+                        if active:
+                            rec["trunk_active_vlans"] = active
+                        if "nativeVlanTagged" in pdata:
+                            rec["native_vlan_tagged"] = bool(pdata["nativeVlanTagged"])
+        except Exception:
+            pass
+
+        if not parsed_trunk_json:
+            try:
+                raw_txt = conn.send_command("show interfaces trunk")
+                if (
+                    isinstance(raw_txt, str)
+                    and raw_txt.strip()
+                    and "Invalid input" not in raw_txt
+                    and "Unrecognized" not in raw_txt
+                ):
+                    section = ""
+                    for line in raw_txt.splitlines():
+                        stripped = line.strip()
+                        if not stripped or set(stripped) <= {"-", "="}:
+                            continue
+                        low = stripped.lower()
+                        if "mode" in low and "native vlan" in low:
+                            section = "mode"
+                            continue
+                        if "vlans allowed on trunk" in low:
+                            section = "allowed"
+                            continue
+                        if "vlans allowed and active" in low:
+                            section = "active"
+                            continue
+                        if "vlans in spanning tree forwarding" in low:
+                            section = "forwarding"
+                            continue
+                        if low.startswith("port "):
+                            continue
+                        if section == "mode":
+                            m_eos = re.match(
+                                r"^\s*(\S+)\s+(on|trunk|auto|desirable)\s+(?:(\S+)\s+)?(trunking|not-trunking)\s+(\d+)",
+                                line,
+                                re.I,
+                            )
+                            if m_eos:
+                                p, _mode_t, _enc, status_t, nat = m_eos.groups()
+                                rec = ops.setdefault(p, {})
+                                is_trk = status_t.lower() == "trunking"
+                                rec["mode"] = "trunk" if is_trk else "access"
+                                rec["oper_mode"] = "trunk" if is_trk else "access"
+                                rec["encapsulation"] = "dot1q"
+                                rec["native_vlan"] = nat
+                        elif section == "allowed":
+                            m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                            if m:
+                                p, vlans = m.group(1), m.group(2).lower()
+                                rec = ops.setdefault(p, {})
+                                rec["mode"] = "trunk"
+                                rec.setdefault("oper_mode", "trunk")
+                                rec["trunk_allowed_vlans"] = vlans
+                        elif section == "active":
+                            m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                            if m:
+                                p, vlans = m.group(1), m.group(2).lower()
+                                rec = ops.setdefault(p, {})
+                                rec.setdefault("mode", "trunk")
+                                rec.setdefault("oper_mode", "trunk")
+                                rec["trunk_active_vlans"] = vlans
+                        elif section == "forwarding":
+                            m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                            if m:
+                                p, vlans = m.group(1), m.group(2).lower()
+                                rec = ops.setdefault(p, {})
+                                if not rec.get("trunk_active_vlans"):
+                                    rec["trunk_active_vlans"] = vlans
+            except Exception:
+                pass
+
+        # 2. Operational Port-Channel / LAG state (`show port-channel summary | json` with text fallback)
+        parsed_pc_json = False
+        try:
+            raw_pc = conn.send_command("show port-channel summary | json")
+            if isinstance(raw_pc, str) and raw_pc.strip().startswith("{"):
+                data = json.loads(raw_pc)
+                pcs = data.get("portChannels", {})
+                if isinstance(pcs, dict):
+                    for pc_name, pc_info in pcs.items():
+                        if not isinstance(pc_info, dict):
+                            continue
+                        parsed_pc_json = True
+                        proto = str(pc_info.get("protocol") or "lacp").lower()
+                        ports_obj = pc_info.get("ports", {})
+                        if isinstance(ports_obj, dict):
+                            for m_port, m_info in ports_obj.items():
+                                lacp_m = str(m_info.get("lacpMode") or "").lower() if isinstance(m_info, dict) else ""
+                                if lacp_m not in ("active", "passive", "on"):
+                                    lacp_m = "active" if "lacp" in proto else "on"
+                                rec = ops.setdefault(m_port, {})
+                                rec["lag_group"] = pc_name
+                                rec["lacp_mode"] = lacp_m
+                        elif isinstance(ports_obj, list):
+                            for m_port in ports_obj:
+                                if isinstance(m_port, str) and m_port:
+                                    rec = ops.setdefault(m_port, {})
+                                    rec["lag_group"] = pc_name
+                                    rec["lacp_mode"] = "active" if "lacp" in proto else "on"
+        except Exception:
+            pass
+
+        if not parsed_pc_json:
+            try:
+                raw_pc_txt = conn.send_command("show port-channel summary")
+                if isinstance(raw_pc_txt, str) and raw_pc_txt.strip() and "Invalid input" not in raw_pc_txt:
+                    for line in raw_pc_txt.splitlines():
+                        m_pc = re.match(
+                            r"^\s*\d+\s+(Po\d+|Port-Channel\d+)\([^)]*\)\s+(LACP|STATIC|-)\s+(.+)$",
+                            line,
+                            re.I,
+                        )
+                        if m_pc:
+                            pc_name, proto, members_str = m_pc.group(1), m_pc.group(2).lower(), m_pc.group(3)
+                            for tok in members_str.split():
+                                pname = re.sub(r"\([^)]*\)$", "", tok).strip()
+                                if pname:
+                                    rec = ops.setdefault(pname, {})
+                                    rec["lag_group"] = pc_name
+                                    rec["lacp_mode"] = "active" if proto == "lacp" else "on"
+            except Exception:
+                pass
+
+        return ops

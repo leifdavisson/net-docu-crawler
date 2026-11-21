@@ -351,3 +351,110 @@ class CiscoSMBDriver(BaseDriver):
             return conn.send_command("show running-config")
         except Exception:
             return ""
+
+    def get_l2_operational(self, conn) -> dict[str, dict]:
+        ops: dict[str, dict] = {}
+        try:
+            raw_sw = conn.send_command("show interfaces switchport")
+            if (
+                isinstance(raw_sw, str)
+                and raw_sw.strip()
+                and "Invalid input" not in raw_sw
+                and "Unrecognized command" not in raw_sw
+            ):
+                cur_port = ""
+                cur_mode = ""
+                cur_native = ""
+                tagged: list[str] = []
+                untagged: list[str] = []
+
+                def _flush_port() -> None:
+                    if not cur_port:
+                        return
+                    mode_l = cur_mode.lower()
+                    all_vids = sorted(set(tagged) | set(untagged), key=int)
+                    rec = ops.setdefault(cur_port, {})
+                    rec["encapsulation"] = "dot1q"
+                    if mode_l in ("customer", "dot1q-tunnel"):
+                        rec["mode"] = "trunk"
+                        rec["admin_mode"] = "dot1q_tunnel"
+                        rec["oper_mode"] = "dot1q_tunnel"
+                        rec["qinq_tunnel"] = True
+                    elif mode_l == "trunk" or (mode_l == "general" and tagged):
+                        rec["mode"] = "trunk"
+                        rec["admin_mode"] = "trunk"
+                        rec["oper_mode"] = "trunk"
+                        if all_vids:
+                            vspec = ",".join(all_vids)
+                            rec["trunk_active_vlans"] = vspec
+                            rec["trunk_allowed_vlans"] = vspec
+                        if untagged:
+                            rec["native_vlan"] = cur_native if cur_native and cur_native != "none" else untagged[0]
+                            rec["native_vlan_tagged"] = False
+                        elif cur_native and cur_native != "none" and not tagged:
+                            rec["native_vlan"] = cur_native
+                            rec["native_vlan_tagged"] = False
+                        else:
+                            rec["native_vlan"] = "none"
+                            rec["native_vlan_tagged"] = True
+                    elif mode_l == "access" or untagged:
+                        rec["mode"] = "access"
+                        rec["admin_mode"] = "access"
+                        rec["oper_mode"] = "access"
+                        if untagged:
+                            rec["access_vlan"] = untagged[0]
+                        elif cur_native and cur_native != "none":
+                            rec["access_vlan"] = cur_native
+
+                for line in raw_sw.splitlines():
+                    m_port = re.match(r"^\s*Port\s*:\s*(\S+)", line, re.I)
+                    if m_port:
+                        _flush_port()
+                        cur_port = m_port.group(1).strip()
+                        cur_mode = ""
+                        cur_native = ""
+                        tagged = []
+                        untagged = []
+                        continue
+                    if not cur_port:
+                        continue
+                    m_mode = re.match(r"^\s*Port\s+Mode\s*:\s*(\S+)", line, re.I)
+                    if m_mode:
+                        cur_mode = m_mode.group(1).strip().lower()
+                        continue
+                    m_nat = re.match(r"^\s*Ingress\s+UnTagged\s+VLAN[^:]*:\s*(\d+|none)", line, re.I)
+                    if m_nat:
+                        cur_native = m_nat.group(1).strip().lower()
+                        continue
+                    m_row = re.match(r"^\s*(\d{1,4})\s+\S+.*?\b(Tagged|Untagged)\b", line, re.I)
+                    if m_row:
+                        vid, egress = m_row.group(1), m_row.group(2).lower()
+                        if 1 <= int(vid) <= 4094:
+                            bucket = tagged if egress == "tagged" else untagged
+                            if vid not in bucket:
+                                bucket.append(vid)
+                _flush_port()
+        except Exception:
+            pass
+
+        try:
+            raw_pc = conn.send_command("show interfaces port-channel")
+            if (
+                isinstance(raw_pc, str)
+                and raw_pc.strip()
+                and "Invalid input" not in raw_pc
+                and "Unrecognized command" not in raw_pc
+            ):
+                for line in raw_pc.splitlines():
+                    m_pc = re.match(r"^\s*(Po\d+)\s+.*?(?:Active|Inactive|Up|Down)\s*:\s*(\S+)", line, re.I)
+                    if m_pc:
+                        po_name, members = m_pc.group(1), m_pc.group(2)
+                        for m_port in members.split(","):
+                            pname = m_port.strip()
+                            if pname:
+                                ops.setdefault(pname, {})["lag_group"] = po_name
+                                ops[pname]["lacp_mode"] = "active"
+        except Exception:
+            pass
+
+        return ops

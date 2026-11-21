@@ -78,9 +78,27 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
         rec["speed_operational"] = stats.get("speed") or ""
         rec["duplex"] = stats.get("duplex") or ""
         rec["mtu"] = stats.get("mtu")
+        rec["admin_mode"] = "unknown"
+        rec["oper_mode"] = ""
+        rec["native_vlan_tagged"] = False
+        rec["trunk_active_vlans"] = ""
+        rec["encapsulation"] = "dot1q"
+        rec["qinq_tunnel"] = False
+        rec["is_subinterface_bundle"] = False
 
         if prof:
             rec["mode"] = prof.get("mode") or "unknown"
+            rec["admin_mode"] = str(prof.get("admin_mode") or rec["mode"])
+            rec["oper_mode"] = str(prof.get("oper_mode") or "")
+            rec["native_vlan_tagged"] = bool(prof.get("native_vlan_tagged", False))
+            raw_active = prof.get("trunk_active_vlans")
+            if isinstance(raw_active, (list, set, tuple)):
+                rec["trunk_active_vlans"] = ",".join(str(v).strip() for v in raw_active if str(v).strip())
+            else:
+                rec["trunk_active_vlans"] = str(raw_active or "").strip()
+            rec["encapsulation"] = str(prof.get("encapsulation") or "dot1q").strip()
+            rec["qinq_tunnel"] = bool(prof.get("qinq_tunnel", False))
+            rec["is_subinterface_bundle"] = bool(prof.get("is_subinterface_bundle", False))
             rec["access_vlan"] = str(prof.get("access_vlan") or "")
             rec["voice_vlan"] = str(prof.get("voice_vlan") or "")
             nat = str(prof.get("native_vlan") or "").strip()
@@ -280,9 +298,15 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
 
 def correlate_dataset(raw_devices: list[dict]) -> dict:
     """Run all Phase 4 correlation passes across `raw_devices`."""
+    from net_docu_crawler.trunk_audit import evaluate_trunk_mismatches
+
     for dev in raw_devices:
         stamp_schema_v2(dev)
         if dev.get("status", "success") == "success":
             correlate_device_ports(dev)
     compute_stp_root_consensus(raw_devices)
-    return {"l3_svi_table": build_l3_svi_table(raw_devices)}
+    trunk_audit_result = evaluate_trunk_mismatches(raw_devices)
+    return {
+        "l3_svi_table": build_l3_svi_table(raw_devices),
+        "trunk_audit": trunk_audit_result,
+    }

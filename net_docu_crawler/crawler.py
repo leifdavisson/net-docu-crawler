@@ -1591,9 +1591,10 @@ def render_deliverables_from_dataset(
     from net_docu_crawler.domain_detector import detect_environment_dns_domain
     from net_docu_crawler.quality_gates import evaluate_quality_gates, write_quality_report
 
-    correlate_dataset(raw_devices)
+    corr_result = correlate_dataset(raw_devices)
+    trunk_audit = corr_result.get("trunk_audit") if isinstance(corr_result, dict) else None
     dns_info = detect_environment_dns_domain(raw_devices)
-    quality_report = evaluate_quality_gates(raw_devices)
+    quality_report = evaluate_quality_gates(raw_devices, trunk_audit=trunk_audit)
     if dns_info["primary_domain"]:
         quality_report["dns_domain"] = dns_info["primary_domain"]
     if dns_info["local_dns_suffix"]:
@@ -1710,6 +1711,13 @@ def render_deliverables_from_dataset(
     report_generator.generate_protocol_translation(devices_dict, output_path=trans_path)
     print(f"[+] Generated configuration translation guide: {trans_path}")
 
+    trunk_rep_path = os.path.join(run_output_dir, "trunk_vlan_audit.md")
+    report_generator.generate_trunk_audit_report(
+        trunk_audit if trunk_audit is not None else raw_devices,
+        output_path=trunk_rep_path,
+    )
+    print(f"[+] Generated trunk VLAN audit report: {trunk_rep_path}")
+
     bom_path = os.path.join(run_output_dir, "bom_hardware_sizing.csv")
     report_generator.generate_bom_hardware_sizing(
         devices_dict,
@@ -1798,12 +1806,19 @@ def render_deliverables_from_dataset(
         (l2_path, os.path.join(rep_dir, "L2_network_diagrams.md")),
         (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
         (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
+        (trunk_rep_path, os.path.join(rep_dir, "trunk_vlan_audit.md")),
     ]
     for src_p, dst_p in _layer_copies:
         if os.path.isfile(src_p):
             shutil.copy2(src_p, dst_p)
 
-    report_generator.export_layered_csvs(raw_devices, registry, run_output_dir, source_logs_dir=logs_dir)
+    report_generator.export_layered_csvs(
+        raw_devices,
+        registry,
+        run_output_dir,
+        source_logs_dir=logs_dir,
+        trunk_audit=trunk_audit,
+    )
 
     # Run directory already holds deliverables/<Subnet>_<TimeStamp>_<domain>/; do not mirror into docs/net_docu_crawler/
 

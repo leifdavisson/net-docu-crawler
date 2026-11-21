@@ -352,36 +352,112 @@ class CiscoDriver(BaseDriver):
         ops: dict[str, dict] = {}
         try:
             raw_trunk = conn.send_command("show interfaces trunk")
-            if raw_trunk and "Invalid input" not in raw_trunk:
+            if (
+                isinstance(raw_trunk, str)
+                and raw_trunk.strip()
+                and "Invalid input" not in raw_trunk
+                and "Unrecognized command" not in raw_trunk
+            ):
                 section = ""
                 for line in raw_trunk.splitlines():
-                    if "Mode" in line and "Native vlan" in line:
-                        section = "mode"
+                    stripped = line.strip()
+                    if not stripped or set(stripped) <= {"-", "="}:
                         continue
-                    if "Vlans allowed on trunk" in line:
+                    low = stripped.lower()
+                    if "mode" in low and "native vlan" in low:
+                        section = "mode_ios"
+                        continue
+                    if "native" in low and "status" in low and "port" in low:
+                        section = "mode_nxos"
+                        continue
+                    if "vlans allowed on trunk" in low:
                         section = "allowed"
                         continue
-                    if "Vlans in spanning tree" in line:
+                    if "vlans allowed and active" in low:
+                        section = "active"
+                        continue
+                    if "vlans in spanning tree forwarding" in low or "stp forwarding" in low:
+                        section = "forwarding"
+                        continue
+                    if "vlans err-disabled" in low or low.startswith("vlans "):
                         section = "other"
                         continue
-                    if section == "mode":
-                        m = re.match(r"^\s*(\S+)\s+(?:on|auto|desirable|trunk)\s+\S+\s+trunking\s+(\d+)", line, re.I)
+                    if low.startswith("port ") or low.startswith("vlan "):
+                        continue
+
+                    if section == "mode_ios":
+                        m = re.match(
+                            r"^\s*(\S+)\s+(on|auto|desirable|trunk|off)\s+(\S+)\s+(trunking|not-trunking)\s+(\d+)",
+                            line,
+                            re.I,
+                        )
                         if m:
-                            p, nat = m.group(1), m.group(2)
-                            ops.setdefault(p, {})["mode"] = "trunk"
-                            ops[p]["native_vlan"] = nat
+                            p, mode_tok, encap_tok, status_tok, nat = m.groups()
+                            if p.lower() == "port":
+                                continue
+                            mode_l = mode_tok.lower()
+                            encap_l = encap_tok.lower()
+                            status_l = status_tok.lower()
+                            admin_m = (
+                                "dynamic_auto"
+                                if mode_l == "auto"
+                                else (
+                                    "dynamic_desirable"
+                                    if mode_l == "desirable"
+                                    else ("trunk" if mode_l in ("on", "trunk") else "access")
+                                )
+                            )
+                            encap = "isl" if "isl" in encap_l else ("negotiate" if "neg" in encap_l else "dot1q")
+                            oper_m = "trunk" if status_l == "trunking" else "access"
+                            entry = ops.setdefault(p, {})
+                            entry["mode"] = "trunk" if status_l == "trunking" else "access"
+                            entry["admin_mode"] = admin_m
+                            entry["oper_mode"] = oper_m
+                            entry["encapsulation"] = encap
+                            entry["native_vlan"] = nat
+                    elif section == "mode_nxos":
+                        m_nx = re.match(r"^\s*(\S+)\s+(\d+)\s+(trunking|not-trunking)\b", line, re.I)
+                        if m_nx:
+                            p, nat, status_tok = m_nx.groups()
+                            if p.lower() == "port":
+                                continue
+                            status_l = status_tok.lower()
+                            entry = ops.setdefault(p, {})
+                            entry["mode"] = "trunk" if status_l == "trunking" else "access"
+                            entry["oper_mode"] = "trunk" if status_l == "trunking" else "access"
+                            entry["encapsulation"] = "dot1q"
+                            entry["native_vlan"] = nat
                     elif section == "allowed":
-                        m = re.match(r"^\s*(\S+)\s+([\d,-]+)", line)
-                        if m:
-                            p, vlans = m.group(1), m.group(2)
-                            ops.setdefault(p, {})["mode"] = "trunk"
-                            ops[p]["trunk_allowed_vlans"] = vlans
+                        m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                        if m and m.group(1).lower() != "port":
+                            p, vlans = m.group(1), m.group(2).lower()
+                            entry = ops.setdefault(p, {})
+                            entry["mode"] = "trunk"
+                            entry.setdefault("oper_mode", "trunk")
+                            entry["trunk_allowed_vlans"] = vlans
+                    elif section == "active":
+                        m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                        if m and m.group(1).lower() != "port":
+                            p, vlans = m.group(1), m.group(2).lower()
+                            entry = ops.setdefault(p, {})
+                            entry.setdefault("mode", "trunk")
+                            entry.setdefault("oper_mode", "trunk")
+                            entry["trunk_active_vlans"] = vlans
+                    elif section == "forwarding":
+                        m = re.match(r"^\s*(\S+)\s+([\d,-]+|none|all)\s*$", line, re.I)
+                        if m and m.group(1).lower() != "port":
+                            p, vlans = m.group(1), m.group(2).lower()
+                            entry = ops.setdefault(p, {})
+                            entry.setdefault("mode", "trunk")
+                            entry.setdefault("oper_mode", "trunk")
+                            if not entry.get("trunk_active_vlans"):
+                                entry["trunk_active_vlans"] = vlans
         except Exception:
             pass
 
         try:
             raw_ec = conn.send_command("show etherchannel summary")
-            if raw_ec and "Invalid input" not in raw_ec:
+            if isinstance(raw_ec, str) and raw_ec.strip() and "Invalid input" not in raw_ec:
                 for line in raw_ec.splitlines():
                     m_ec = re.match(r"^\s*\d+\s+(Po\d+)\(\S+\)\s+(LACP|PAgP|-)\s+(.+)$", line, re.I)
                     if m_ec:

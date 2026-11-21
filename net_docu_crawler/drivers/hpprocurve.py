@@ -685,7 +685,7 @@ class HPProCurveDriver(BaseDriver):
         ops: dict[str, dict] = {}
         try:
             raw_trunks = conn.send_command("show trunks")
-            if raw_trunks and "Invalid input" not in raw_trunks:
+            if isinstance(raw_trunks, str) and raw_trunks and "Invalid input" not in raw_trunks:
                 for line in raw_trunks.splitlines():
                     m_tr = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|.*?\b(Trk\d+)\s+(LACP|Trunk|Dyn\d*)", line, re.I)
                     if m_tr:
@@ -697,7 +697,7 @@ class HPProCurveDriver(BaseDriver):
 
         try:
             raw_lacp = conn.send_command("show lacp")
-            if raw_lacp and "Invalid input" not in raw_lacp:
+            if isinstance(raw_lacp, str) and raw_lacp and "Invalid input" not in raw_lacp:
                 for line in raw_lacp.splitlines():
                     m_lc = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(Trk\d+)\s+.*?(Active|Passive)", line, re.I)
                     if m_lc:
@@ -708,8 +708,74 @@ class HPProCurveDriver(BaseDriver):
             pass
 
         try:
+            raw_vp = conn.send_command("show vlans ports all")
+            if (
+                isinstance(raw_vp, str)
+                and raw_vp.strip()
+                and "Invalid input" not in raw_vp
+                and "Incomplete input" not in raw_vp
+            ):
+                port_vlans: dict[str, dict] = {}
+                cur_port = ""
+                for line in raw_vp.splitlines():
+                    m_ph = re.match(r"^\s*Port\s+name\s*:\s*(\S+)", line, re.I)
+                    if m_ph:
+                        cur_port = m_ph.group(1).strip()
+                        port_vlans.setdefault(cur_port, {"tagged": [], "untagged": "", "voice": set()})
+                        continue
+                    if not cur_port:
+                        continue
+                    m_vr = re.match(
+                        r"^\s*(\d{1,4})\s+.*\|\s+\S+\s+(Yes|No)\s+(?:Yes|No)\s+(Tagged|Untagged)\b",
+                        line,
+                        re.I,
+                    )
+                    if not m_vr:
+                        m_vr_simple = re.match(r"^\s*(\d{1,4})\s+\S+.*?\b(Tagged|Untagged)\b", line, re.I)
+                        if m_vr_simple:
+                            vid, mode_tok = m_vr_simple.group(1), m_vr_simple.group(2).lower()
+                            is_voice = False
+                        else:
+                            continue
+                    else:
+                        vid, voice_tok, mode_tok = m_vr.group(1), m_vr.group(2).lower(), m_vr.group(3).lower()
+                        is_voice = voice_tok == "yes"
+
+                    pv = port_vlans[cur_port]
+                    if is_voice:
+                        pv["voice"].add(vid)
+                    if mode_tok == "tagged":
+                        if vid not in pv["tagged"]:
+                            pv["tagged"].append(vid)
+                    else:
+                        pv["untagged"] = vid
+
+                for port, pv in port_vlans.items():
+                    tagged = pv["tagged"]
+                    untagged = pv["untagged"]
+                    non_voice_tagged = [v for v in tagged if v not in pv["voice"]]
+                    if non_voice_tagged:
+                        all_active = sorted(set(tagged) | ({untagged} if untagged else set()), key=int)
+                        rec = ops.setdefault(port, {})
+                        rec["mode"] = "trunk"
+                        rec["oper_mode"] = "trunk"
+                        rec["encapsulation"] = "dot1q"
+                        rec["trunk_active_vlans"] = ",".join(all_active)
+                        rec["native_vlan"] = untagged or "none"
+                        rec["native_vlan_tagged"] = not bool(untagged)
+                    elif untagged:
+                        rec = ops.setdefault(port, {})
+                        rec["mode"] = "access"
+                        rec["oper_mode"] = "access"
+                        rec["encapsulation"] = "dot1q"
+                        rec["access_vlan"] = untagged
+                        rec["native_vlan_tagged"] = False
+        except Exception:
+            pass
+
+        try:
             raw_stp = conn.send_command("show spanning-tree detail")
-            if raw_stp and "Invalid input" not in raw_stp:
+            if isinstance(raw_stp, str) and raw_stp and "Invalid input" not in raw_stp:
                 for line in raw_stp.splitlines():
                     m_st = re.match(
                         r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+\|\s+(?:100Mb|1Gb|10Gb|\S+)\s+\|\s+\d+\s+\|\s+(\S+)\s+\|\s+(\S+)",
@@ -724,7 +790,7 @@ class HPProCurveDriver(BaseDriver):
 
         try:
             raw_auth = conn.send_command("show port-access authenticator")
-            if raw_auth and "Invalid input" not in raw_auth:
+            if isinstance(raw_auth, str) and raw_auth and "Invalid input" not in raw_auth:
                 for line in raw_auth.splitlines():
                     m_au = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(?:Enabled|Active)", line, re.I)
                     if m_au:

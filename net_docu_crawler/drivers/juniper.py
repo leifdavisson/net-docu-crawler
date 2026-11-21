@@ -1007,25 +1007,161 @@ class JuniperDriver(BaseDriver):
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
         ops: dict[str, dict] = {}
+        parsed_es_json = False
         try:
             raw_es = conn.send_command("show ethernet-switching interfaces | display json")
-            if raw_es and raw_es.strip().startswith("{"):
+            if isinstance(raw_es, str) and raw_es.strip().startswith("{"):
                 data = json.loads(raw_es)
-                for entry in data.get("l2ng-l2ald-iff-interface-information", [{}])[0].get(
+                entries = data.get("l2ng-l2ald-iff-interface-information", [{}])[0].get(
                     "l2ng-l2ald-iff-interface-entry", []
-                ):
+                )
+                for entry in entries:
                     iname = (entry.get("l2ng-l2ald-iff-interface-name", [{}])[0].get("data") or "").split(".")[0]
                     if not iname:
                         continue
+                    parsed_es_json = True
                     mode = (entry.get("l2ng-l2ald-iff-port-mode", [{}])[0].get("data") or "").lower()
+                    state = (
+                        entry.get("l2ng-l2ald-iff-interface-state", [{}])[0].get("data")
+                        or entry.get("l2ng-l2ald-iff-interface-status", [{}])[0].get("data")
+                        or "up"
+                    ).lower()
+                    flags = (entry.get("l2ng-l2ald-iff-interface-flags", [{}])[0].get("data") or "").upper()
+                    is_down = state == "down" or "DN" in flags.split()
+
+                    # Extract operational VLAN members & tagness
+                    member_nodes: list[dict] = []
+                    for vlist in entry.get("l2ng-l2ald-iff-interface-vlan-member-list", []):
+                        if isinstance(vlist, dict):
+                            member_nodes.extend(vlist.get("l2ng-l2ald-iff-interface-vlan-member", []))
+                    if not member_nodes:
+                        member_nodes = entry.get("l2ng-l2ald-iff-interface-vlan-member", [])
+
+                    active_vids: list[str] = []
+                    tagged_vids: list[str] = []
+                    untagged_vid = ""
+                    for m_node in member_nodes:
+                        if not isinstance(m_node, dict):
+                            continue
+                        tag_id = (
+                            m_node.get("l2ng-l2ald-iff-interface-vlan-member-tagid", [{}])[0].get("data")
+                            or m_node.get("l2ng-l2ald-iff-interface-vlan-id", [{}])[0].get("data")
+                            or ""
+                        ).strip()
+                        tagness = (
+                            m_node.get("l2ng-l2ald-iff-interface-vlan-member-tagness", [{}])[0].get("data")
+                            or m_node.get("l2ng-l2ald-iff-interface-vlan-member-tagging", [{}])[0].get("data")
+                            or ""
+                        ).lower()
+                        if tag_id.isdigit():
+                            if tag_id not in active_vids:
+                                active_vids.append(tag_id)
+                            if tagness == "untagged":
+                                untagged_vid = tag_id
+                            elif tagness == "tagged" and tag_id not in tagged_vids:
+                                tagged_vids.append(tag_id)
+
+                    if mode not in ("access", "trunk"):
+                        if tagged_vids or len(active_vids) > 1:
+                            mode = "trunk"
+                        elif untagged_vid:
+                            mode = "access"
+
                     if mode in ("access", "trunk"):
-                        ops.setdefault(iname, {})["mode"] = mode
+                        rec = ops.setdefault(iname, {})
+                        rec["mode"] = mode
+                        rec["oper_mode"] = "down" if is_down else mode
+                        rec["encapsulation"] = "dot1q"
+                        if mode == "trunk":
+                            if active_vids:
+                                sorted_vids = sorted(active_vids, key=int)
+                                rec["trunk_active_vlans"] = ",".join(sorted_vids)
+                            if untagged_vid:
+                                rec["native_vlan"] = untagged_vid
+                                rec["native_vlan_tagged"] = False
+                            elif active_vids:
+                                rec["native_vlan"] = "none"
+                                rec["native_vlan_tagged"] = True
+                        elif mode == "access" and untagged_vid:
+                            rec["access_vlan"] = untagged_vid
         except Exception:
             pass
 
+        # Text fallback for `show ethernet-switching interfaces` (ELS & pre-ELS Junos)
+        if not parsed_es_json:
+            try:
+                raw_es_txt = conn.send_command("show ethernet-switching interfaces")
+                if (
+                    isinstance(raw_es_txt, str)
+                    and raw_es_txt.strip()
+                    and "syntax error" not in raw_es_txt.lower()
+                    and "unknown command" not in raw_es_txt.lower()
+                    and "invalid" not in raw_es_txt.lower()
+                ):
+                    parsed_ports: dict[str, dict] = {}
+                    cur_if = ""
+                    for line in raw_es_txt.splitlines():
+                        if not line.strip():
+                            continue
+                        low = line.strip().lower()
+                        if low.startswith(("routing instance", "logical", "interface", "---")):
+                            continue
+                        m_if = re.match(r"^\s*((?:ge-|xe-|et-|fe-|mge-|ae\d)\S*)\s+(.*)$", line)
+                        if m_if:
+                            cur_if = m_if.group(1).split(".")[0]
+                            tail = m_if.group(2)
+                            p_state = parsed_ports.setdefault(cur_if, {"down": False, "tagged": [], "untagged": []})
+                            if re.match(r"^down\b", tail, re.I) or re.search(r"\bDN\b", tail):
+                                p_state["down"] = True
+                        elif cur_if and line[0].isspace():
+                            tail = line.strip()
+                            p_state = parsed_ports[cur_if]
+                            if re.search(r"\bDN\b", tail):
+                                p_state["down"] = True
+                        else:
+                            continue
+
+                        # Match ELS (`VLAN_NAME  10  65535  Forwarding  tagged`) or pre-ELS (`[up|down] VLAN_NAME  10  tagged`)
+                        m_row = re.search(
+                            r"^\s*(?:(?:up|down)\s+)?\S+\s+(\d{1,4})\s+(?:\d+\s+\S+.*?)?\b(tagged|untagged)\b",
+                            tail,
+                            re.I,
+                        )
+                        if m_row:
+                            vid, tagness = m_row.group(1), m_row.group(2).lower()
+                            if 1 <= int(vid) <= 4094:
+                                bucket = p_state["tagged"] if tagness == "tagged" else p_state["untagged"]
+                                if vid not in bucket:
+                                    bucket.append(vid)
+
+                    for iname, p_state in parsed_ports.items():
+                        tagged = p_state["tagged"]
+                        untagged = p_state["untagged"]
+                        all_vids = sorted(set(tagged) | set(untagged), key=int)
+                        if not all_vids:
+                            continue
+                        rec = ops.setdefault(iname, {})
+                        rec["encapsulation"] = "dot1q"
+                        if tagged or len(all_vids) > 1:
+                            rec["mode"] = "trunk"
+                            rec["oper_mode"] = "down" if p_state["down"] else "trunk"
+                            rec["trunk_active_vlans"] = ",".join(all_vids)
+                            if untagged:
+                                rec["native_vlan"] = untagged[0]
+                                rec["native_vlan_tagged"] = False
+                            else:
+                                rec["native_vlan"] = "none"
+                                rec["native_vlan_tagged"] = True
+                        elif untagged:
+                            rec["mode"] = "access"
+                            rec["oper_mode"] = "down" if p_state["down"] else "access"
+                            rec["access_vlan"] = untagged[0]
+            except Exception:
+                pass
+
         try:
             raw_lacp = conn.send_command("show lacp interfaces | display json")
-            if raw_lacp and raw_lacp.strip().startswith("{"):
+            if isinstance(raw_lacp, str) and raw_lacp.strip().startswith("{"):
                 data = json.loads(raw_lacp)
                 for grp_blk in data.get("lacp-interface-information-list", [{}])[0].get(
                     "lacp-interface-information", []
@@ -1043,7 +1179,7 @@ class JuniperDriver(BaseDriver):
 
         try:
             raw_stp = conn.send_command("show spanning-tree interface | display json")
-            if raw_stp and raw_stp.strip().startswith("{"):
+            if isinstance(raw_stp, str) and raw_stp.strip().startswith("{"):
                 data = json.loads(raw_stp)
                 for stp_blk in data.get("stp-interface-information", []):
                     for p_ent in stp_blk.get("stp-interface-entry", []):
@@ -1061,7 +1197,7 @@ class JuniperDriver(BaseDriver):
 
         try:
             raw_dot1x = conn.send_command("show dot1x interface | display json")
-            if raw_dot1x and raw_dot1x.strip().startswith("{"):
+            if isinstance(raw_dot1x, str) and raw_dot1x.strip().startswith("{"):
                 data = json.loads(raw_dot1x)
                 for d_ent in data.get("dot1x-interface-information", [{}])[0].get("interface", []):
                     pname = (d_ent.get("interface-name", [{}])[0].get("data") or "").split(".")[0]

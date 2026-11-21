@@ -24,6 +24,87 @@ import re
 import xml.etree.ElementTree as ET
 
 
+def _extract_indented_stanza_body(lines: list[str]) -> str:
+    """Return lines belonging to an indented CLI interface/VLAN stanza."""
+    body_lines: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if stripped == "!" or stripped.lower() == "exit":
+            break
+        if not ln[0].isspace():
+            break
+        body_lines.append(ln)
+    return "\n".join(body_lines)
+
+
+def _expand_numeric_vlan_tokens(spec: str) -> set[int] | None:
+    """Expand a purely numeric Cisco/EOS VLAN spec like '1,10-12' into a set of ints, or None if non-numeric."""
+    out: set[int] = set()
+    for raw_tok in spec.split(","):
+        tok = raw_tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            parts = tok.split("-", 1)
+            if parts[0].isdigit() and parts[1].isdigit():
+                s_i, e_i = int(parts[0]), int(parts[1])
+                if 1 <= s_i <= e_i <= 4094:
+                    out.update(range(s_i, e_i + 1))
+                    continue
+            return None
+        if tok.isdigit():
+            val = int(tok)
+            if 1 <= val <= 4094:
+                out.add(val)
+                continue
+        return None
+    return out
+
+
+def _compact_vlan_set(vids: set[int]) -> str:
+    """Format a set of VLAN IDs compactly (e.g. {1, 10, 11, 12, 20} -> '1,10-12,20')."""
+    if not vids:
+        return "none"
+    sorted_ids = sorted(vids)
+    ranges: list[str] = []
+    start = prev = sorted_ids[0]
+    for v in sorted_ids[1:]:
+        if v == prev + 1:
+            prev = v
+        else:
+            ranges.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = v
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(ranges)
+
+
+def _merge_allowed_vlan_directive(existing: str, directive: str) -> str:
+    """Apply a Cisco/NX-OS/Arista `switchport trunk allowed vlan <directive>` line."""
+    spec = directive.strip()
+    if not spec:
+        return existing
+    low = spec.lower()
+    if low.startswith("add "):
+        add_part = spec[4:].strip()
+        if not add_part:
+            return existing
+        if not existing or existing.lower() == "none":
+            return add_part
+        if existing.lower() == "all":
+            return "all"
+        return f"{existing},{add_part}"
+    if low.startswith("remove "):
+        rem_part = spec[7:].strip()
+        cur_set = _expand_numeric_vlan_tokens(existing) if existing else None
+        rem_set = _expand_numeric_vlan_tokens(rem_part)
+        if cur_set is not None and rem_set is not None:
+            return _compact_vlan_set(cur_set - rem_set)
+        return existing
+    return spec
+
+
 def extract_port_profiles(
     raw_config: str,
     vendor: str = "",
@@ -31,8 +112,10 @@ def extract_port_profiles(
 ) -> dict[str, dict]:
     """
     Extract normalized per-port L2/L3 switching intent from raw_config and PoE data.
-    Returns {port_name: {mode, access_vlan, voice_vlan, native_vlan,
-                         trunk_allowed_vlans, lag_group, lacp_mode,
+    Returns {port_name: {mode, admin_mode, oper_mode, access_vlan, voice_vlan,
+                         native_vlan, native_vlan_tagged, trunk_allowed_vlans,
+                         trunk_active_vlans, encapsulation, qinq_tunnel,
+                         is_subinterface_bundle, lag_group, lacp_mode,
                          bpdu_guard, dot1x_mab, poe_watts}}.
     """
     profiles: dict[str, dict] = {}
@@ -43,10 +126,17 @@ def extract_port_profiles(
         if port not in profiles:
             profiles[port] = {
                 "mode": "unknown",
+                "admin_mode": "unknown",
+                "oper_mode": "",
                 "access_vlan": "",
                 "voice_vlan": "",
                 "native_vlan": "",
+                "native_vlan_tagged": False,
                 "trunk_allowed_vlans": "",
+                "trunk_active_vlans": "",
+                "encapsulation": "dot1q",
+                "qinq_tunnel": False,
+                "is_subinterface_bundle": False,
                 "lag_group": "",
                 "lacp_mode": "",
                 "bpdu_guard": False,
@@ -57,44 +147,108 @@ def extract_port_profiles(
 
     v_lower = (vendor or "").lower()
 
-    # 1. Cisco IOS / Arista EOS / NX-OS interface blocks
-    if any(k in v_lower for k in ("cisco", "arista")) and "interface " in raw_config:
+    # 1. Cisco IOS / NX-OS / Arista EOS / CiscoSMB interface blocks
+    is_cisco_like = any(k in v_lower for k in ("cisco", "arista")) or (
+        not v_lower
+        and "interface " in raw_config
+        and ("switchport " in raw_config or "encapsulation dot1q" in raw_config.lower())
+    )
+    if is_cisco_like and "interface " in raw_config:
+        global_tag_native = bool(re.search(r"(?m)^vlan\s+dot1q\s+tag\s+native\b", raw_config, re.IGNORECASE))
+        cisco_subifs: dict[str, dict] = {}
+        parent_has_ip: set[str] = set()
+        explicit_no_native_tag: set[str] = set()
+        cisco_touched: set[str] = set()
+
         blocks = re.split(r"(?m)^interface\s+", raw_config)
         for blk in blocks[1:]:
             lines = blk.splitlines()
             if not lines:
                 continue
             port = lines[0].strip()
-            if port.lower().startswith(("vlan", "loopback", "null", "nve", "tunnel")):
+            if not port or port.lower().startswith(("vlan", "loopback", "null", "nve", "tunnel")):
                 continue
-            body = "\n".join(lines[1:])
-            prof = _ensure_port(port)
-            if re.search(r"^\s*no\s+switchport\b", body, re.MULTILINE):
-                prof["mode"] = "routed"
-            elif re.search(r"^\s*switchport\s+mode\s+trunk\b", body, re.MULTILINE):
-                prof["mode"] = "trunk"
-            elif re.search(r"^\s*switchport\s+mode\s+access\b", body, re.MULTILINE):
-                prof["mode"] = "access"
+            body = _extract_indented_stanza_body(lines[1:])
 
-            m_acc = re.search(r"^\s*switchport\s+access\s+vlan\s+(\d+)", body, re.MULTILINE)
+            # Detect L3 dot1Q subinterfaces (e.g. Gi0/0.10, GigabitEthernet0/0.99)
+            m_sub = re.match(r"^([^.\s]+)\.(\d+)$", port)
+            if m_sub:
+                m_dot1q = re.search(
+                    r"^\s*encapsulation\s+dot1q\s+(?:vlan\s+)?(\d+)(\s+native)?\b",
+                    body,
+                    re.MULTILINE | re.IGNORECASE,
+                )
+                if m_dot1q:
+                    parent_port = m_sub.group(1)
+                    vid = m_dot1q.group(1)
+                    is_nat = bool(m_dot1q.group(2))
+                    entry = cisco_subifs.setdefault(parent_port, {"vlans": set(), "native_vlan": ""})
+                    entry["vlans"].add(vid)
+                    if is_nat:
+                        entry["native_vlan"] = vid
+                    continue
+
+            if re.search(r"^\s*ip\s+address\s+\d+\.\d+\.\d+\.\d+", body, re.MULTILINE | re.IGNORECASE):
+                parent_has_ip.add(port)
+
+            prof = _ensure_port(port)
+            cisco_touched.add(port)
+
+            if re.search(r"^\s*no\s+switchport\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["mode"] = "routed"
+                prof["admin_mode"] = "routed"
+            elif re.search(r"^\s*switchport\s+mode\s+dot1q-tunnel\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["mode"] = "trunk"
+                prof["admin_mode"] = "dot1q_tunnel"
+                prof["qinq_tunnel"] = True
+            elif re.search(r"^\s*switchport\s+mode\s+trunk\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["mode"] = "trunk"
+                prof["admin_mode"] = "trunk"
+            elif re.search(r"^\s*switchport\s+mode\s+access\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["mode"] = "access"
+                prof["admin_mode"] = "access"
+            elif re.search(r"^\s*switchport\s+mode\s+dynamic\s+desirable\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["admin_mode"] = "dynamic_desirable"
+            elif re.search(r"^\s*switchport\s+mode\s+dynamic\s+auto\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["admin_mode"] = "dynamic_auto"
+
+            m_enc = re.search(
+                r"^\s*switchport\s+trunk\s+encapsulation\s+(dot1q|isl|negotiate)\b",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            )
+            if m_enc:
+                prof["encapsulation"] = m_enc.group(1).lower()
+
+            m_acc = re.search(r"^\s*switchport\s+access\s+vlan\s+(\d+)", body, re.MULTILINE | re.IGNORECASE)
             if m_acc:
                 prof["access_vlan"] = m_acc.group(1)
-                if prof["mode"] == "unknown":
+                if prof["mode"] == "unknown" and prof["admin_mode"] == "unknown":
                     prof["mode"] = "access"
+                    prof["admin_mode"] = "access"
 
-            m_voice = re.search(r"^\s*switchport\s+voice\s+vlan\s+(\d+)", body, re.MULTILINE)
+            m_voice = re.search(r"^\s*switchport\s+voice\s+vlan\s+(\d+)", body, re.MULTILINE | re.IGNORECASE)
             if m_voice:
                 prof["voice_vlan"] = m_voice.group(1)
 
-            m_nat = re.search(r"^\s*switchport\s+trunk\s+native\s+vlan\s+(\d+)", body, re.MULTILINE)
+            m_nat = re.search(r"^\s*switchport\s+trunk\s+native\s+vlan\s+(\d+)", body, re.MULTILINE | re.IGNORECASE)
             if m_nat:
                 prof["native_vlan"] = m_nat.group(1)
 
-            m_all = re.search(r"^\s*switchport\s+trunk\s+allowed\s+vlan\s+([^\r\n]+)", body, re.MULTILINE)
-            if m_all:
-                prof["trunk_allowed_vlans"] = m_all.group(1).strip()
+            if re.search(r"^\s*no\s+switchport\s+trunk\s+native\s+vlan\s+tag\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["native_vlan_tagged"] = False
+                explicit_no_native_tag.add(port)
+            elif re.search(r"^\s*switchport\s+trunk\s+native\s+vlan\s+tag\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["native_vlan_tagged"] = True
 
-            m_lag = re.search(r"^\s*channel-group\s+(\d+)\s+mode\s+(\S+)", body, re.MULTILINE)
+            for m_all in re.finditer(
+                r"^\s*switchport\s+trunk\s+allowed\s+vlan\s+([^\r\n]+)",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                prof["trunk_allowed_vlans"] = _merge_allowed_vlan_directive(prof["trunk_allowed_vlans"], m_all.group(1))
+
+            m_lag = re.search(r"^\s*channel-group\s+(\d+)\s+mode\s+(\S+)", body, re.MULTILINE | re.IGNORECASE)
             if m_lag:
                 prof["lag_group"] = f"Po{m_lag.group(1)}"
                 prof["lacp_mode"] = m_lag.group(2).lower()
@@ -104,7 +258,145 @@ def extract_port_profiles(
             if re.search(r"authentication\s+port-control|dot1x\s+pae|mab\b", body, re.IGNORECASE):
                 prof["dot1x_mab"] = True
 
-    # 2. HP ProCurve / ArubaOS-S VLAN & trunk blocks
+        # Apply global `vlan dot1q tag native` to Cisco/NX-OS/Arista trunk ports
+        if global_tag_native:
+            for port in cisco_touched:
+                if port in explicit_no_native_tag:
+                    continue
+                prof = profiles[port]
+                if not prof["qinq_tunnel"] and (
+                    prof["mode"] == "trunk" or prof["admin_mode"] in ("trunk", "dynamic_auto", "dynamic_desirable")
+                ):
+                    prof["native_vlan_tagged"] = True
+
+        # Synthesize L3 dot1Q subinterfaces onto their parent physical/LAG port
+        for parent_port, sub_info in cisco_subifs.items():
+            prof = _ensure_port(parent_port)
+            prof["mode"] = "trunk"
+            prof["admin_mode"] = "trunk"
+            prof["encapsulation"] = "dot1q"
+            prof["is_subinterface_bundle"] = True
+            merged_vids = set(sub_info["vlans"])
+            if prof["trunk_allowed_vlans"] and prof["trunk_allowed_vlans"].lower() not in ("all", "none"):
+                existing_ids = _expand_numeric_vlan_tokens(prof["trunk_allowed_vlans"])
+                if existing_ids is not None:
+                    merged_vids.update(str(v) for v in existing_ids)
+            prof["trunk_allowed_vlans"] = ",".join(sorted(merged_vids, key=lambda x: int(x) if x.isdigit() else 99999))
+            if sub_info["native_vlan"]:
+                prof["native_vlan"] = sub_info["native_vlan"]
+                prof["native_vlan_tagged"] = False
+            elif not prof["native_vlan"]:
+                if parent_port in parent_has_ip:
+                    prof["native_vlan_tagged"] = False
+                else:
+                    prof["native_vlan"] = "none"
+                    prof["native_vlan_tagged"] = True
+
+    # 2. Aruba AOS-CX interface stanzas
+    is_aoscx_cfg = (
+        any(k in v_lower for k in ("aruba", "aoscx", "aos-cx"))
+        and "procurve" not in v_lower
+        and "arubaos-s" not in v_lower
+    ) or bool(re.search(r"(?m)^\s*vlan\s+(?:trunk|access)\s+", raw_config))
+    if is_aoscx_cfg and "interface " in raw_config:
+        aoscx_lag_lacp: dict[str, str] = {}
+        aoscx_blocks = re.split(r"(?m)^interface\s+", raw_config)
+        for blk in aoscx_blocks[1:]:
+            lines = blk.splitlines()
+            if not lines:
+                continue
+            raw_hdr = lines[0].strip()
+            if not raw_hdr:
+                continue
+            # Normalize `interface lag 1` / `interface lag 1 multi-chassis` -> `lag1`
+            m_lag_hdr = re.match(r"^lag\s+(\d+)\b", raw_hdr, re.IGNORECASE)
+            if m_lag_hdr:
+                port = f"lag{m_lag_hdr.group(1)}"
+            else:
+                port = raw_hdr.split()[0]
+            if port.lower().startswith(("vlan", "loopback", "null", "tunnel", "vxlan", "mgmt")):
+                continue
+            body = _extract_indented_stanza_body(lines[1:])
+            has_aoscx_tokens = bool(
+                re.search(
+                    r"^\s*(?:vlan\s+(?:trunk|access)\b|lag\s+\d+\b|lacp\s+mode\b|(?:no\s+)?routing\b)",
+                    body,
+                    re.MULTILINE | re.IGNORECASE,
+                )
+            )
+            if not has_aoscx_tokens:
+                continue
+
+            prof = _ensure_port(port)
+            prof["encapsulation"] = "dot1q"
+
+            if re.search(r"^\s*routing\b", body, re.MULTILINE | re.IGNORECASE) and not re.search(
+                r"^\s*no\s+routing\b", body, re.MULTILINE | re.IGNORECASE
+            ):
+                prof["mode"] = "routed"
+                prof["admin_mode"] = "routed"
+
+            m_cx_acc = re.search(r"^\s*vlan\s+access\s+(\d+)\b", body, re.MULTILINE | re.IGNORECASE)
+            if m_cx_acc:
+                prof["mode"] = "access"
+                prof["admin_mode"] = "access"
+                prof["access_vlan"] = m_cx_acc.group(1)
+
+            m_cx_nat = re.search(
+                r"^\s*vlan\s+trunk\s+native\s+(\d+)(\s+tag)?\b",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            )
+            if m_cx_nat:
+                prof["mode"] = "trunk"
+                prof["admin_mode"] = "trunk"
+                prof["native_vlan"] = m_cx_nat.group(1)
+                if m_cx_nat.group(2):
+                    prof["native_vlan_tagged"] = True
+
+            if re.search(r"^\s*vlan\s+trunk\s+native\s+tag\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["mode"] = "trunk"
+                prof["admin_mode"] = "trunk"
+                prof["native_vlan_tagged"] = True
+
+            for m_cx_all in re.finditer(
+                r"^\s*vlan\s+trunk\s+allowed\s+([^\r\n]+)",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                prof["mode"] = "trunk"
+                prof["admin_mode"] = "trunk"
+                val = m_cx_all.group(1).strip()
+                if prof["trunk_allowed_vlans"] and val.lower() not in ("all", "none"):
+                    prof["trunk_allowed_vlans"] = f"{prof['trunk_allowed_vlans']},{val}"
+                else:
+                    prof["trunk_allowed_vlans"] = val
+
+            m_cx_lag = re.search(r"^\s*lag\s+(\d+)\b", body, re.MULTILINE | re.IGNORECASE)
+            if m_cx_lag:
+                prof["lag_group"] = f"lag{m_cx_lag.group(1)}"
+                if not prof["lacp_mode"]:
+                    prof["lacp_mode"] = "active"
+
+            m_cx_lacp = re.search(r"^\s*lacp\s+mode\s+(active|passive)\b", body, re.MULTILINE | re.IGNORECASE)
+            if m_cx_lacp:
+                lacp_m = m_cx_lacp.group(1).lower()
+                prof["lacp_mode"] = lacp_m
+                if port.startswith("lag"):
+                    aoscx_lag_lacp[port] = lacp_m
+
+            if re.search(r"^\s*spanning-tree\s+bpdu-guard\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["bpdu_guard"] = True
+            if re.search(r"^\s*aaa\s+authentication\s+port-access\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["dot1x_mab"] = True
+
+        # Propagate LACP mode from parent lagX stanza to member ports if present
+        for prof in profiles.values():
+            lg = prof.get("lag_group", "")
+            if lg and lg in aoscx_lag_lacp:
+                prof["lacp_mode"] = aoscx_lag_lacp[lg]
+
+    # 3. HP ProCurve / ArubaOS-S VLAN & trunk blocks
     if "procurve" in v_lower or "arubaos-s" in v_lower or re.search(r"(?m)^vlan\s+\d+\b", raw_config):
         for m_trk in re.finditer(r"(?m)^trunk\s+(\S+)\s+(Trk\d+)\s*(lacp|trunk)?", raw_config, re.IGNORECASE):
             ports_spec, trk_name, mode_tok = m_trk.groups()
@@ -134,17 +426,24 @@ def extract_port_profiles(
 
         for p in set(hp_untagged) | set(hp_tagged):
             prof = _ensure_port(p)
+            prof["encapsulation"] = "dot1q"
             untag_v = hp_untagged.get(p, "")
             tag_list = hp_tagged.get(p, [])
             non_voice_tagged = [v for v in tag_list if v not in hp_voice_vlans]
             voice_tagged = [v for v in tag_list if v in hp_voice_vlans]
             if non_voice_tagged:
                 prof["mode"] = "trunk"
+                prof["admin_mode"] = "trunk"
                 prof["native_vlan"] = untag_v or "none"
-                prof["trunk_allowed_vlans"] = ",".join(tag_list)
+                prof["native_vlan_tagged"] = not bool(untag_v)
+                allowed_all = ([untag_v] if untag_v and untag_v not in tag_list else []) + tag_list
+                allowed_all = sorted(allowed_all, key=lambda x: int(x) if x.isdigit() else 99999)
+                prof["trunk_allowed_vlans"] = ",".join(allowed_all)
             elif untag_v:
                 prof["mode"] = "access"
+                prof["admin_mode"] = "access"
                 prof["access_vlan"] = untag_v
+                prof["native_vlan_tagged"] = False
                 if voice_tagged:
                     prof["voice_vlan"] = voice_tagged[0]
 
@@ -158,8 +457,14 @@ def extract_port_profiles(
             for p in _expand_port_range(m_auth.group(1)):
                 _ensure_port(p)["dot1x_mab"] = True
 
-    # 3. Juniper Junos hierarchical / set-style interface VLANs & ae bundles
-    if "juniper" in v_lower or "ethernet-switching" in raw_config:
+    # 4. Juniper Junos hierarchical / set-style interface VLANs, vlan-tagging units & ae bundles
+    if (
+        "juniper" in v_lower
+        or "junos" in v_lower
+        or "ethernet-switching" in raw_config
+        or "vlan-tagging" in raw_config
+        or re.search(r"set\s+interfaces\s+\S+\s+unit\s+\d+\s+vlan-id\s+\d+", raw_config)
+    ):
         # Expand `set interfaces interface-range <rname> ...` into per-member lines
         irange_members: dict[str, list[str]] = {}
         for m_ir_m in re.finditer(r"set\s+interfaces\s+interface-range\s+(\S+)\s+member\s+(\S+)", raw_config):
@@ -186,14 +491,19 @@ def extract_port_profiles(
             if expanded_lines:
                 junos_cfg = raw_config + "\n" + "\n".join(expanded_lines)
 
+        junos_touched: set[str] = set()
         for m_set in re.finditer(
-            r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+interface-mode\s+(access|trunk)",
+            r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+(?:interface-mode|port-mode)\s+(access|trunk)",
             junos_cfg,
         ):
             if m_set.group(1) == "interface-range":
                 continue
-            prof = _ensure_port(m_set.group(1))
+            p_name = m_set.group(1)
+            prof = _ensure_port(p_name)
+            junos_touched.add(p_name)
             prof["mode"] = m_set.group(2)
+            prof["admin_mode"] = m_set.group(2)
+            prof["encapsulation"] = "dot1q"
 
         for m_nat in re.finditer(
             r"set\s+interfaces\s+(\S+)\s+(?:unit\s+0\s+family\s+ethernet-switching\s+)?native-vlan-id\s+(\S+)",
@@ -201,8 +511,11 @@ def extract_port_profiles(
         ):
             if m_nat.group(1) == "interface-range":
                 continue
-            prof = _ensure_port(m_nat.group(1))
+            p_name = m_nat.group(1)
+            prof = _ensure_port(p_name)
+            junos_touched.add(p_name)
             prof["native_vlan"] = m_nat.group(2).strip('"')
+            prof["native_vlan_tagged"] = False
 
         vlans_map = extract_vlans(junos_cfg, vendor)
         name_to_vid = {v["name"].strip('"').lower(): vid for vid, v in vlans_map.items() if v.get("name")}
@@ -218,7 +531,8 @@ def extract_port_profiles(
                 return m_vn.group(1)
             return t_clean
 
-        for p_data in profiles.values():
+        for p_name in junos_touched:
+            p_data = profiles[p_name]
             if p_data.get("native_vlan"):
                 p_data["native_vlan"] = _resolve_vid(p_data["native_vlan"])
 
@@ -240,16 +554,57 @@ def extract_port_profiles(
 
         for port, members in junos_members.items():
             prof = _ensure_port(port)
+            junos_touched.add(port)
+            prof["encapsulation"] = "dot1q"
             if prof["mode"] == "trunk" or len(members) > 1 or "all" in members:
                 if prof["mode"] == "unknown":
                     prof["mode"] = "trunk"
+                if prof["admin_mode"] == "unknown":
+                    prof["admin_mode"] = "trunk"
                 prof["trunk_allowed_vlans"] = ",".join(members)
-                if not prof["native_vlan"]:
-                    prof["native_vlan"] = "none"
             else:
                 if prof["mode"] == "unknown":
                     prof["mode"] = "access"
+                if prof["admin_mode"] == "unknown":
+                    prof["admin_mode"] = "access"
                 prof["access_vlan"] = members[0]
+
+        # Synthesize L3 vlan-tagging units (e.g. `set interfaces ge-0/0/1 unit 10 vlan-id 10`) onto parent port
+        junos_subif_vlans: dict[str, set[str]] = {}
+        for m_unit in re.finditer(
+            r"set\s+interfaces\s+(\S+)\s+unit\s+\d+\s+vlan-id\s+(\d+)",
+            junos_cfg,
+        ):
+            port, vid = m_unit.group(1), m_unit.group(2)
+            if port == "interface-range" or port.lower().startswith(("irb", "lo", "vlan")):
+                continue
+            junos_subif_vlans.setdefault(port, set()).add(vid)
+
+        for port, vids in junos_subif_vlans.items():
+            prof = _ensure_port(port)
+            junos_touched.add(port)
+            prof["mode"] = "trunk"
+            prof["admin_mode"] = "trunk"
+            prof["encapsulation"] = "dot1q"
+            prof["is_subinterface_bundle"] = True
+            merged_vids = set(vids)
+            if prof["trunk_allowed_vlans"] and prof["trunk_allowed_vlans"].lower() not in ("all", "none"):
+                existing_ids = _expand_numeric_vlan_tokens(prof["trunk_allowed_vlans"])
+                if existing_ids is not None:
+                    merged_vids.update(str(v) for v in existing_ids)
+            prof["trunk_allowed_vlans"] = ",".join(sorted(merged_vids, key=lambda x: int(x) if x.isdigit() else 99999))
+
+        # Finalize Junos native_vlan & native_vlan_tagged invariant on all Junos trunk ports
+        for port in junos_touched:
+            prof = profiles[port]
+            if prof["mode"] == "trunk":
+                if not prof["native_vlan"] or prof["native_vlan"].lower() == "none":
+                    prof["native_vlan"] = "none"
+                    prof["native_vlan_tagged"] = True
+                else:
+                    prof["native_vlan_tagged"] = False
+            elif prof["mode"] == "access":
+                prof["native_vlan_tagged"] = False
 
         for m_voip in re.finditer(
             r"set\s+(?:switch-options|ethernet-switching-options)\s+voip\s+interface\s+(\S+?)(?:\.0)?\s+vlan\s+(\S+)",
@@ -286,6 +641,8 @@ def extract_port_profiles(
             prof["storm_control"] = True
             if prof["mode"] == "unknown":
                 prof["mode"] = "access"
+                if prof["admin_mode"] == "unknown":
+                    prof["admin_mode"] = "access"
                 if not prof["access_vlan"]:
                     prof["access_vlan"] = "1"
         for m_dot1x in re.finditer(r"set\s+protocols\s+dot1x\s+authenticator\s+interface\s+(\S+)", junos_cfg):

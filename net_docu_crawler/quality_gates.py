@@ -24,8 +24,14 @@ import os
 from collections import Counter
 
 
-def evaluate_quality_gates(raw_devices: list[dict]) -> dict:
-    """Evaluate correlated `raw_devices` against P0 cutover-readiness gates."""
+def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = None) -> dict:
+    """Evaluate correlated `raw_devices` against P0/P1 cutover-readiness gates."""
+    if trunk_audit is None:
+        from net_docu_crawler.trunk_audit import evaluate_trunk_mismatches
+
+        trunk_audit = evaluate_trunk_mismatches(raw_devices)
+    trunk_summary = dict((trunk_audit or {}).get("summary") or {})
+
     funnel = Counter(d.get("record_class", "unknown") for d in raw_devices)
     infra = [d for d in raw_devices if d.get("record_class") == "crawled_infra" or d.get("status") == "success"]
 
@@ -104,10 +110,45 @@ def evaluate_quality_gates(raw_devices: list[dict]) -> dict:
         }
     )
 
+    crit_cnt = int(trunk_summary.get("critical_count", 0) or 0)
+    high_cnt = int(trunk_summary.get("high_count", 0) or 0)
+    med_cnt = int(trunk_summary.get("medium_count", 0) or 0)
+    low_cnt = int(trunk_summary.get("low_count", 0) or 0)
+    total_findings = int(trunk_summary.get("total_findings", len((trunk_audit or {}).get("findings") or [])) or 0)
+    edges_eval = int(
+        trunk_summary.get(
+            "total_trunk_edges_evaluated",
+            trunk_summary.get("edges_evaluated", trunk_summary.get("total_edges", 0)),
+        )
+        or 0
+    )
+    if crit_cnt + high_cnt > 0:
+        trunk_mismatch_status = "WARN"
+        trunk_mismatch_detail = (
+            f"Detected {crit_cnt} CRITICAL and {high_cnt} HIGH trunk VLAN mismatch(es) "
+            f"across {edges_eval} evaluated trunk link(s) "
+            f"({total_findings} total finding(s): {crit_cnt} CRITICAL, {high_cnt} HIGH, {med_cnt} MEDIUM, {low_cnt} LOW)."
+        )
+    else:
+        trunk_mismatch_status = "PASS"
+        trunk_mismatch_detail = (
+            f"0 CRITICAL/HIGH trunk VLAN mismatches across {edges_eval} evaluated trunk link(s) "
+            f"({total_findings} total finding(s))."
+        )
+    gates.append(
+        {
+            "gate": "GATE_TRUNK_VLAN_MISMATCH",
+            "severity": "P1",
+            "status": trunk_mismatch_status,
+            "detail": trunk_mismatch_detail,
+        }
+    )
+
     p0_failed = any(g["severity"] == "P0" and g["status"] == "FAIL" for g in gates)
     return {
         "passed": not p0_failed,
         "gates": gates,
+        "trunk_audit_summary": trunk_summary,
         "funnel": {
             "total_records": len(raw_devices),
             "crawled_infra": funnel.get("crawled_infra", 0),

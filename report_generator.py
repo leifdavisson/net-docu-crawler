@@ -1230,6 +1230,9 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             "(Layer 3 routers, firewalls, and wireless APs excluded from L2 STP requirement)."
         )
 
+    # C2. Trunk VLAN Mismatch & L2 Symmetry Audit
+    lines.extend(_build_trunk_audit_markdown_section(devices, heading="### Trunk VLAN Mismatch & L2 Symmetry Audit"))
+
     # D. Interface Descriptions & Port Naming
     lines.append("\n### Configured Interface Descriptions & Port Naming")
     desc_found = False
@@ -2848,6 +2851,12 @@ def generate_master_network_analysis_migration_blueprint(
         vlan_rows.append("| - | *None* | - | *No L3 VLAN/SVI mappings parsed* | - | `N/A` | `N/A` | - |")
 
     lines.extend(vlan_rows)
+    lines.extend(
+        _build_trunk_audit_markdown_section(
+            unique_devs,
+            heading="### 4.1 Trunk VLAN Mismatch & L2 Symmetry Audit",
+        )
+    )
 
     lines.extend(
         [
@@ -3583,7 +3592,13 @@ def generate_target_migration_configs(
         print(f"Error generating target migration configs: {e}")
 
 
-def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, source_logs_dir: str = "") -> None:
+def export_layered_csvs(
+    raw_devices: list[dict],
+    registry,
+    run_output_dir: str,
+    source_logs_dir: str = "",
+    trunk_audit: dict | None = None,
+) -> None:
     """
     Export normalized and correlated machine-readable CSVs into the layered
     `00_manifest/`, `01_raw/`, `02_normalized/`, and `03_correlated/` subdirectories.
@@ -3596,7 +3611,8 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     r_dir = os.path.join(run_output_dir, "01_raw")
     n_dir = os.path.join(run_output_dir, "02_normalized")
     c_dir = os.path.join(run_output_dir, "03_correlated")
-    for d in (m_dir, r_dir, n_dir, c_dir):
+    rep_dir = os.path.join(run_output_dir, "05_reports")
+    for d in (m_dir, r_dir, n_dir, c_dir, rep_dir):
         os.makedirs(d, exist_ok=True)
 
     # 1. 00_manifest/failures.csv
@@ -3916,3 +3932,276 @@ def export_layered_csvs(raw_devices: list[dict], registry, run_output_dir: str, 
     ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
     if os.path.isfile(ep_src):
         shutil.copy2(ep_src, os.path.join(c_dir, "endpoint_bindings.csv"))
+
+    # 11. 03_correlated/trunk_audit.json, 03_correlated/trunk_mismatches.csv & 05_reports/trunk_vlan_audit.md
+    resolved_audit = trunk_audit if trunk_audit is not None else _resolve_trunk_audit(raw_devices)
+    with open(os.path.join(c_dir, "trunk_audit.json"), "w", encoding="utf-8") as f:
+        json.dump(resolved_audit, f, indent=2, default=list)
+
+    trunk_csv_rows = _normalize_trunk_csv_rows(resolved_audit)
+    with open(os.path.join(c_dir, "trunk_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=TRUNK_MISMATCH_CSV_FIELDS)
+        w.writeheader()
+        w.writerows(trunk_csv_rows)
+
+    layered_trunk_md = os.path.join(rep_dir, "trunk_vlan_audit.md")
+    if not os.path.isfile(layered_trunk_md):
+        generate_trunk_audit_report(resolved_audit, output_path=layered_trunk_md)
+
+
+TRUNK_MISMATCH_CSV_FIELDS = [
+    "Edge_ID",
+    "Side_A_Host",
+    "Side_A_Port",
+    "Side_B_Host",
+    "Side_B_Port",
+    "Rule_ID",
+    "Severity",
+    "Side_A_Only_VLANs",
+    "Side_B_Only_VLANs",
+    "Remediation_Hint",
+]
+
+
+def _resolve_trunk_audit(devices_or_audit) -> dict:
+    """Resolve `devices_or_audit` into a canonical `evaluate_trunk_mismatches` result dict."""
+    from net_docu_crawler.trunk_audit import evaluate_trunk_mismatches
+
+    if isinstance(devices_or_audit, dict):
+        if "summary" in devices_or_audit and ("findings" in devices_or_audit or "csv_rows" in devices_or_audit):
+            return devices_or_audit
+        return evaluate_trunk_mismatches(list(devices_or_audit.values()))
+    if isinstance(devices_or_audit, list):
+        return evaluate_trunk_mismatches(devices_or_audit)
+    return evaluate_trunk_mismatches([])
+
+
+def _format_vlan_cell(val) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (list, set, tuple)):
+        return ",".join(str(v) for v in sorted(val, key=lambda x: int(str(x)) if str(x).isdigit() else 99999))
+    return str(val).strip()
+
+
+def _normalize_trunk_csv_rows(trunk_audit: dict) -> list[dict]:
+    """Normalize trunk audit findings/csv_rows to match TRUNK_MISMATCH_CSV_FIELDS."""
+    raw_rows = (trunk_audit or {}).get("csv_rows")
+    if isinstance(raw_rows, list) and raw_rows:
+        norm_rows = []
+        for r in raw_rows:
+            if not isinstance(r, dict):
+                continue
+            norm_rows.append(
+                {
+                    "Edge_ID": str(r.get("Edge_ID", r.get("edge_id", "")) or ""),
+                    "Side_A_Host": str(r.get("Side_A_Host", r.get("side_a_host", "")) or ""),
+                    "Side_A_Port": str(r.get("Side_A_Port", r.get("side_a_port", "")) or ""),
+                    "Side_B_Host": str(r.get("Side_B_Host", r.get("side_b_host", "")) or ""),
+                    "Side_B_Port": str(r.get("Side_B_Port", r.get("side_b_port", "")) or ""),
+                    "Rule_ID": str(r.get("Rule_ID", r.get("rule_id", "")) or ""),
+                    "Severity": str(r.get("Severity", r.get("severity", "")) or ""),
+                    "Side_A_Only_VLANs": _format_vlan_cell(r.get("Side_A_Only_VLANs", r.get("side_a_only_vlans", ""))),
+                    "Side_B_Only_VLANs": _format_vlan_cell(r.get("Side_B_Only_VLANs", r.get("side_b_only_vlans", ""))),
+                    "Remediation_Hint": str(
+                        r.get("Remediation_Hint", r.get("remediation_hint", r.get("remediation", ""))) or ""
+                    ),
+                }
+            )
+        return norm_rows
+
+    findings = (trunk_audit or {}).get("findings") or []
+    norm_rows = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        side_a = f.get("side_a") or {}
+        side_b = f.get("side_b") or {}
+        norm_rows.append(
+            {
+                "Edge_ID": str(f.get("Edge_ID", f.get("edge_id", "")) or ""),
+                "Side_A_Host": str(
+                    f.get(
+                        "Side_A_Host",
+                        f.get("side_a_host", side_a.get("device_hostname", side_a.get("hostname", ""))),
+                    )
+                    or ""
+                ),
+                "Side_A_Port": str(
+                    f.get("Side_A_Port", f.get("side_a_port", side_a.get("interface_name", side_a.get("port", ""))))
+                    or ""
+                ),
+                "Side_B_Host": str(
+                    f.get(
+                        "Side_B_Host",
+                        f.get("side_b_host", side_b.get("device_hostname", side_b.get("hostname", ""))),
+                    )
+                    or ""
+                ),
+                "Side_B_Port": str(
+                    f.get("Side_B_Port", f.get("side_b_port", side_b.get("interface_name", side_b.get("port", ""))))
+                    or ""
+                ),
+                "Rule_ID": str(f.get("Rule_ID", f.get("rule_id", "")) or ""),
+                "Severity": str(f.get("Severity", f.get("severity", "")) or ""),
+                "Side_A_Only_VLANs": _format_vlan_cell(f.get("Side_A_Only_VLANs", f.get("side_a_only_vlans", ""))),
+                "Side_B_Only_VLANs": _format_vlan_cell(f.get("Side_B_Only_VLANs", f.get("side_b_only_vlans", ""))),
+                "Remediation_Hint": str(
+                    f.get("Remediation_Hint", f.get("remediation_hint", f.get("remediation", f.get("detail", ""))))
+                    or ""
+                ),
+            }
+        )
+    return norm_rows
+
+
+def _build_trunk_audit_markdown_section(
+    devices_or_audit,
+    heading: str = "### Trunk VLAN Mismatch & L2 Symmetry Audit",
+) -> list[str]:
+    """Build a concise Markdown summary table for trunk VLAN mismatch & L2 symmetry findings."""
+    audit = _resolve_trunk_audit(devices_or_audit)
+    summary = (audit or {}).get("summary") or {}
+    rows = _normalize_trunk_csv_rows(audit)
+
+    edges_eval = int(
+        summary.get(
+            "total_trunk_edges_evaluated",
+            summary.get("edges_evaluated", summary.get("total_edges", 0)),
+        )
+        or 0
+    )
+    crit_cnt = int(summary.get("critical_count", 0) or 0)
+    high_cnt = int(summary.get("high_count", 0) or 0)
+    med_cnt = int(summary.get("medium_count", 0) or 0)
+    low_cnt = int(summary.get("low_count", 0) or 0)
+    info_cnt = int(summary.get("info_count", 0) or 0)
+    total_cnt = int(summary.get("total_findings", len(rows)) or 0)
+
+    sec_lines = [
+        "",
+        heading,
+        (
+            f"Evaluated Trunk Links: **{edges_eval}** | Total Findings: **{total_cnt}** "
+            f"(CRITICAL: **{crit_cnt}**, HIGH: **{high_cnt}**, MEDIUM: **{med_cnt}**, "
+            f"LOW: **{low_cnt}**, INFO: **{info_cnt}**)"
+        ),
+        "",
+        "| Edge_ID | Side_A_Host | Side_A_Port | Side_B_Host | Side_B_Port | Rule_ID | Severity | Side_A_Only_VLANs | Side_B_Only_VLANs | Remediation_Hint |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+    if rows:
+        for r in rows[:50]:
+            sec_lines.append(
+                f"| `{r['Edge_ID']}` | **{r['Side_A_Host']}** | `{r['Side_A_Port']}` | "
+                f"**{r['Side_B_Host'] or 'N/A'}** | `{r['Side_B_Port'] or 'N/A'}` | "
+                f"`{r['Rule_ID']}` | **{r['Severity']}** | `{r['Side_A_Only_VLANs'] or '-'}` | "
+                f"`{r['Side_B_Only_VLANs'] or '-'}` | {r['Remediation_Hint']} |"
+            )
+        if len(rows) > 50:
+            sec_lines.append(
+                f"| *... and {len(rows) - 50} additional trunk findings recorded in `trunk_vlan_audit.md` and `03_correlated/trunk_mismatches.csv`* | | | | | | | | | |"
+            )
+    else:
+        sec_lines.append(
+            "| *All Evaluated Trunks* | *Symmetric* | `-` | *Symmetric* | `-` | `PASS` | **PASS** | `-` | `-` | ✓ Zero 802.1Q trunk VLAN, native PVID, or mode mismatches detected. |"
+        )
+    return sec_lines
+
+
+def generate_trunk_audit_report(devices_or_audit, output_path: str = "trunk_vlan_audit.md") -> dict:
+    """
+    Generate the dedicated Trunk VLAN Mismatch & L2 Symmetry Audit Report (`trunk_vlan_audit.md`)
+    with GNU AGPLv3 notice, summary counts, discrepancy table, and multi-vendor remediation guidance.
+    """
+    audit = _resolve_trunk_audit(devices_or_audit)
+    summary = (audit or {}).get("summary") or {}
+    rows = _normalize_trunk_csv_rows(audit)
+
+    edges_eval = int(
+        summary.get(
+            "total_trunk_edges_evaluated",
+            summary.get("edges_evaluated", summary.get("total_edges", 0)),
+        )
+        or 0
+    )
+    crit_cnt = int(summary.get("critical_count", 0) or 0)
+    high_cnt = int(summary.get("high_count", 0) or 0)
+    med_cnt = int(summary.get("medium_count", 0) or 0)
+    low_cnt = int(summary.get("low_count", 0) or 0)
+    info_cnt = int(summary.get("info_count", 0) or 0)
+    total_cnt = int(summary.get("total_findings", len(rows)) or 0)
+
+    lines = [
+        "<!--",
+        "Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>",
+        "SPDX-License-Identifier: AGPL-3.0-or-later",
+        "-->",
+        "",
+        "# Trunk VLAN Mismatch & Layer 2 Symmetry Audit Report",
+        "",
+        "> **License Notice**: This deliverable is generated by `Net-Docu-Crawler` and distributed under the "
+        "**GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`)** (<https://www.gnu.org/licenses/agpl-3.0.html>).",
+        "",
+        "This report audits bidirectional Layer 2 802.1Q trunk links, Port-Channel / LAG bundles, native/PVID tagging, "
+        "active VLAN forwarding state, and IEEE 802.1ad QinQ boundaries across multi-vendor switching domains.",
+        "",
+        "## 1. Executive Summary & Audit Metrics",
+        "",
+        "| Metric | Count | Status |",
+        "| :--- | :--- | :--- |",
+        f"| **Evaluated Trunk / Uplink Edges** | `{edges_eval}` | Audited |",
+        f"| **Total Discrepancy Findings** | `{total_cnt}` | {'WARN' if (crit_cnt + high_cnt) > 0 else 'PASS'} |",
+        f"| **CRITICAL Findings (`TRK-001`, `TRK-002`)** | `{crit_cnt}` | {'⚠️ Action Required' if crit_cnt > 0 else '✓ Clean'} |",
+        f"| **HIGH Findings (`TRK-003`, `TRK-004`)** | `{high_cnt}` | {'⚠️ Action Required' if high_cnt > 0 else '✓ Clean'} |",
+        f"| **MEDIUM Findings (`TRK-005`, `TRK-006`, Boundary)** | `{med_cnt}` | {'Review Recommended' if med_cnt > 0 else '✓ Clean'} |",
+        f"| **LOW Findings (`TRK-007`)** | `{low_cnt}` | {'Hardening Opportunity' if low_cnt > 0 else '✓ Clean'} |",
+        f"| **INFO Findings (`INFO_QINQ_BOUNDARY`)** | `{info_cnt}` | Informational |",
+    ]
+
+    lines.extend(
+        _build_trunk_audit_markdown_section(
+            audit,
+            heading="## 2. Trunk VLAN Mismatch & L2 Symmetry Discrepancy Table",
+        )
+    )
+
+    lines.extend(
+        [
+            "",
+            "## 3. Rule Reference & Multi-Vendor Remediation Guidance",
+            "",
+            "| Rule ID | Severity | Condition Audited | Operational Impact & Remediation Guidance |",
+            "| :--- | :--- | :--- | :--- |",
+            "| `TRK-001` | **CRITICAL** | Operational mode mismatch (`oper_mode_a != oper_mode_b`) | One side operates as an 802.1Q trunk while the peer operates as access or down. Configure explicit trunk mode on both peers. |",
+            "| `TRK-002` | **CRITICAL** | Native / untagged PVID mismatch (`native_vlan_a != native_vlan_b`) | Causes untagged frame leaking between VLANs and Spanning Tree PVID inconsistency blocks. Align native VLAN IDs on both sides. |",
+            "| `TRK-003` | **HIGH** | Asymmetric native VLAN tagging (`native_vlan_tagged` mismatch) | One switch tags the native VLAN (`vlan dot1q tag native` / Junos pure tagged trunk) while the peer expects untagged frames. |",
+            "| `TRK-004` | **HIGH** | Allowed VLAN set asymmetry (`allowed_vlans_a ^ allowed_vlans_b`) | Traffic for asymmetric VLANs is silently blackholed at the peer trunk port. Synchronize the allowed VLAN list across both ends. |",
+            "| `TRK-005` | **MEDIUM** | Active / operational VLAN database drift | A VLAN is permitted on the trunk configuration but missing or suspended in the local switch VLAN database or blocked by STP. |",
+            "| `TRK-006` | **MEDIUM** | Default VLAN 1 permitted on trunk | Security hardening recommendation: prune default VLAN 1 from inter-switch trunks where unused. |",
+            "| `TRK-007` | **LOW** | Dynamic Trunking Protocol (`dynamic_auto` / `dynamic_desirable`) | Disable DTP negotiation (`switchport mode trunk` + `switchport nonegotiate`) to prevent trunk spoofing. |",
+            "| `ERR_UNCRAWLED_NEIGHBOR` | **MEDIUM** | Trunk neighbor not in crawled dataset | Include the remote neighbor management IP in the crawl scope or verify SSH/AAA credentials. |",
+            "| `WARN_ASYMMETRIC_DISCOVERY` | **MEDIUM** | One-way LLDP/CDP neighbor visibility | Enable bidirectional LLDP (`lldp run` / `set protocols lldp interface all`) on both switches. |",
+            "| `INFO_QINQ_BOUNDARY` | **INFO** | IEEE 802.1ad QinQ (`dot1q-tunnel`) edge | Customer-to-provider tunnel boundary detected; customer C-VLAN lists intentionally differ from provider S-VLANs. |",
+            "",
+            "### Official Vendor CLI Documentation & Remediation References",
+            "- **Cisco IOS / IOS-XE / NX-OS**: [Cisco IOS & NX-OS Configuration Guides](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html) (`switchport mode trunk`, `switchport trunk native vlan <id>`, `switchport trunk allowed vlan <list>`)",
+            "- **Juniper Networks Junos OS**: [Juniper Junos OS Documentation](https://www.juniper.net/documentation/product/us/en/junos-os/) (`set interfaces <port> unit 0 family ethernet-switching interface-mode trunk vlan members [...]`, `native-vlan-id <id>`)",
+            "- **HPE Aruba Networking AOS-CX**: [HPE Aruba AOS-CX Documentation](https://www.arubanetworks.com/techdocs/AOS-CX/help_portal/Content/home.htm) (`vlan trunk native <id>`, `vlan trunk allowed <list>`)",
+            "- **HPE ProCurve / ArubaOS-S**: [HPE ArubaOS-S Management and Configuration Guide](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm) (`vlan <id> tagged <ports>`, `vlan <id> untagged <ports>`)",
+            "- **Arista EOS**: [Arista EOS User Manual](https://www.arista.com/en/um-eos) (`switchport mode trunk`, `switchport trunk native vlan <id>`, `switchport trunk allowed vlan <list>`)",
+            "",
+        ]
+    )
+
+    try:
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"Trunk VLAN audit report successfully written to {output_path}")
+    except Exception as e:
+        print(f"Error generating trunk VLAN audit report: {e}")
+
+    return audit
