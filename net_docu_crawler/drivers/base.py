@@ -275,37 +275,13 @@ class BaseDriver(ABC):
     @staticmethod
     def safe_netmiko_connect(device_params: dict):
         """
-        Establishes a Netmiko connection with automatic fallback for legacy SSH peers.
-        If the initial handshake fails due to deprecated key exchange (KEX), host keys,
-        or ciphers (e.g. IncompatiblePeer: no acceptable kex algorithm / host key),
-        it automatically retries with legacy algorithms enabled.
+        Establishes a Netmiko connection via the 3-stage SSH compatibility ladder
+        (`connect_netmiko_with_fallback`), bridging modern RFC 8731/3526 KEX peers
+        and legacy SSHv2 implementations without retrying failed credentials.
         """
-        import logging
+        from net_docu_crawler.ssh_compat import connect_netmiko_with_fallback
 
-        from netmiko import ConnectHandler
-
-        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
-
-        try:
-            return ConnectHandler(**device_params)
-        except Exception as e:
-            err_msg = str(e).lower()
-            is_compat_err = (
-                "incompatible" in err_msg
-                or "no acceptable kex" in err_msg
-                or "no acceptable host key" in err_msg
-                or "no matching host key" in err_msg
-                or "no acceptable ciphers" in err_msg
-                or "no acceptable macs" in err_msg
-                or "key exchange failed" in err_msg
-            )
-            if is_compat_err:
-                fallback_params = dict(device_params)
-                fallback_params["disabled_algorithms"] = dict()
-                fallback_params["disable_sha2_fix"] = True
-                fallback_params["ssh_strict"] = False
-                return ConnectHandler(**fallback_params)
-            raise
+        return connect_netmiko_with_fallback(device_params)
 
     def connect_netmiko(self, device_params: dict):
         """

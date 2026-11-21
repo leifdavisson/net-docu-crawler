@@ -638,9 +638,10 @@ Multiple Spanning Tree (MST) Information
 
 def test_safe_netmiko_connect_fallback():
     mock_connect = MagicMock()
-    # First call raises IncompatiblePeer / algorithm mismatch, second succeeds
+    # Stage 1 raises KEX mismatch, Stage 2 raises SHA-2 host-key negotiation error, Stage 3 succeeds
     mock_connect.side_effect = [
         Exception("Incompatible ssh peer (no acceptable kex algorithm)"),
+        Exception("Incompatible ssh peer (no acceptable host key)"),
         MagicMock(base_prompt="SW#"),
     ]
 
@@ -650,12 +651,15 @@ def test_safe_netmiko_connect_fallback():
         dev_params = {"device_type": "hp_procurve", "ip": "10.0.0.1"}
         conn = BaseDriver.safe_netmiko_connect(dev_params)
         assert conn.base_prompt == "SW#"
-        assert mock_connect.call_count == 2
-        # Verify fallback params were passed
-        fallback_call_args = mock_connect.call_args[1]
-        assert fallback_call_args["disabled_algorithms"] == {}
-        assert fallback_call_args["disable_sha2_fix"] is True
-        assert fallback_call_args["ssh_strict"] is False
+        assert mock_connect.call_count == 3
+        stage2_kwargs = mock_connect.call_args_list[1][1]
+        assert stage2_kwargs["disabled_algorithms"] == {}
+        assert stage2_kwargs["disable_sha2_fix"] is False
+        assert stage2_kwargs["ssh_strict"] is False
+        stage3_kwargs = mock_connect.call_args_list[2][1]
+        assert stage3_kwargs["disabled_algorithms"] == {}
+        assert stage3_kwargs["disable_sha2_fix"] is True
+        assert stage3_kwargs["ssh_strict"] is False
 
 
 def test_crawl_target_stops_retrying_ssh_drivers_on_transport_error():

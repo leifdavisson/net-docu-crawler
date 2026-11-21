@@ -64,9 +64,12 @@ class OPNsenseDriver(BaseDriver):
     paging_cmd = ""
 
     def connect(self):
+        from net_docu_crawler.ssh_compat import connect_paramiko_with_fallback
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
+        connect_paramiko_with_fallback(
+            client,
             hostname=self.ip,
             port=self.port,
             username=self.username,
