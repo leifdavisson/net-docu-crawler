@@ -376,6 +376,10 @@ def classify_non_network_appliance(
         return ("server", "Windows Host (OpenSSH)")
     if "axis" in oui_l or "axis" in title_l:
         return ("camera", "Axis IP Camera")
+    if "apple" in oui_l:
+        return ("workstation", "Apple Host / Mac")
+    if "ruckus" in oui_l:
+        return ("ap", "Ruckus Wireless AP")
     return None
 
 

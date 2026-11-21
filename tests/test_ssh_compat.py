@@ -648,3 +648,34 @@ def test_detector_probe_http_fingerprint_isolates_tls_context_and_logs_debug(cap
     ):
         assert probe_http_fingerprint("10.0.0.254") is None
         assert "HTTP/HTTPS fingerprint probe failed" in caplog.text
+
+
+def test_lazy_session_log_prevents_zero_byte_files_on_failed_connect(tmp_path):
+    from netmiko.exceptions import NetmikoAuthenticationException
+
+    from net_docu_crawler.ssh_compat import LazySessionLog
+
+    empty_path = tmp_path / "empty.log"
+    slog = LazySessionLog(file_name=str(empty_path))
+    slog.open()
+    slog.close()
+    assert not empty_path.exists()
+
+    active_path = tmp_path / "active.log"
+    slog2 = LazySessionLog(file_name=str(active_path))
+    slog2.open()
+    slog2.write("SW# show version\n")
+    slog2.close()
+    assert active_path.read_text(encoding="utf-8") == "SW# show version\n"
+
+    fail_log = tmp_path / "10.0.0.9_raw_session.log"
+
+    def fake_connect_handler(**kwargs):
+        kwargs["session_log"].open()
+        kwargs["session_log"].close()
+        raise NetmikoAuthenticationException("Auth failed")
+
+    with patch("netmiko.ConnectHandler", side_effect=fake_connect_handler):
+        with pytest.raises(NetmikoAuthenticationException):
+            connect_netmiko_with_fallback({"device_type": "cisco_ios", "ip": "10.0.0.9", "session_log": str(fail_log)})
+    assert not fail_log.exists()

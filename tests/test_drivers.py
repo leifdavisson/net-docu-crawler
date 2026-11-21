@@ -2687,3 +2687,72 @@ def test_topology_resolver_mac_inference_and_passthrough_detection(tmp_path):
     assert "[Passthrough/Transit]" in content
     assert "## L2 Discovery Coverage & Accuracy Audit" in content
     assert "lldpd (os-lldpd plugin) is not installed on OPNsense." in content
+
+
+def test_classify_non_network_appliance_apple_and_ruckus():
+    from net_docu_crawler.drivers.detector import classify_non_network_appliance
+
+    assert classify_non_network_appliance(vendor_oui="Apple, Inc.", banner="SSH-2.0-OpenSSH_10.2") == (
+        "workstation",
+        "Apple Host / Mac",
+    )
+    assert classify_non_network_appliance(vendor_oui="Ruckus Wireless", banner="SSH-2.0-OpenSSH_7.9") == (
+        "ap",
+        "Ruckus Wireless AP",
+    )
+
+
+def test_resolve_candidate_drivers_unknown_skips_opnsense_and_openwrt():
+    from net_docu_crawler.crawler import _resolve_candidate_drivers
+    from net_docu_crawler.drivers.openwrt import OpenWrtDriver
+    from net_docu_crawler.drivers.opnsense import OPNsenseDriver
+
+    creds = [
+        {"vendor": "opnsense", "username": "root", "password": "pw"},
+        {"vendor": "openwrt", "username": "root", "password": "pw"},
+        {"vendor": "juniper", "username": "root", "password": "pw"},
+    ]
+    drivers = _resolve_candidate_drivers("unknown", creds)
+    assert OPNsenseDriver not in drivers
+    assert OpenWrtDriver not in drivers
+    assert JuniperDriver in drivers
+
+
+def test_try_driver_credentials_deduplicates_failed_ssh_creds(tmp_path):
+    from net_docu_crawler.crawler import _try_driver_credentials
+
+    calls = []
+
+    def fake_attempt(driver_cls, ip, port, transport, cred, timeout, session_log, log_file):
+        calls.append((driver_cls.__name__, cred.get("username"), cred.get("password")))
+        return None, "auth_failed"
+
+    creds = [{"username": "admin", "password": "bad"}]
+    with patch("net_docu_crawler.crawler._connect_and_crawl_once", side_effect=fake_attempt):
+        _try_driver_credentials(
+            ip="10.0.0.1",
+            port=22,
+            transport="ssh",
+            vendor_cand="unknown",
+            driver_classes=[CiscoDriver, JuniperDriver, AristaDriver],
+            sorted_creds=creds,
+            try_all_creds=True,
+            timeout=5,
+            session_log="",
+            log_file=str(tmp_path / "exec.log"),
+        )
+    assert len(calls) == 1
+
+
+def test_prune_empty_session_logs_removes_only_zero_byte_files(tmp_path):
+    from net_docu_crawler.crawler import _prune_empty_session_logs
+
+    empty_log = tmp_path / "10.0.0.1_raw_session.log"
+    empty_log.write_text("", encoding="utf-8")
+    non_empty_log = tmp_path / "10.0.0.2_raw_session.log"
+    non_empty_log.write_text("SW# show version\n", encoding="utf-8")
+
+    _prune_empty_session_logs(str(tmp_path))
+
+    assert not empty_log.exists()
+    assert non_empty_log.read_text(encoding="utf-8") == "SW# show version\n"

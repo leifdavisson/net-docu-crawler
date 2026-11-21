@@ -50,6 +50,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.session_log import SessionLog
 from paramiko.kex_curve25519 import KexCurve25519
 from paramiko.message import Message
 
@@ -498,6 +499,40 @@ def _close_paramiko_client_quietly(client: paramiko.SSHClient, target: str, stag
         logger.debug("Ignoring client.close() error after Stage %d failure on %s: %s", stage, target, close_exc)
 
 
+class LazySessionLog(SessionLog):
+    """
+    Netmiko ``SessionLog`` subclass that defers opening ``file_name`` on disk until
+    non-empty CLI output is actually received, preventing 0-byte ``*_raw_session.log``
+    files whenever TCP/SSH negotiation or authentication fails.
+    """
+
+    def open(self) -> None:
+        return None
+
+    def _ensure_open(self) -> None:
+        if self.session_log is None and self.file_name:
+            super().open()
+
+    def _flush_buffer(self, final: bool = False) -> None:
+        if not self.slog_buffer.getvalue():
+            return
+        self._ensure_open()
+        super()._flush_buffer(final=final)
+
+
+def _wrap_lazy_session_log(params: dict[str, Any]) -> dict[str, Any]:
+    """Wrap string ``session_log`` paths in a fresh ``LazySessionLog`` per connection stage."""
+    out = dict(params)
+    slog = out.get("session_log")
+    if isinstance(slog, str) and slog:
+        out["session_log"] = LazySessionLog(
+            file_name=slog,
+            file_mode=str(out.get("session_log_file_mode", "write")),
+            record_writes=bool(out.get("session_log_record_writes", False)),
+        )
+    return out
+
+
 def connect_netmiko_with_fallback(device_params: dict[str, Any]):
     """
     Establishes a Netmiko SSH/Telnet connection using a 3-stage per-connection ladder:
@@ -517,7 +552,7 @@ def connect_netmiko_with_fallback(device_params: dict[str, Any]):
     target = str(device_params.get("ip") or device_params.get("host") or "unknown")
     dev_type = str(device_params.get("device_type", ""))
 
-    stage1_params = dict(device_params)
+    stage1_params = _wrap_lazy_session_log(device_params)
     if "disabled_algorithms" not in stage1_params and not dev_type.endswith("_telnet"):
         stage1_params["disabled_algorithms"] = _stage1_disabled_algorithms_dict()
 
@@ -530,7 +565,7 @@ def connect_netmiko_with_fallback(device_params: dict[str, Any]):
             "Netmiko Stage 1 SSH negotiation failed for %s; retrying Stage 2 scoped fallback: %s", target, exc1
         )
 
-    stage2_params = dict(device_params)
+    stage2_params = _wrap_lazy_session_log(device_params)
     stage2_params["disabled_algorithms"] = {}
     stage2_params["disable_sha2_fix"] = False
     stage2_params["ssh_strict"] = False
@@ -546,7 +581,7 @@ def connect_netmiko_with_fallback(device_params: dict[str, Any]):
             exc2,
         )
 
-    stage3_params = dict(device_params)
+    stage3_params = _wrap_lazy_session_log(device_params)
     stage3_params["disabled_algorithms"] = {}
     stage3_params["disable_sha2_fix"] = True
     stage3_params["ssh_strict"] = False

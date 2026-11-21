@@ -67,9 +67,16 @@ class AuditedMissingHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     or ``NDC_STRICT_HOST_KEYS=1`` to enforce ``paramiko.RejectPolicy()`` for unknown hosts.
     """
 
+    _warned_host_keys: set[tuple[str, str]] = set()
+
     def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
         key_type = key.get_name() if hasattr(key, "get_name") else "unknown"
         fingerprint = _format_host_key_fingerprint(key)
+        cache_key = (str(hostname), fingerprint)
+        if cache_key in self._warned_host_keys:
+            return
+        if len(self._warned_host_keys) < 4096:
+            self._warned_host_keys.add(cache_key)
         logger.warning(
             "Unverified SSH host key for %s (%s %s) during read-only OPNsense discovery; "
             "set strict_host_key_checking=True or %s=1 to reject unknown hosts.",

@@ -60,3 +60,28 @@ def test_install_missing_dependencies_mock():
         res = install_missing_dependencies(["netmiko", "paramiko"])
         assert res is True
         assert mock_call.called
+
+
+def test_dependency_checker_imports_without_third_party_deps():
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; "
+        "sys.modules['paramiko'] = None; "
+        "sys.modules['netmiko'] = None; "
+        "sys.modules['netaddr'] = None; "
+        "from net_docu_crawler.dependency_checker import check_dependencies; "
+        "res = check_dependencies(); "
+        "assert 'paramiko' in res['missing_required']"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_lazy_package_exports():
+    import net_docu_crawler
+
+    assert net_docu_crawler.CiscoDriver.__name__ == "CiscoDriver"
+    assert net_docu_crawler.DeviceRegistry.__name__ == "DeviceRegistry"
+    assert callable(net_docu_crawler.get_driver)

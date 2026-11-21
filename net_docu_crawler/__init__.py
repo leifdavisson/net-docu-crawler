@@ -19,23 +19,6 @@ Consolidates zero-blast-radius discovery across Cisco, Juniper, Aruba, Palo Alto
 Arista, MikroTik, Fortinet, FRRouting, OPNsense, and OpenWrt platforms.
 """
 
-from net_docu_crawler.drivers import (
-    DRIVER_REGISTRY,
-    AristaDriver,
-    ArubaDriver,
-    BaseDriver,
-    CiscoDriver,
-    FortinetDriver,
-    FRRDriver,
-    JuniperDriver,
-    MikroTikDriver,
-    OpenWrtDriver,
-    OPNsenseDriver,
-    PaloAltoDriver,
-    get_driver,
-)
-from net_docu_crawler.topology_resolver import DeviceRegistry
-
 __version__ = "2.0.0"
 
 __all__ = [
@@ -54,3 +37,16 @@ __all__ = [
     "DeviceRegistry",
     "get_driver",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily load driver and topology symbols so pre-flight dependency checks can run first."""
+    if name == "DeviceRegistry":
+        from net_docu_crawler.topology_resolver import DeviceRegistry
+
+        return DeviceRegistry
+    if name in __all__:
+        from net_docu_crawler import drivers
+
+        return getattr(drivers, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

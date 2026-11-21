@@ -503,7 +503,11 @@ def _resolve_candidate_drivers(vendor_cand: str, credentials: list[dict]) -> lis
     """Return ordered driver classes to try for a detected vendor or unknown target."""
     if vendor_cand in VENDOR_DRIVER_MAP:
         return [VENDOR_DRIVER_MAP[vendor_cand]]
-    cred_vendors = [str(c.get("vendor") or "").strip().lower() for c in credentials if c.get("vendor")]
+    cred_vendors = [
+        str(c.get("vendor") or "").strip().lower()
+        for c in credentials
+        if c.get("vendor") and str(c.get("vendor")).strip().lower() not in ("opnsense", "openwrt")
+    ]
     preferred = [VENDOR_DRIVER_MAP[v] for v in cred_vendors if v in VENDOR_DRIVER_MAP]
     default_order = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
     return list(dict.fromkeys(preferred + default_order))
@@ -552,6 +556,17 @@ def _sort_and_scope_credentials(
     return sorted_creds
 
 
+def _remove_empty_session_log(session_log: str) -> None:
+    """Delete ``session_log`` if it exists on disk with 0 bytes after a failed connection attempt."""
+    if not session_log:
+        return
+    try:
+        if os.path.isfile(session_log) and os.path.getsize(session_log) == 0:
+            os.remove(session_log)
+    except OSError as exc:
+        logger.debug("Unable to remove empty session log %s: %s", session_log, exc)
+
+
 def _connect_and_crawl_once(
     driver_cls: type,
     ip: str,
@@ -592,6 +607,7 @@ def _connect_and_crawl_once(
         _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
         return data, "success"
     except Exception as e:
+        _remove_empty_session_log(session_log)
         err_msg = str(e).lower()
         _log_event(
             log_file,
@@ -629,6 +645,7 @@ def _try_driver_credentials(
 ) -> tuple[dict | None, bool]:
     """Attempt authentication and crawl across candidate driver classes and credentials."""
     saw_auth_failure = False
+    failed_ssh_creds: set[tuple[str, str]] = set()
     for driver_cls in driver_classes:
         if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
             continue
@@ -642,7 +659,11 @@ def _try_driver_credentials(
                 if filtered:
                     driver_creds = filtered
         for cred in driver_creds:
-            if not cred.get("username", ""):
+            user = cred.get("username", "")
+            if not user:
+                continue
+            cred_key = (user, cred.get("password", ""))
+            if transport == "ssh" and cred_key in failed_ssh_creds:
                 continue
             data, outcome = _connect_and_crawl_once(
                 driver_cls, ip, port, transport, cred, timeout, session_log, log_file
@@ -651,6 +672,8 @@ def _try_driver_credentials(
                 return data, saw_auth_failure
             if outcome == "auth_failed":
                 saw_auth_failure = True
+                if transport == "ssh":
+                    failed_ssh_creds.add(cred_key)
                 continue
             if outcome == "transport_failed":
                 return None, saw_auth_failure
@@ -775,6 +798,7 @@ def crawl_target_with_ports(
         if data is not None:
             return data
 
+    _remove_empty_session_log(session_log)
     status = "unauthenticated" if (last_vendor in VENDOR_DRIVER_MAP and saw_auth_failure) else "unsupported"
     fail_msg = f"Could not authenticate or connect to {ip} (recording partial inventory status={status})"
     print(f"[-] {fail_msg}")
@@ -1622,6 +1646,16 @@ def crawl_network(
     return _execute_crawl(cfg)
 
 
+def _prune_empty_session_logs(logs_dir: str) -> None:
+    """Remove any 0-byte ``*_raw_session.log`` files left in ``logs_dir``."""
+    if not logs_dir or not os.path.isdir(logs_dir):
+        return
+    for fname in os.listdir(logs_dir):
+        if not fname.endswith("_raw_session.log"):
+            continue
+        _remove_empty_session_log(os.path.join(logs_dir, fname))
+
+
 def _sanitize_session_logs(logs_dir: str):
     """Redact credentials/secrets from raw Netmiko/Paramiko session transcripts when --sanitize-passwords is enabled."""
     if not logs_dir or not os.path.isdir(logs_dir):
@@ -1979,6 +2013,7 @@ def _export_dataset_and_failed_hosts(
     logs_dir: str,
 ) -> str:
     """Optionally sanitize secrets, then write `net_docu_crawler_dataset.json` and `failed_hosts.json`."""
+    _prune_empty_session_logs(logs_dir or os.path.join(run_output_dir, "logs"))
     if sanitize_passwords:
         print("[+] Sanitizing passwords and pre-shared keys in configuration backups and session logs...")
         for dev in raw_devices:
