@@ -36,7 +36,6 @@ from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption,
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 from paramiko.ed25519key import Ed25519Key
 from paramiko.kex_curve25519 import KexCurve25519
-from paramiko.kex_group1 import KexGroup1
 from paramiko.message import Message
 from paramiko.pkey import PKey
 from paramiko.ssh_exception import (
@@ -124,7 +123,7 @@ def test_configure_paramiko_compat_registers_curve25519_and_group18_idempotently
         assert Transport._preferred_kex.count("curve25519-sha256") == 1
 
     assert Transport._kex_info["diffie-hellman-group18-sha512"] is KexGroup18SHA512
-    assert issubclass(KexGroup18SHA512, KexGroup1)
+    assert hasattr(KexGroup18SHA512, "start_kex") and hasattr(KexGroup18SHA512, "parse_next")
     assert KexGroup18SHA512.P.bit_length() == 8192
     assert KexGroup18SHA512.G == 2
     assert KexGroup18SHA512.hash_algo is hashlib.sha512

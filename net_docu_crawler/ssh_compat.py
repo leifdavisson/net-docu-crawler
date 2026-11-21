@@ -45,8 +45,12 @@ from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 from paramiko.kex_curve25519 import KexCurve25519
-from paramiko.kex_group1 import KexGroup1
 from paramiko.message import Message
+
+try:
+    from paramiko.kex_group1 import KexGroup1 as _BaseModpKex
+except ImportError:  # Paramiko 5.x removed kex_group1
+    from paramiko.kex_group16 import KexGroup16SHA512 as _BaseModpKex
 from paramiko.pkey import PKey
 from paramiko.ssh_exception import (
     AuthenticationException,
@@ -102,7 +106,7 @@ _AUTH_ERROR_SUBSTRINGS: tuple[str, ...] = (
 )
 
 
-class KexGroup18SHA512(KexGroup1):
+class KexGroup18SHA512(_BaseModpKex):
     """
     RFC 3526 Section 7 (8192-bit MODP Group 18) Diffie-Hellman key exchange with SHA-512
     (RFC 8268 ``diffie-hellman-group18-sha512``).
