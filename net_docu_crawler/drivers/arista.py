@@ -20,10 +20,13 @@ Official Documentation: https://www.arista.com/en/um-eos
 """
 
 import json
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class AristaDriver(BaseDriver):
@@ -38,22 +41,9 @@ class AristaDriver(BaseDriver):
     paging_cmd = "terminal length 0"
 
     def connect(self):
-        device = {
-            "device_type": "arista_eos",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "secret": self.secret,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
+        device = self._build_netmiko_params("arista_eos", secret=self.secret)
         conn = self.connect_netmiko(device)
-        try:
-            conn.enable()
-        except Exception:
-            pass
+        self._safe_enable(conn)
         return conn
 
     def get_version(self, conn) -> dict:
@@ -75,18 +65,18 @@ class AristaDriver(BaseDriver):
             sys_mac = data.get("systemMacAddress", "")
             if sys_mac:
                 info["mac_address"] = oui_lookup.normalize_mac(sys_mac).lower()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show version | json failed: %s", self.ip, exc)
 
         try:
             raw_host = conn.send_command("show hostname | json")
             h_data = json.loads(raw_host)
             info["hostname"] = h_data.get("fqdn") or h_data.get("hostname", "")
-        except Exception:
-            try:
-                info["hostname"] = conn.find_prompt().rstrip(">#")
-            except Exception:
-                pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show hostname | json failed, falling back to prompt: %s", self.ip, exc)
+            prompt = self._safe_find_prompt(conn)
+            if prompt:
+                info["hostname"] = prompt.rstrip(">#")
 
         return info
 
@@ -133,8 +123,8 @@ class AristaDriver(BaseDriver):
                     "output_errors": int(counters.get("outErrors", 0) or 0),
                     "drops": int(counters.get("inDiscards", 0) or 0) + int(counters.get("outDiscards", 0) or 0),
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show ip interface | json failed: %s", self.ip, exc)
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
@@ -162,8 +152,8 @@ class AristaDriver(BaseDriver):
                             "device_type": "switch",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show lldp neighbors detail | json failed: %s", self.ip, exc)
         return neighbors
 
     def get_stp(self, conn) -> dict:
@@ -180,8 +170,8 @@ class AristaDriver(BaseDriver):
                         if is_root:
                             stp["is_root"] = True
                         stp["vlans"][inst_id] = {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show spanning-tree | json failed: %s", self.ip, exc)
         return stp
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -203,8 +193,8 @@ class AristaDriver(BaseDriver):
                         "interface": intf,
                     }
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show ip route | json failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -227,8 +217,8 @@ class AristaDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show ip arp | json failed: %s", self.ip, exc)
         return arp_entries
 
     def get_poe(self, conn) -> dict:
@@ -246,7 +236,8 @@ class AristaDriver(BaseDriver):
                     "watts": float(intf_data.get("power", 0.0)),
                     "class": str(intf_data.get("class", "unknown")),
                 }
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Arista show power inline | json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_txt = conn.send_command("show power inline")
                 m_tot = re.search(r"Total:\s*([\d\.]+)W?", raw_txt, re.IGNORECASE)
@@ -266,8 +257,8 @@ class AristaDriver(BaseDriver):
                             "watts": float(parts[3]),
                             "class": parts[4] if len(parts) > 4 else "unknown",
                         }
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Arista show power inline text fallback failed: %s", self.ip, txt_exc)
         return poe
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -292,7 +283,8 @@ class AristaDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Arista show mac address-table | json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_txt = conn.send_command("show mac address-table")
                 for line in raw_txt.splitlines():
@@ -308,8 +300,8 @@ class AristaDriver(BaseDriver):
                                 "vendor": oui_lookup.lookup_oui(mac),
                             }
                         )
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Arista show mac address-table text fallback failed: %s", self.ip, txt_exc)
         return entries
 
     def get_optics(self, conn) -> list[dict]:
@@ -339,7 +331,10 @@ class AristaDriver(BaseDriver):
                         else None,
                     }
                 )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Arista show interfaces transceiver | json failed, falling back to text: %s", self.ip, exc
+            )
             try:
                 raw_txt = conn.send_command("show interfaces transceiver")
                 for line in raw_txt.splitlines():
@@ -366,15 +361,12 @@ class AristaDriver(BaseDriver):
                                 "voltage_v": volt,
                             }
                         )
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Arista show interfaces transceiver text fallback failed: %s", self.ip, txt_exc)
         return optics
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("show running-config")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "show running-config")
 
     @staticmethod
     def _eos_vlans_to_str(val) -> str:
@@ -435,8 +427,8 @@ class AristaDriver(BaseDriver):
                             rec["trunk_active_vlans"] = active
                         if "nativeVlanTagged" in pdata:
                             rec["native_vlan_tagged"] = bool(pdata["nativeVlanTagged"])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show interfaces trunk | json failed: %s", self.ip, exc)
 
         if not parsed_trunk_json:
             try:
@@ -504,8 +496,8 @@ class AristaDriver(BaseDriver):
                                 rec = ops.setdefault(p, {})
                                 if not rec.get("trunk_active_vlans"):
                                     rec["trunk_active_vlans"] = vlans
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Arista show interfaces trunk text fallback failed: %s", self.ip, exc)
 
         # 2. Operational Port-Channel / LAG state (`show port-channel summary | json` with text fallback)
         parsed_pc_json = False
@@ -535,8 +527,8 @@ class AristaDriver(BaseDriver):
                                     rec = ops.setdefault(m_port, {})
                                     rec["lag_group"] = pc_name
                                     rec["lacp_mode"] = "active" if "lacp" in proto else "on"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Arista show port-channel summary | json failed: %s", self.ip, exc)
 
         if not parsed_pc_json:
             try:
@@ -556,7 +548,7 @@ class AristaDriver(BaseDriver):
                                     rec = ops.setdefault(pname, {})
                                     rec["lag_group"] = pc_name
                                     rec["lacp_mode"] = "active" if proto == "lacp" else "on"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Arista show port-channel summary text fallback failed: %s", self.ip, exc)
 
         return ops

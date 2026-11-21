@@ -19,10 +19,13 @@ Official Documentation: https://docs.frrouting.org/
 """
 
 import json
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class FRRDriver(BaseDriver):
@@ -51,25 +54,15 @@ class FRRDriver(BaseDriver):
                 self._frr_available = True
                 self._frr_version = m_ver.group(1)
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FRR vtysh probe failed: %s", self.ip, exc)
         self._frr_available = False
         self._frr_version = ""
         return False
 
     def connect(self):
-        device = {
-            "device_type": "linux",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("linux")
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -85,8 +78,8 @@ class FRRDriver(BaseDriver):
             h = conn.send_command("hostname -s").strip()
             if h:
                 info["hostname"] = h
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FRR hostname -s failed: %s", self.ip, exc)
 
         if self._has_frr(conn):
             ver = getattr(self, "_frr_version", "")
@@ -107,8 +100,8 @@ class FRRDriver(BaseDriver):
                 pretty = m_pretty.group(1).strip()
                 info["model"] = f"Linux Host ({pretty})"
                 info["firmware"] = pretty
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Linux /etc/os-release read failed: %s", self.ip, exc)
 
         return info
 
@@ -139,8 +132,8 @@ class FRRDriver(BaseDriver):
                     "output_errors": int(tx_stats.get("errors", 0) or 0),
                     "drops": int(rx_stats.get("dropped", 0) or 0) + int(tx_stats.get("dropped", 0) or 0),
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Linux ip -s -j link show failed: %s", self.ip, exc)
 
         try:
             addr_raw = conn.send_command("ip -j -4 addr show")
@@ -166,8 +159,8 @@ class FRRDriver(BaseDriver):
                     )
                     if ifname in interfaces_detail and not interfaces_detail[ifname]["ip_address"]:
                         interfaces_detail[ifname]["ip_address"] = cidr
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Linux ip -j -4 addr show failed: %s", self.ip, exc)
         return l3_interfaces, interfaces_detail
 
     def get_interfaces(self, conn) -> tuple[list, dict]:
@@ -204,8 +197,8 @@ class FRRDriver(BaseDriver):
                     "status": status,
                     "mac_address": mac,
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FRR show interface json failed: %s", self.ip, exc)
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
@@ -230,8 +223,8 @@ class FRRDriver(BaseDriver):
                                 "device_type": "router",
                             }
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FRR lldpcli neighbor query failed: %s", self.ip, exc)
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -251,8 +244,8 @@ class FRRDriver(BaseDriver):
                             "interface": r.get("dev", ""),
                         }
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Linux ip -j route show failed: %s", self.ip, exc)
             return routes
         try:
             raw = conn.send_command("vtysh -c 'show ip route json'")
@@ -271,8 +264,8 @@ class FRRDriver(BaseDriver):
                             "interface": intf,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FRR show ip route json failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -295,14 +288,11 @@ class FRRDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Linux ip -j neigh show failed: %s", self.ip, exc)
         return arp_entries
 
     def get_running_config(self, conn) -> str:
         if not self._has_frr(conn):
             return ""
-        try:
-            return conn.send_command("vtysh -c 'show running-config'")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "vtysh -c 'show running-config'")

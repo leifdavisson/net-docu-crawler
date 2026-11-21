@@ -21,10 +21,13 @@ already-collected device configurations and TLS certificates.
 from __future__ import annotations
 
 import collections
+import logging
 import os
 import re
 import socket
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _VALID_DOMAIN_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9-]+)+$")
@@ -57,8 +60,8 @@ def detect_local_dns_suffix() -> str:
                     dom = _clean_domain(m.group(1))
                     if dom:
                         return dom
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Windows ipconfig DNS suffix detection failed: %s", exc)
     else:
         try:
             if os.path.isfile("/etc/resolv.conf"):
@@ -70,8 +73,8 @@ def detect_local_dns_suffix() -> str:
                                 dom = _clean_domain(token)
                                 if dom:
                                     return dom
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Reading /etc/resolv.conf for DNS suffix failed: %s", exc)
 
     try:
         fqdn = socket.getfqdn()
@@ -79,8 +82,8 @@ def detect_local_dns_suffix() -> str:
             dom = _clean_domain(fqdn.split(".", 1)[1])
             if dom:
                 return dom
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.debug("socket.getfqdn() DNS suffix detection failed: %s", exc)
     return ""
 
 

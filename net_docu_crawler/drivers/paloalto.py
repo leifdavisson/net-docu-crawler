@@ -18,10 +18,13 @@ Palo Alto Networks Driver: PAN-OS Firewalls and Management Appliances.
 Official Documentation: https://docs.paloaltonetworks.com/pan-os
 """
 
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class PaloAltoDriver(BaseDriver):
@@ -36,22 +39,9 @@ class PaloAltoDriver(BaseDriver):
     paging_cmd = "set cli pager off"
 
     def connect(self):
-        device = {
-            "device_type": "paloalto_panos",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-            "global_delay_factor": 2,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
+        device = self._build_netmiko_params("paloalto_panos", global_delay_factor=2)
         conn = self.connect_netmiko(device)
-        try:
-            conn.send_command(self.paging_cmd)
-        except Exception:
-            pass
+        self._safe_send_command(conn, self.paging_cmd)
         return conn
 
     def get_version(self, conn) -> dict:
@@ -80,8 +70,8 @@ class PaloAltoDriver(BaseDriver):
             m_mac = re.search(r"mac-address:\s*([0-9a-fA-F:.-]+)", raw)
             if m_mac:
                 info["mac_address"] = oui_lookup.normalize_mac(m_mac.group(1)).lower()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] PAN-OS show system info failed: %s", self.ip, exc)
 
         if not info["hostname"]:
             prompt = conn.find_prompt()
@@ -123,8 +113,8 @@ class PaloAltoDriver(BaseDriver):
                         "speed": "N/A",
                         "duplex": "N/A",
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] PAN-OS show interface all failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -159,8 +149,8 @@ class PaloAltoDriver(BaseDriver):
                     current["remote_platform"] = desc
             if current.get("local_port") and current.get("remote_device"):
                 neighbors.append(current)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] PAN-OS show lldp neighbors all failed: %s", self.ip, exc)
 
         return neighbors
 
@@ -179,8 +169,8 @@ class PaloAltoDriver(BaseDriver):
                             "protocol": parts[2] if len(parts) > 2 else "A",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] PAN-OS show routing route failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -200,12 +190,9 @@ class PaloAltoDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] PAN-OS show arp all failed: %s", self.ip, exc)
         return arp_entries
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("show config running")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "show config running")

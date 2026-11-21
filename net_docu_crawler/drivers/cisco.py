@@ -18,11 +18,14 @@ Cisco Systems Driver: IOS, IOS-XE, NX-OS, and IOS-XR.
 Official Documentation: https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html
 """
 
+import logging
 import re
 
 import oui_lookup
 import parser
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class CiscoDriver(BaseDriver):
@@ -32,24 +35,10 @@ class CiscoDriver(BaseDriver):
     paging_cmd = "terminal length 0"
 
     def connect(self):
-        device = {
-            "device_type": "cisco_ios",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "secret": self.secret,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-            "global_delay_factor": 2,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
+        device = self._build_netmiko_params("cisco_ios", secret=self.secret, global_delay_factor=2)
         conn = self.connect_netmiko(device)
         if self.secret:
-            try:
-                conn.enable()
-            except Exception:
-                pass
+            self._safe_enable(conn)
         return conn
 
     def get_version(self, conn) -> dict:
@@ -74,8 +63,8 @@ class CiscoDriver(BaseDriver):
                     if item.get("sn") and item["sn"] != "N/A":
                         ver["serial"] = item["sn"]
                     break
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show inventory failed: %s", self.ip, exc)
 
         # Classify router vs switch persona accurately (e.g. CISCO891-K9, ISR, ASR, IOS-XR)
         dev_type = parser.classify_device_type(model=ver.get("model", ""), device_id=ver.get("hostname", ""))
@@ -130,8 +119,8 @@ class CiscoDriver(BaseDriver):
                 if key not in seen:
                     seen.add(key)
                     neighbors.append(n)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show cdp neighbors detail failed: %s", self.ip, exc)
         try:
             sh_lldp = conn.send_command("show lldp neighbors detail")
             for n in parser.parse_lldp_neighbors_detail(sh_lldp):
@@ -171,29 +160,32 @@ class CiscoDriver(BaseDriver):
                 if key not in seen:
                     seen.add(key)
                     neighbors.append(n)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show lldp neighbors detail failed: %s", self.ip, exc)
         return neighbors
 
     def get_stp(self, conn) -> dict:
         try:
             sh_stp = conn.send_command("show spanning-tree")
             return parser.parse_spanning_tree(sh_stp, "cisco_ios")
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Cisco show spanning-tree failed: %s", self.ip, exc)
             return {"enabled": False, "vlans": {}}
 
     def get_routing_table(self, conn) -> list[dict]:
         try:
             sh_route = conn.send_command("show ip route")
             return parser.parse_show_ip_route(sh_route, "cisco_ios")
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Cisco show ip route failed: %s", self.ip, exc)
             return []
 
     def get_arp_table(self, conn) -> list[dict]:
         try:
             sh_arp = conn.send_command("show ip arp")
             return parser.parse_show_ip_arp(sh_arp)
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Cisco show ip arp failed: %s", self.ip, exc)
             return []
 
     def get_poe(self, conn) -> dict:
@@ -209,8 +201,8 @@ class CiscoDriver(BaseDriver):
                 poe["used_power_watts"] = float(m_used.group(1))
             if m_rem:
                 poe["available_power_watts"] = float(m_rem.group(1))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show power inline failed: %s", self.ip, exc)
         return poe
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -230,8 +222,8 @@ class CiscoDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show mac address-table failed: %s", self.ip, exc)
         return entries
 
     @staticmethod
@@ -300,8 +292,8 @@ class CiscoDriver(BaseDriver):
                         }
                     cur_name = ""
                     cur_descr = ""
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show inventory optics parse failed: %s", self.ip, exc)
 
         # 2. Merge live DOM telemetry from `show interfaces transceiver`
         try:
@@ -338,15 +330,12 @@ class CiscoDriver(BaseDriver):
                             "temperature_c": temp,
                             "voltage_v": volt,
                         }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show interfaces transceiver failed: %s", self.ip, exc)
         return list(optics_by_norm.values())
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("show running-config")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "show running-config")
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
         ops: dict[str, dict] = {}
@@ -452,8 +441,8 @@ class CiscoDriver(BaseDriver):
                             entry.setdefault("oper_mode", "trunk")
                             if not entry.get("trunk_active_vlans"):
                                 entry["trunk_active_vlans"] = vlans
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show interfaces trunk failed: %s", self.ip, exc)
 
         try:
             raw_ec = conn.send_command("show etherchannel summary")
@@ -467,7 +456,7 @@ class CiscoDriver(BaseDriver):
                             if pname:
                                 ops.setdefault(pname, {})["lag_group"] = po_name
                                 ops[pname]["lacp_mode"] = "active" if proto == "lacp" else "on"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Cisco show etherchannel summary failed: %s", self.ip, exc)
 
         return ops

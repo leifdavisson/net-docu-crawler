@@ -21,10 +21,13 @@ Official Documentation: https://openwrt.org/docs/start
 """
 
 import json
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class OpenWrtDriver(BaseDriver):
@@ -39,18 +42,8 @@ class OpenWrtDriver(BaseDriver):
     paging_cmd = ""
 
     def connect(self):
-        device = {
-            "device_type": "linux",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("linux")
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -77,16 +70,16 @@ class OpenWrtDriver(BaseDriver):
                     info["firmware"] = f"OpenWrt {rel['version']}"
                 if rel.get("target") and rel["target"] not in info["model"]:
                     info["model"] = f"{info['model']} ({rel['target']})"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt ubus system board failed: %s", self.ip, exc)
 
         if info["hostname"] == "OpenWrt":
             try:
                 h = conn.send_command("cat /proc/sys/kernel/hostname 2>/dev/null || hostname").strip()
                 if h:
                     info["hostname"] = h
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] OpenWrt hostname fallback failed: %s", self.ip, exc)
 
         if info["firmware"] == "OpenWrt":
             try:
@@ -94,8 +87,8 @@ class OpenWrtDriver(BaseDriver):
                 m_desc = re.search(r"DISTRIB_DESCRIPTION=['\"]([^'\"]+)['\"]", rel_raw)
                 if m_desc:
                     info["firmware"] = m_desc.group(1)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] OpenWrt /etc/openwrt_release read failed: %s", self.ip, exc)
 
         if info["model"] == "OpenWrt Router":
             try:
@@ -103,8 +96,8 @@ class OpenWrtDriver(BaseDriver):
                 m_mach = re.search(r"(?:machine|model name|Hardware)\s*:\s*(.+)", cpuinfo, re.IGNORECASE)
                 if m_mach:
                     info["model"] = m_mach.group(1).strip()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] OpenWrt /proc/cpuinfo read failed: %s", self.ip, exc)
 
         return info
 
@@ -152,8 +145,8 @@ class OpenWrtDriver(BaseDriver):
                         "description": f"OpenWrt logical interface: {logical_name} (proto={intf.get('proto', 'static')})",
                     }
                 used_ubus = bool(interfaces_detail)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt ubus network.interface dump failed: %s", self.ip, exc)
 
         # 2. Extract MAC addresses and physical state via ip or sysfs
         try:
@@ -205,8 +198,8 @@ class OpenWrtDriver(BaseDriver):
                             )
                             if current_intf in interfaces_detail and not interfaces_detail[current_intf]["ip_address"]:
                                 interfaces_detail[current_intf]["ip_address"] = ip_val
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt ip address show failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -234,8 +227,8 @@ class OpenWrtDriver(BaseDriver):
                                 "device_type": "switch",
                             }
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt lldpcli neighbor query failed: %s", self.ip, exc)
 
         try:
             raw_assoc = conn.send_command("ubus call hostapd.* get_clients 2>/dev/null").strip()
@@ -254,8 +247,8 @@ class OpenWrtDriver(BaseDriver):
                             "device_type": "host",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt hostapd get_clients failed: %s", self.ip, exc)
 
         return neighbors
 
@@ -296,8 +289,8 @@ class OpenWrtDriver(BaseDriver):
                             "interface": dev,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt routing table query failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -322,8 +315,8 @@ class OpenWrtDriver(BaseDriver):
                                 "vendor": oui_lookup.lookup_oui(mac_val),
                             }
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt /proc/net/arp read failed: %s", self.ip, exc)
         return arp_entries
 
     def get_running_config(self, conn) -> str:
@@ -331,10 +324,7 @@ class OpenWrtDriver(BaseDriver):
             config = conn.send_command("uci export 2>/dev/null")
             if config and len(config.strip()) > 50:
                 return config
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] OpenWrt uci export failed: %s", self.ip, exc)
 
-        try:
-            return conn.send_command("head -n 1000 /etc/config/* 2>/dev/null")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "head -n 1000 /etc/config/* 2>/dev/null")

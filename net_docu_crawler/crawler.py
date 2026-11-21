@@ -25,6 +25,7 @@ import datetime
 import glob
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,22 +33,18 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 
 import oui_lookup
 import report_generator
 from net_docu_crawler.drivers import (
+    VENDOR_DRIVER_MAP,
     AristaDriver,
-    ArubaDriver,
     CiscoDriver,
-    CiscoSMBDriver,
     FortinetDriver,
-    FRRDriver,
-    HPProCurveDriver,
     JuniperDriver,
-    MikroTikDriver,
-    OpenWrtDriver,
-    OPNsenseDriver,
-    PaloAltoDriver,
+    resolve_driver_for_vendor,
+    resolve_vendor_for_driver,
 )
 from net_docu_crawler.drivers.base import sanitize_raw_config
 from net_docu_crawler.drivers.detector import (
@@ -62,6 +59,8 @@ from net_docu_crawler.drivers.detector import (
     scan_subnet_ports,
 )
 from net_docu_crawler.topology_resolver import DeviceRegistry
+
+logger = logging.getLogger(__name__)
 
 _VIRTUAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth", "virbr", "tun", "tap", "wg", "tailscale")
 
@@ -88,8 +87,10 @@ def detect_local_subnets() -> list[str]:
                             net = ipaddress.IPv4Interface(f"{cur_ip}/{m_mask.group(1)}").network
                             if 22 <= net.prefixlen <= 30 and not net.is_loopback and str(net) not in subnets:
                                 subnets.append(str(net))
-                        except ValueError:
-                            pass
+                        except ValueError as exc:
+                            logger.debug(
+                                "Skipping invalid Windows IPv4 interface %s/%s: %s", cur_ip, m_mask.group(1), exc
+                            )
                         cur_ip = ""
         else:
             proc = subprocess.run(
@@ -115,10 +116,10 @@ def detect_local_subnets() -> list[str]:
                         net = ipaddress.IPv4Interface(cidr).network
                         if 22 <= net.prefixlen <= 30 and str(net) not in subnets:
                             subnets.append(str(net))
-                    except ValueError:
-                        continue
-    except Exception:
-        pass
+                    except ValueError as exc:
+                        logger.debug("Skipping invalid local IPv4 CIDR %r: %s", cidr, exc)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Local subnet auto-detection failed: %s", exc)
     return subnets[:1] if subnets else ["192.168.1.0/24"]
 
 
@@ -127,27 +128,6 @@ DEFAULT_TARGETS = (
     if os.environ.get("NET_DOCU_TARGETS")
     else detect_local_subnets()
 )
-
-VENDOR_DRIVER_MAP = {
-    "juniper": JuniperDriver,
-    "aruba": ArubaDriver,
-    "hpprocurve": HPProCurveDriver,
-    "procurve": HPProCurveDriver,
-    "hp": HPProCurveDriver,
-    "cisco": CiscoDriver,
-    "ciscosmb": CiscoSMBDriver,
-    "cisco_s300": CiscoSMBDriver,
-    "cbs": CiscoSMBDriver,
-    "sg300": CiscoSMBDriver,
-    "sg350": CiscoSMBDriver,
-    "paloalto": PaloAltoDriver,
-    "arista": AristaDriver,
-    "mikrotik": MikroTikDriver,
-    "fortinet": FortinetDriver,
-    "frrouting": FRRDriver,
-    "opnsense": OPNsenseDriver,
-    "openwrt": OpenWrtDriver,
-}
 
 
 def expand_targets(targets: list[str], max_hosts_per_cidr: int = 256) -> list[str]:
@@ -323,8 +303,8 @@ def _log_event(log_path: str, msg: str):
     try:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.debug("Failed to append crawler event to %s: %s", log_path, exc)
 
 
 def crawl_target(
@@ -518,6 +498,212 @@ def _sanitize_http_model_label(fp: dict | None) -> str:
     return ""
 
 
+def _resolve_candidate_drivers(vendor_cand: str, credentials: list[dict]) -> list[type]:
+    """Return ordered driver classes to try for a detected vendor or unknown target."""
+    if vendor_cand in VENDOR_DRIVER_MAP:
+        return [VENDOR_DRIVER_MAP[vendor_cand]]
+    cred_vendors = [str(c.get("vendor") or "").strip().lower() for c in credentials if c.get("vendor")]
+    preferred = [VENDOR_DRIVER_MAP[v] for v in cred_vendors if v in VENDOR_DRIVER_MAP]
+    default_order = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
+    return list(dict.fromkeys(preferred + default_order))
+
+
+def _sort_and_scope_credentials(
+    credentials: list[dict],
+    vendor_cand: str,
+    try_all_creds: bool,
+    log_file: str,
+) -> list[dict]:
+    """Order and filter candidate credentials for the detected vendor to prevent AAA lockouts."""
+    sorted_creds = list(credentials)
+    if vendor_cand in ("opnsense", "frrouting", "openwrt"):
+        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
+    elif vendor_cand == "cisco":
+        sorted_creds.sort(key=lambda c: 0 if c.get("username") in ("Cisco", "admin") else 1)
+    elif vendor_cand == "juniper":
+        sorted_creds.sort(
+            key=lambda c: 0 if c.get("username") == "root" else (1 if c.get("username") == "admin" else 2)
+        )
+    elif vendor_cand == "hpprocurve":
+        sorted_creds.sort(
+            key=lambda c: 0 if c.get("username") == "manager" else (1 if c.get("username") == "admin" else 2)
+        )
+    else:
+        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
+
+    if vendor_cand and vendor_cand != "unknown":
+        sorted_creds.sort(
+            key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
+        )
+        if not try_all_creds:
+            scoped_creds = [
+                c
+                for c in sorted_creds
+                if not c.get("vendor") or c.get("vendor", "").strip().lower() == vendor_cand.lower()
+            ]
+            if scoped_creds:
+                sorted_creds = scoped_creds
+            else:
+                _log_event(
+                    log_file,
+                    f"No credentials tagged '{vendor_cand}' or untagged; falling back to all {len(sorted_creds)} profiles.",
+                )
+    return sorted_creds
+
+
+def _connect_and_crawl_once(
+    driver_cls: type,
+    ip: str,
+    port: int,
+    transport: str,
+    cred: dict,
+    timeout: int,
+    session_log: str,
+    log_file: str,
+) -> tuple[dict | None, str]:
+    """Execute a single driver connection and crawl attempt; returns `(data, outcome)`."""
+    user = cred.get("username", "")
+    pwd = cred.get("password", "")
+    secret = cred.get("secret", "")
+    _log_event(log_file, f"Connecting to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})...")
+    try:
+        driver = driver_cls(
+            ip=ip,
+            username=user,
+            password=pwd,
+            secret=secret,
+            timeout=timeout,
+            session_log=session_log,
+            port=port,
+            transport=transport,
+        )
+        conn = driver.connect()
+        succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
+        print(f"[+] {succ_msg}")
+        _log_event(log_file, succ_msg)
+        data = driver.crawl(conn)
+        conn.disconnect()
+        _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
+        return data, "success"
+    except Exception as e:
+        err_msg = str(e).lower()
+        _log_event(
+            log_file,
+            f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {e}",
+        )
+        if any(k in err_msg for k in ("auth", "password", "login", "denied", "permission", "credential", "invalid")):
+            return None, "auth_failed"
+        if any(
+            k in err_msg
+            for k in (
+                "incompatible",
+                "no acceptable host key",
+                "no acceptable kex",
+                "error reading ssh protocol banner",
+                "connection refused",
+                "timed out",
+                "tcp connection to device failed",
+            )
+        ):
+            return None, "transport_failed"
+        return None, "driver_failed"
+
+
+def _try_driver_credentials(
+    ip: str,
+    port: int,
+    transport: str,
+    vendor_cand: str,
+    driver_classes: list[type],
+    sorted_creds: list[dict],
+    try_all_creds: bool,
+    timeout: int,
+    session_log: str,
+    log_file: str,
+) -> tuple[dict | None, bool]:
+    """Attempt authentication and crawl across candidate driver classes and credentials."""
+    saw_auth_failure = False
+    for driver_cls in driver_classes:
+        if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
+            continue
+        driver_creds = sorted_creds
+        if vendor_cand == "unknown" and not try_all_creds:
+            drv_vendor = resolve_vendor_for_driver(driver_cls)
+            if drv_vendor:
+                filtered = [
+                    c for c in sorted_creds if not c.get("vendor") or c.get("vendor", "").strip().lower() == drv_vendor
+                ]
+                if filtered:
+                    driver_creds = filtered
+        for cred in driver_creds:
+            if not cred.get("username", ""):
+                continue
+            data, outcome = _connect_and_crawl_once(
+                driver_cls, ip, port, transport, cred, timeout, session_log, log_file
+            )
+            if outcome == "success":
+                return data, saw_auth_failure
+            if outcome == "auth_failed":
+                saw_auth_failure = True
+                continue
+            if outcome == "transport_failed":
+                return None, saw_auth_failure
+            break
+    return None, saw_auth_failure
+
+
+def _identify_port_vendor(
+    ip: str,
+    port: int,
+    transport: str,
+    host_mac: str,
+    hint_norm: str,
+    last_vendor: str,
+    timeout: int,
+    http_fingerprint: bool,
+    http_probed: bool,
+    cached_http_fp: dict | None,
+    log_file: str,
+) -> tuple[str, str, tuple[str, str] | None, bool, dict | None]:
+    """Identify vendor or non-network appliance for an open `(port, transport)` target."""
+    vendor_cand, banner = detect_vendor_range(
+        ip, mac=host_mac, port=port, timeout=min(float(timeout), 3.0), transport=transport
+    )
+    if vendor_cand == "unsupported_appliance":
+        _log_event(
+            log_file,
+            f"Target {ip}:{port} ({transport}) -> non-network appliance ({banner!r}); skipping SSH/Telnet login.",
+        )
+        return vendor_cand, banner, None, http_probed, cached_http_fp
+    if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
+        vendor_cand = hint_norm
+    elif vendor_cand == "unknown":
+        if http_fingerprint and not http_probed:
+            cached_http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
+            http_probed = True
+            if cached_http_fp:
+                _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {cached_http_fp}")
+        http_vendor = infer_vendor_from_http(cached_http_fp)
+        if http_vendor != "unknown":
+            vendor_cand = http_vendor
+            _log_event(log_file, f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand}")
+        else:
+            app_ports = probe_appliance_ports(ip, timeout=min(float(timeout), 0.3))
+            oui_v = oui_lookup.get_vendor(host_mac) if host_mac else ""
+            app_class = classify_non_network_appliance(
+                vendor_oui=oui_v, banner=banner, http_fp=cached_http_fp, open_app_ports=app_ports
+            )
+            if app_class:
+                _log_event(
+                    log_file,
+                    f"Target {ip}:{port} ({transport}) -> non-network appliance ({app_class[1]}, ports={app_ports}); skipping SSH/Telnet login.",
+                )
+                return "unsupported_appliance", banner, app_class, http_probed, cached_http_fp
+    if vendor_cand == "unknown" and last_vendor in VENDOR_DRIVER_MAP:
+        vendor_cand = last_vendor
+    return vendor_cand, banner, None, http_probed, cached_http_fp
+
+
 def crawl_target_with_ports(
     ip: str,
     credentials: list[dict],
@@ -530,232 +716,67 @@ def crawl_target_with_ports(
     vendor_hint: str = "",
     try_all_creds: bool = False,
 ) -> dict | None:
-    """
-    Probe a target across its discovered open `(port, transport)` pairs.
-    Returns a full `device_data` dict on success, or a partial `unauthenticated`/
-    `unsupported` record when a management port is open but login/driver fails.
-    """
-    ports_to_try = open_ports if open_ports else [(22, "ssh")]
-    # Try SSH before Telnet
-    ports_to_try = sorted(ports_to_try, key=lambda pt: (0 if pt[1] == "ssh" else 1, pt[0]))
+    """Probe a target across its discovered open `(port, transport)` pairs and return normalized `device_data`."""
+    ports_to_try = sorted(
+        open_ports if open_ports else [(22, "ssh")], key=lambda pt: (0 if pt[1] == "ssh" else 1, pt[0])
+    )
     host_mac = mac or get_mac_from_system_arp(ip)
     hint_norm = vendor_hint.strip().lower()
-
-    last_vendor = "unknown"
-    last_banner = ""
+    last_vendor, last_banner = "unknown", ""
     last_port, last_transport = ports_to_try[0]
     last_app_class: tuple[str, str] | None = None
     cached_http_fp: dict | None = None
-    http_probed = False
-    saw_auth_failure = False
+    http_probed, saw_auth_failure = False, False
 
     for port, transport in ports_to_try:
-        vendor_cand, banner = detect_vendor_range(
+        vendor_cand, banner, app_class, http_probed, cached_http_fp = _identify_port_vendor(
             ip,
-            mac=host_mac,
-            port=port,
-            timeout=min(float(timeout), 3.0),
-            transport=transport,
+            port,
+            transport,
+            host_mac,
+            hint_norm,
+            last_vendor,
+            timeout,
+            http_fingerprint,
+            http_probed,
+            cached_http_fp,
+            log_file,
         )
-        if vendor_cand == "unsupported_appliance":
-            last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
-            _log_event(
-                log_file,
-                f"Target {ip}:{port} ({transport}) -> non-network appliance ({banner!r}); skipping SSH/Telnet login.",
-            )
-            break
-        if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
-            vendor_cand = hint_norm
-        elif vendor_cand == "unknown":
-            if http_fingerprint and not http_probed:
-                cached_http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
-                http_probed = True
-                if cached_http_fp:
-                    _log_event(log_file, f"Target {ip}:{port} HTTP/TLS probe -> {cached_http_fp}")
-            http_fp = cached_http_fp
-            http_vendor = infer_vendor_from_http(http_fp)
-            if http_vendor != "unknown":
-                vendor_cand = http_vendor
-                _log_event(
-                    log_file,
-                    f"Target {ip}:{port} HTTP/TLS fingerprint identified vendor={vendor_cand}",
-                )
-            else:
-                app_ports = probe_appliance_ports(ip, timeout=min(float(timeout), 0.3))
-                oui_v = oui_lookup.get_vendor(host_mac) if host_mac else ""
-                app_class = classify_non_network_appliance(
-                    vendor_oui=oui_v, banner=banner, http_fp=http_fp, open_app_ports=app_ports
-                )
-                if app_class:
-                    last_vendor, last_banner, last_port, last_transport = (
-                        "unsupported_appliance",
-                        banner,
-                        port,
-                        transport,
-                    )
-                    last_app_class = app_class
-                    _log_event(
-                        log_file,
-                        f"Target {ip}:{port} ({transport}) -> non-network appliance ({app_class[1]}, ports={app_ports}); skipping SSH/Telnet login.",
-                    )
-                    break
-        if vendor_cand == "unknown" and last_vendor in VENDOR_DRIVER_MAP:
-            vendor_cand = last_vendor
         last_vendor, last_banner, last_port, last_transport = vendor_cand, banner, port, transport
+        if vendor_cand == "unsupported_appliance":
+            last_app_class = app_class
+            break
         _log_event(
             log_file,
             f"Target {ip}:{port} ({transport}) -> vendor={vendor_cand}, mac={host_mac or 'none'}, banner={banner!r}",
         )
-
-        if vendor_cand in VENDOR_DRIVER_MAP:
-            driver_classes = [VENDOR_DRIVER_MAP[vendor_cand]]
-        else:
-            cred_vendors = [str(c.get("vendor") or "").strip().lower() for c in credentials if c.get("vendor")]
-            preferred = [VENDOR_DRIVER_MAP[v] for v in cred_vendors if v in VENDOR_DRIVER_MAP]
-            default_order = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
-            driver_classes = list(dict.fromkeys(preferred + default_order))
-
-        sorted_creds = list(credentials)
-        if vendor_cand == "opnsense":
-            sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
-        elif vendor_cand == "cisco":
-            sorted_creds.sort(key=lambda c: 0 if c.get("username") in ("Cisco", "admin") else 1)
-        elif vendor_cand == "juniper":
-            sorted_creds.sort(
-                key=lambda c: 0 if c.get("username") == "root" else (1 if c.get("username") == "admin" else 2)
-            )
-        elif vendor_cand in ("frrouting", "openwrt"):
-            sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
-        elif vendor_cand == "hpprocurve":
-            sorted_creds.sort(
-                key=lambda c: 0 if c.get("username") == "manager" else (1 if c.get("username") == "admin" else 2)
-            )
-        else:
-            sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
-
-        if vendor_cand and vendor_cand != "unknown":
-            sorted_creds.sort(
-                key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
-            )
-            if not try_all_creds:
-                scoped_creds = [
-                    c
-                    for c in sorted_creds
-                    if not c.get("vendor") or c.get("vendor", "").strip().lower() == vendor_cand.lower()
-                ]
-                if scoped_creds:
-                    sorted_creds = scoped_creds
-                else:
-                    _log_event(
-                        log_file,
-                        f"No credentials tagged '{vendor_cand}' or untagged; falling back to all {len(sorted_creds)} profiles.",
-                    )
-
-        _driver_vendor_map = {
-            CiscoDriver: "cisco",
-            CiscoSMBDriver: "ciscosmb",
-            AristaDriver: "arista",
-            JuniperDriver: "juniper",
-            FortinetDriver: "fortinet",
-            ArubaDriver: "aruba",
-            HPProCurveDriver: "hpprocurve",
-            PaloAltoDriver: "paloalto",
-            MikroTikDriver: "mikrotik",
-            OPNsenseDriver: "opnsense",
-            OpenWrtDriver: "openwrt",
-            FRRDriver: "frrouting",
-        }
-
-        transport_failed = False
-        for driver_cls in driver_classes:
-            if transport_failed:
-                break
-            if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
-                continue
-            driver_creds = sorted_creds
-            if vendor_cand == "unknown" and not try_all_creds:
-                drv_vendor = _driver_vendor_map.get(driver_cls, "")
-                if drv_vendor:
-                    filtered = [
-                        c
-                        for c in sorted_creds
-                        if not c.get("vendor") or c.get("vendor", "").strip().lower() == drv_vendor
-                    ]
-                    if filtered:
-                        driver_creds = filtered
-            for cred in driver_creds:
-                user = cred.get("username", "")
-                pwd = cred.get("password", "")
-                secret = cred.get("secret", "")
-                if not user:
-                    continue
-
-                _log_event(
-                    log_file,
-                    f"Connecting to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})...",
-                )
-                try:
-                    driver = driver_cls(
-                        ip=ip,
-                        username=user,
-                        password=pwd,
-                        secret=secret,
-                        timeout=timeout,
-                        session_log=session_log,
-                        port=port,
-                        transport=transport,
-                    )
-                    conn = driver.connect()
-                    succ_msg = (
-                        f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
-                    )
-                    print(f"[+] {succ_msg}")
-                    _log_event(log_file, succ_msg)
-                    data = driver.crawl(conn)
-                    conn.disconnect()
-                    _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
-                    return data
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    _log_event(
-                        log_file,
-                        f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {e}",
-                    )
-                    if any(
-                        k in err_msg
-                        for k in ("auth", "password", "login", "denied", "permission", "credential", "invalid")
-                    ):
-                        saw_auth_failure = True
-                        continue
-                    if any(
-                        k in err_msg
-                        for k in (
-                            "incompatible",
-                            "no acceptable host key",
-                            "no acceptable kex",
-                            "error reading ssh protocol banner",
-                            "connection refused",
-                            "timed out",
-                            "tcp connection to device failed",
-                        )
-                    ):
-                        transport_failed = True
-                    break
+        driver_classes = _resolve_candidate_drivers(vendor_cand, credentials)
+        sorted_creds = _sort_and_scope_credentials(credentials, vendor_cand, try_all_creds, log_file)
+        data, port_auth_fail = _try_driver_credentials(
+            ip,
+            port,
+            transport,
+            vendor_cand,
+            driver_classes,
+            sorted_creds,
+            try_all_creds,
+            timeout,
+            session_log,
+            log_file,
+        )
+        if port_auth_fail:
+            saw_auth_failure = True
+        if data is not None:
+            return data
 
     status = "unauthenticated" if (last_vendor in VENDOR_DRIVER_MAP and saw_auth_failure) else "unsupported"
     fail_msg = f"Could not authenticate or connect to {ip} (recording partial inventory status={status})"
     print(f"[-] {fail_msg}")
     _log_event(log_file, fail_msg)
+    dev_type = last_app_class[0] if last_app_class else "unknown"
+    model_ovr = last_app_class[1] if last_app_class else ""
     partial = build_partial_device_record(
-        ip=ip,
-        mac=host_mac,
-        vendor=last_vendor,
-        banner=last_banner,
-        port=last_port,
-        transport=last_transport,
-        status=status,
-        device_type=last_app_class[0] if last_app_class else "unknown",
-        model_override=last_app_class[1] if last_app_class else "",
+        ip, host_mac, last_vendor, last_banner, last_port, last_transport, status, dev_type, model_ovr
     )
     if http_probed:
         partial["_http_fp"] = cached_http_fp
@@ -802,8 +823,8 @@ def _parse_cidr_list(raw_cidrs: list[str] | None) -> list[ipaddress.IPv4Network]
     for raw in raw_cidrs or []:
         try:
             nets.append(ipaddress.IPv4Network(raw.strip(), strict=False))
-        except ValueError:
-            continue
+        except ValueError as exc:
+            logger.debug("Ignoring invalid CIDR %r in subnet filter list: %s", raw, exc)
     return nets
 
 
@@ -841,7 +862,8 @@ def extract_followable_subnets(
             return
         try:
             net = ipaddress.IPv4Interface(s).network
-        except ValueError:
+        except ValueError as exc:
+            logger.debug("Ignoring non-CIDR interface/route entry %r: %s", s, exc)
             return
         if net.is_loopback or net.is_link_local or net.is_multicast or net.is_unspecified:
             return
@@ -896,7 +918,8 @@ def _select_hop_targets_for_cidrs(
     for cidr in cidrs:
         try:
             net = ipaddress.IPv4Network(cidr, strict=False)
-        except ValueError:
+        except ValueError as exc:
+            logger.debug("Skipping invalid hop CIDR %r: %s", cidr, exc)
             continue
         arp_hits = [ip for ip in arp_ips if ipaddress.IPv4Address(ip) in net]
         if arp_hits:
@@ -965,7 +988,8 @@ def extract_neighbor_ips(
                 continue
             try:
                 addr = ipaddress.IPv4Address(cand_ip)
-            except ValueError:
+            except ValueError as exc:
+                logger.debug("Skipping non-IPv4 neighbor address %r: %s", cand_ip, exc)
                 continue
             if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
                 continue
@@ -1013,8 +1037,515 @@ def compute_organized_output_dir(
     return os.path.join(base_dir, folder_name)
 
 
+@dataclass
+class CrawlOptions:
+    """Typed configuration for `crawl_network()` discovery, scope boundaries, and deliverable options."""
+
+    targets: list[str] = field(default_factory=list)
+    credentials_path: str | list[str] = "credentials.json"
+    output_dir: str = ""
+    organize: bool = True
+    site: str = "auto"
+    domain: str = ""
+    sanitize_passwords: bool = False
+    timeout: int = 8
+    ssh_ports: list[int] | None = None
+    telnet_ports: list[int] | None = None
+    max_workers: int = 16
+    http_fingerprint: bool = True
+    snmp: bool = False
+    snmp_community: str = "public"
+    follow_subnets: bool = False
+    follow_arp_only: bool = False
+    mgmt_subnets_only: bool = False
+    subnet_include: list[str] | None = None
+    subnet_exclude: list[str] | None = None
+    follow_routes: bool = False
+    follow_neighbors: bool = True
+    max_hops: int = 1
+    allow_cgnat: bool = False
+    allow_public_subnets: bool = False
+    target_vendor: str = ""
+    vendor_hint: str = ""
+    try_all_creds: bool = False
+    save_baseline: str = ""
+    compare_baseline: str = ""
+    retry_failed: str = ""
+
+
+# Alias for callers referencing either CrawlOptions or CrawlConfig
+CrawlConfig = CrawlOptions
+
+_CRAWL_OPTION_DEFAULTS: dict[str, object] = {
+    "credentials_path": "credentials.json",
+    "output_dir": "",
+    "organize": True,
+    "site": "auto",
+    "domain": "",
+    "sanitize_passwords": False,
+    "timeout": 8,
+    "ssh_ports": None,
+    "telnet_ports": None,
+    "max_workers": 16,
+    "http_fingerprint": True,
+    "snmp": False,
+    "snmp_community": "public",
+    "follow_subnets": False,
+    "follow_arp_only": False,
+    "mgmt_subnets_only": False,
+    "subnet_include": None,
+    "subnet_exclude": None,
+    "follow_routes": False,
+    "follow_neighbors": True,
+    "max_hops": 1,
+    "allow_cgnat": False,
+    "allow_public_subnets": False,
+    "target_vendor": "",
+    "vendor_hint": "",
+    "try_all_creds": False,
+    "save_baseline": "",
+    "compare_baseline": "",
+    "retry_failed": "",
+}
+
+
+def _resolve_crawl_options(
+    targets: list[str] | CrawlOptions | None,
+    config: CrawlOptions | None,
+    overrides: dict[str, object],
+) -> CrawlOptions:
+    """Merge an optional `CrawlOptions` instance with any explicitly passed `crawl_network` arguments."""
+    if isinstance(targets, CrawlOptions) and config is None:
+        base_cfg = replace(targets)
+        explicit_targets: list[str] | None = None
+    elif config is not None:
+        base_cfg = replace(config)
+        explicit_targets = list(targets) if targets is not None else None
+    else:
+        return CrawlOptions(targets=list(targets or []), **overrides)
+
+    if explicit_targets is not None:
+        base_cfg.targets = explicit_targets
+    for key, val in overrides.items():
+        if val != _CRAWL_OPTION_DEFAULTS[key]:
+            setattr(base_cfg, key, val)
+    return base_cfg
+
+
+def _load_retry_failed_targets(retry_failed: str) -> tuple[list[str], list[dict]]:
+    """Load retryable targets from `failed_hosts.json` and merge any sibling prior-success dataset."""
+    with open(retry_failed, encoding="utf-8") as f:
+        failed_entries = json.load(f)
+    retry_ips: list[str] = []
+    skipped_unsupported = 0
+    for entry in failed_entries:
+        if isinstance(entry, str):
+            retry_ips.append(entry)
+        elif isinstance(entry, dict) and entry.get("ip"):
+            if entry.get("status") == "unsupported":
+                skipped_unsupported += 1
+                continue
+            retry_ips.append(entry["ip"])
+    if not retry_ips and isinstance(failed_entries, list):
+        retry_ips = [e["ip"] for e in failed_entries if isinstance(e, dict) and e.get("ip")]
+        skipped_unsupported = 0
+    if skipped_unsupported:
+        print(
+            f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed} (skipped {skipped_unsupported} unsupported)."
+        )
+    else:
+        print(f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed}.")
+    if not retry_ips:
+        print("[!] No retryable hosts found in failed_hosts.json.")
+        return [], []
+
+    prior_success_devices: list[dict] = []
+    sibling_dataset = os.path.join(os.path.dirname(os.path.abspath(retry_failed)), "net_docu_crawler_dataset.json")
+    if os.path.isfile(sibling_dataset):
+        try:
+            with open(sibling_dataset, encoding="utf-8") as df:
+                prior_data = json.load(df)
+            retry_ip_set = set(retry_ips)
+            if isinstance(prior_data, list):
+                prior_success_devices = [
+                    d
+                    for d in prior_data
+                    if isinstance(d, dict)
+                    and d.get("status", "success") == "success"
+                    and d.get("ip") not in retry_ip_set
+                ]
+                if prior_success_devices:
+                    print(
+                        f"[+] Merging {len(prior_success_devices)} previously succeeded device(s) from {sibling_dataset}."
+                    )
+        except Exception as exc:
+            print(f"[!] Could not load prior dataset {sibling_dataset} for merge: {exc}")
+    return retry_ips, prior_success_devices
+
+
+def _resolve_run_output_dir(cfg: CrawlOptions, targets: list[str]) -> tuple[str, bool, str, str]:
+    """Determine `(run_output_dir, is_organized, logs_dir, crawler_log)` and ensure directories exist."""
+    if cfg.organize:
+        base = (
+            cfg.output_dir
+            if (cfg.output_dir and cfg.output_dir not in ("auto", "docs/net_docu_crawler"))
+            else "deliverables"
+        )
+        run_output_dir = compute_organized_output_dir(targets, base_dir=base, site=cfg.site, domain=cfg.domain)
+        is_organized = True
+    elif not cfg.output_dir or cfg.output_dir == "auto":
+        run_output_dir = "docs/net_docu_crawler"
+        is_organized = False
+    else:
+        run_output_dir = cfg.output_dir
+        is_organized = False
+
+    os.makedirs(run_output_dir, exist_ok=True)
+    logs_dir = os.path.join(run_output_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    crawler_log = os.path.join(logs_dir, "crawler_execution.log")
+    return run_output_dir, is_organized, logs_dir, crawler_log
+
+
+def _crawl_target_batch(
+    batch_ips: list[str],
+    batch_explicit: dict[str, list[tuple[int, str]]],
+    cfg: CrawlOptions,
+    credentials: list[dict],
+    registry: DeviceRegistry,
+    raw_devices: list[dict],
+    scanned_ip_set: set[str],
+    logs_dir: str,
+    crawler_log: str,
+) -> None:
+    """Pre-scan a batch of target IPs for open management ports and crawl reachable devices concurrently."""
+    if not batch_ips:
+        return
+    eff_ssh = cfg.ssh_ports if cfg.ssh_ports is not None else [22]
+    eff_telnet = cfg.telnet_ports if cfg.telnet_ports is not None else [23]
+    scanned_ip_set.update(batch_ips)
+    print(f"[+] Pre-scanning {len(batch_ips)} target(s) for SSH {eff_ssh} / Telnet {eff_telnet}...")
+    _log_event(crawler_log, f"Pre-scanning {len(batch_ips)} targets: {batch_ips}")
+
+    scan_ips = [ip for ip in batch_ips if ip not in batch_explicit]
+    open_ports_map = (
+        scan_subnet_ports(
+            scan_ips, eff_ssh, eff_telnet, timeout=min(float(cfg.timeout), 1.0), max_workers=max(cfg.max_workers, 32)
+        )
+        if scan_ips
+        else {}
+    )
+    open_ports_map.update(batch_explicit)
+
+    reachable = [ip for ip in batch_ips if open_ports_map.get(ip)]
+    print(f"[+] Found {len(reachable)} reachable host(s) with open management ports.")
+    _log_event(crawler_log, f"Reachable targets ({len(reachable)}): {reachable}")
+
+    targets_to_crawl = []
+    for ip in reachable:
+        if not registry.start_crawl(ip):
+            print(f"[*] Skipping {ip}: already registered as alias/SVI of a crawled device.")
+            _log_event(crawler_log, f"Skipping {ip}: already registered as alias/SVI of a crawled device.")
+            continue
+        targets_to_crawl.append(ip)
+    if not targets_to_crawl:
+        return
+
+    with ThreadPoolExecutor(max_workers=max(1, min(cfg.max_workers, len(targets_to_crawl)))) as pool:
+        future_to_ip = {
+            pool.submit(
+                crawl_target_with_ports,
+                ip,
+                credentials,
+                timeout=cfg.timeout,
+                session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
+                log_file=crawler_log,
+                open_ports=open_ports_map.get(ip),
+                mac=registry.get_arp_mac(ip),
+                http_fingerprint=cfg.http_fingerprint,
+                vendor_hint=cfg.vendor_hint,
+                try_all_creds=cfg.try_all_creds,
+            ): ip
+            for ip in targets_to_crawl
+        }
+        results_by_ip: dict[str, dict | None] = {}
+        for fut in as_completed(future_to_ip):
+            ip = future_to_ip[fut]
+            try:
+                results_by_ip[ip] = fut.result()
+            except Exception as exc:
+                _log_event(crawler_log, f"Unhandled worker exception for {ip}: {exc}")
+                results_by_ip[ip] = None
+
+    for ip in targets_to_crawl:
+        device_data = results_by_ip.get(ip)
+        if device_data:
+            registry.register_device(device_data)
+            raw_devices.append(device_data)
+        else:
+            registry.release_crawl(ip)
+
+
+def _discover_neighbor_and_subnet_hops(
+    raw_devices: list[dict],
+    registry: DeviceRegistry,
+    scanned_ip_set: set[str],
+    scanned_cidrs: set[str],
+    cfg: CrawlOptions,
+    credentials: list[dict],
+    logs_dir: str,
+    crawler_log: str,
+) -> None:
+    """Follow CDP/LLDP neighbor management IPs and optional connected L3 subnets across hops."""
+    if cfg.follow_neighbors and not cfg.retry_failed:
+        for hop in range(1, max(1, cfg.max_hops) + 1):
+            nbr_ips = [
+                ip
+                for ip in extract_neighbor_ips(
+                    raw_devices,
+                    registry=registry,
+                    allow_cgnat=cfg.allow_cgnat,
+                    allow_public=cfg.allow_public_subnets,
+                )
+                if ip not in scanned_ip_set
+            ]
+            if not nbr_ips:
+                break
+            print(f"[+] Neighbor Hop {hop}: queuing {len(nbr_ips)} CDP/LLDP neighbor IP(s): {nbr_ips}")
+            _log_event(crawler_log, f"Neighbor Hop {hop} queuing IPs: {nbr_ips}")
+            _crawl_target_batch(
+                nbr_ips, {}, cfg, credentials, registry, raw_devices, scanned_ip_set, logs_dir, crawler_log
+            )
+
+    if (cfg.follow_subnets or cfg.follow_arp_only) and cfg.max_hops > 0:
+        for hop in range(1, cfg.max_hops + 1):
+            candidate_cidrs = extract_followable_subnets(
+                raw_devices,
+                allow_cgnat=cfg.allow_cgnat,
+                allow_public=cfg.allow_public_subnets,
+                include_routes=cfg.follow_routes,
+                mgmt_only=cfg.mgmt_subnets_only,
+                subnet_include=cfg.subnet_include,
+                subnet_exclude=cfg.subnet_exclude,
+            )
+            new_cidrs = [c for c in candidate_cidrs if c not in scanned_cidrs]
+            if not new_cidrs:
+                break
+            scanned_cidrs.update(new_cidrs)
+            hop_ips = _select_hop_targets_for_cidrs(
+                new_cidrs,
+                registry,
+                scanned_ip_set,
+                arp_only=cfg.follow_arp_only,
+            )
+            if not hop_ips:
+                break
+            print(f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}")
+            _log_event(crawler_log, f"Hop {hop} following subnets ({len(hop_ips)} IPs): {new_cidrs}")
+            _crawl_target_batch(
+                hop_ips, {}, cfg, credentials, registry, raw_devices, scanned_ip_set, logs_dir, crawler_log
+            )
+
+
+def _append_local_arp_inventory(
+    raw_devices: list[dict],
+    registry: DeviceRegistry,
+    scanned_ip_set: set[str],
+) -> None:
+    """Include local ARP-visible hosts within the scanned scope that had no open SSH/Telnet ports."""
+    arp_entries = get_arp_table_entries()
+    for arp_ip, arp_mac in arp_entries.items():
+        if scanned_ip_set and arp_ip not in scanned_ip_set:
+            continue
+        if not registry.start_crawl(arp_ip):
+            continue
+        arp_rec = build_partial_device_record(
+            ip=arp_ip,
+            mac=arp_mac,
+            vendor="Unknown",
+            banner="",
+            port=0,
+            transport="arp",
+            status="discovered",
+        )
+        registry.register_device(arp_rec)
+        raw_devices.append(arp_rec)
+
+
+def _enrich_partial_devices_http(raw_devices: list[dict], cfg: CrawlOptions) -> list[dict]:
+    """Enrich partial/ARP-discovered hosts via read-only HTTP/HTTPS banner and TLS cert fingerprinting."""
+    partial_devs = [d for d in raw_devices if d.get("status") in ("discovered", "unauthenticated", "unsupported")]
+    if cfg.http_fingerprint and partial_devs:
+        to_probe = [d for d in partial_devs if "_http_fp" not in d]
+        probed_results: dict[int, dict | None] = {}
+        if to_probe:
+            with ThreadPoolExecutor(max_workers=min(cfg.max_workers, len(to_probe))) as pool:
+                http_futs = {
+                    pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(cfg.timeout), 1.5)): d
+                    for d in to_probe
+                }
+                for fut in as_completed(http_futs):
+                    dev = http_futs[fut]
+                    try:
+                        probed_results[id(dev)] = fut.result()
+                    except Exception as exc:
+                        logger.debug("HTTP fingerprint probe failed for %s: %s", dev.get("ip"), exc)
+                        probed_results[id(dev)] = None
+
+        for dev in partial_devs:
+            fp = dev.pop("_http_fp", None) if "_http_fp" in dev else probed_results.get(id(dev))
+            if not fp:
+                continue
+            label = _sanitize_http_model_label(fp)
+            if label and (dev.get("model") in ("Unknown", "") or dev.get("model", "").endswith(" Device")):
+                dev["model"] = label
+            if dev.get("status") == "discovered":
+                scheme = fp["scheme"].upper()
+                port = fp["port"]
+                dev["mgmt_method"] = scheme if port in (80, 443) else f"{scheme}:{port}"
+                dev["status"] = "unsupported"
+    else:
+        for dev in partial_devs:
+            dev.pop("_http_fp", None)
+    return partial_devs
+
+
+def _enrich_partial_devices_snmp(partial_devs: list[dict], cfg: CrawlOptions) -> None:
+    """Enrich partial devices via optional SNMPv2c sysDescr/sysName and GetBulk MIB fallback."""
+    if not (cfg.snmp and partial_devs):
+        return
+    with ThreadPoolExecutor(max_workers=min(cfg.max_workers, len(partial_devs))) as pool:
+        snmp_futs = {
+            pool.submit(
+                probe_snmp_sysinfo, d["ip"], community=cfg.snmp_community, timeout=min(float(cfg.timeout), 1.5)
+            ): d
+            for d in partial_devs
+        }
+        for fut in as_completed(snmp_futs):
+            dev = snmp_futs[fut]
+            try:
+                info = fut.result()
+            except Exception as exc:
+                logger.debug("SNMP sysinfo probe failed for %s: %s", dev.get("ip"), exc)
+                info = None
+            if not info:
+                continue
+            if info.get("sysName") and dev.get("hostname") == dev.get("ip"):
+                dev["hostname"] = info["sysName"]
+            if info.get("sysDescr"):
+                dev["model"] = info["sysDescr"][:60]
+            if dev.get("status") == "discovered":
+                dev["mgmt_method"] = "SNMP"
+                dev["status"] = "unsupported"
+
+    from net_docu_crawler.snmp_collector import collect_snmp_fallback
+
+    unauth_infra = [d for d in partial_devs if d.get("status") == "unauthenticated"]
+    if not unauth_infra:
+        return
+    with ThreadPoolExecutor(max_workers=min(cfg.max_workers, len(unauth_infra))) as pool:
+        fb_futs = {
+            pool.submit(
+                collect_snmp_fallback, d["ip"], community=cfg.snmp_community, timeout=min(float(cfg.timeout), 2.0)
+            ): d
+            for d in unauth_infra
+        }
+        for fut in as_completed(fb_futs):
+            dev = fb_futs[fut]
+            try:
+                fb = fut.result() or {}
+            except Exception as exc:
+                logger.debug("SNMPv2c fallback collection failed for %s: %s", dev.get("ip"), exc)
+                fb = {}
+            if fb.get("interfaces_detail"):
+                dev["interfaces_detail"] = fb["interfaces_detail"]
+                dev["mgmt_method"] = "SNMPv2c-Fallback"
+            if fb.get("lldp_remote_names"):
+                dev.setdefault("neighbors", []).extend(
+                    [
+                        {
+                            "local_port": f"ifIndex-{n.get('index', '')}",
+                            "remote_device": n.get("remote_device", ""),
+                            "remote_port": "",
+                            "remote_ip": "",
+                            "remote_mac": "",
+                            "platform": "",
+                            "device_type": "switch",
+                            "link_confidence": "one-way",
+                        }
+                        for n in fb["lldp_remote_names"]
+                        if n.get("remote_device")
+                    ]
+                )
+
+
+def _execute_crawl(cfg: CrawlOptions) -> list[dict]:
+    """Execute network discovery and deliverable generation for a resolved `CrawlOptions` config."""
+    targets = list(cfg.targets)
+    prior_success_devices: list[dict] = []
+    if cfg.retry_failed:
+        targets, prior_success_devices = _load_retry_failed_targets(cfg.retry_failed)
+        if not targets:
+            return []
+
+    credentials, cred_warnings, cred_errors = load_and_validate_credentials(cfg.credentials_path)
+    for w in cred_warnings:
+        print(f"[!] Credential warning: {w}")
+    for err in cred_errors:
+        print(f"[-] Credential error: {err}")
+    if cred_errors:
+        raise ValueError(
+            f"Credential validation failed ({len(cred_errors)} error(s)). Fix {cfg.credentials_path} and retry."
+        )
+
+    run_output_dir, is_organized, logs_dir, crawler_log = _resolve_run_output_dir(cfg, targets)
+    print(f"[+] Validated and loaded {len(credentials)} credential profile(s) from {cfg.credentials_path}")
+    _log_event(
+        crawler_log, f"Validated and loaded {len(credentials)} credential profile(s) from {cfg.credentials_path}"
+    )
+    for w in cred_warnings:
+        _log_event(crawler_log, f"Credential warning: {w}")
+
+    expanded_targets, explicit_ports = parse_target_specs(
+        targets, ssh_ports=cfg.ssh_ports, telnet_ports=cfg.telnet_ports
+    )
+    raw_devices: list[dict] = []
+    registry = DeviceRegistry()
+    scanned_ip_set: set[str] = set()
+    scanned_cidrs: set[str] = {t.strip() for t in targets if "/" in t}
+
+    for prior_dev in prior_success_devices:
+        registry.register_device(prior_dev)
+        raw_devices.append(prior_dev)
+        if prior_dev.get("ip"):
+            scanned_ip_set.add(prior_dev["ip"])
+
+    _crawl_target_batch(
+        expanded_targets, explicit_ports, cfg, credentials, registry, raw_devices, scanned_ip_set, logs_dir, crawler_log
+    )
+    _discover_neighbor_and_subnet_hops(
+        raw_devices, registry, scanned_ip_set, scanned_cidrs, cfg, credentials, logs_dir, crawler_log
+    )
+    _append_local_arp_inventory(raw_devices, registry, scanned_ip_set)
+    partial_devs = _enrich_partial_devices_http(raw_devices, cfg)
+    _enrich_partial_devices_snmp(partial_devs, cfg)
+
+    return render_deliverables_from_dataset(
+        raw_devices=raw_devices,
+        registry=registry,
+        run_output_dir=run_output_dir,
+        targets=targets,
+        is_organized=is_organized,
+        sanitize_passwords=cfg.sanitize_passwords,
+        target_vendor=cfg.target_vendor,
+        save_baseline=cfg.save_baseline,
+        compare_baseline=cfg.compare_baseline,
+        logs_dir=logs_dir,
+    )
+
+
 def crawl_network(
-    targets: list[str],
+    targets: list[str] | CrawlOptions | None = None,
     credentials_path: str | list[str] = "credentials.json",
     output_dir: str = "",
     organize: bool = True,
@@ -1044,352 +1575,45 @@ def crawl_network(
     save_baseline: str = "",
     compare_baseline: str = "",
     retry_failed: str = "",
+    config: CrawlOptions | None = None,
 ) -> list[dict]:
-    prior_success_devices: list[dict] = []
-    if retry_failed:
-        with open(retry_failed, encoding="utf-8") as f:
-            failed_entries = json.load(f)
-        retry_ips = []
-        skipped_unsupported = 0
-        for entry in failed_entries:
-            if isinstance(entry, str):
-                retry_ips.append(entry)
-            elif isinstance(entry, dict) and entry.get("ip"):
-                if entry.get("status") == "unsupported":
-                    skipped_unsupported += 1
-                    continue
-                retry_ips.append(entry["ip"])
-        if not retry_ips and isinstance(failed_entries, list):
-            retry_ips = [e["ip"] for e in failed_entries if isinstance(e, dict) and e.get("ip")]
-            skipped_unsupported = 0
-        if skipped_unsupported:
-            print(
-                f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed} (skipped {skipped_unsupported} unsupported)."
-            )
-        else:
-            print(f"[+] Loaded {len(retry_ips)} retry target(s) from {retry_failed}.")
-        targets = retry_ips
-        if not targets:
-            print("[!] No retryable hosts found in failed_hosts.json.")
-            return []
-
-        sibling_dataset = os.path.join(os.path.dirname(os.path.abspath(retry_failed)), "net_docu_crawler_dataset.json")
-        if os.path.isfile(sibling_dataset):
-            try:
-                with open(sibling_dataset, encoding="utf-8") as df:
-                    prior_data = json.load(df)
-                retry_ip_set = set(retry_ips)
-                if isinstance(prior_data, list):
-                    prior_success_devices = [
-                        d
-                        for d in prior_data
-                        if isinstance(d, dict)
-                        and d.get("status", "success") == "success"
-                        and d.get("ip") not in retry_ip_set
-                    ]
-                    if prior_success_devices:
-                        print(
-                            f"[+] Merging {len(prior_success_devices)} previously succeeded device(s) from {sibling_dataset}."
-                        )
-            except Exception as exc:
-                print(f"[!] Could not load prior dataset {sibling_dataset} for merge: {exc}")
-
-    credentials, cred_warnings, cred_errors = load_and_validate_credentials(credentials_path)
-    for w in cred_warnings:
-        print(f"[!] Credential warning: {w}")
-    for err in cred_errors:
-        print(f"[-] Credential error: {err}")
-    if cred_errors:
-        raise ValueError(
-            f"Credential validation failed ({len(cred_errors)} error(s)). Fix {credentials_path} and retry."
-        )
-
-    # Determine output destination (structured run folder vs legacy flat folder)
-    if organize:
-        base = output_dir if (output_dir and output_dir not in ("auto", "docs/net_docu_crawler")) else "deliverables"
-        run_output_dir = compute_organized_output_dir(targets, base_dir=base, site=site, domain=domain)
-        is_organized = True
-    elif not output_dir or output_dir == "auto":
-        run_output_dir = "docs/net_docu_crawler"
-        is_organized = False
-    else:
-        run_output_dir = output_dir
-        is_organized = False
-
-    os.makedirs(run_output_dir, exist_ok=True)
-    logs_dir = os.path.join(run_output_dir, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    crawler_log = os.path.join(logs_dir, "crawler_execution.log")
-
-    print(f"[+] Validated and loaded {len(credentials)} credential profile(s) from {credentials_path}")
-    _log_event(crawler_log, f"Validated and loaded {len(credentials)} credential profile(s) from {credentials_path}")
-    for w in cred_warnings:
-        _log_event(crawler_log, f"Credential warning: {w}")
-
-    # Expand any CIDR subnets and ip:port targets
-    expanded_targets, explicit_ports = parse_target_specs(targets, ssh_ports=ssh_ports, telnet_ports=telnet_ports)
-    eff_ssh_ports = ssh_ports if ssh_ports is not None else [22]
-    eff_telnet_ports = telnet_ports if telnet_ports is not None else [23]
-
-    raw_devices: list[dict] = []
-    registry = DeviceRegistry()
-    scanned_ip_set: set[str] = set()
-    scanned_cidrs: set[str] = {t.strip() for t in targets if "/" in t}
-
-    for prior_dev in prior_success_devices:
-        registry.register_device(prior_dev)
-        raw_devices.append(prior_dev)
-        if prior_dev.get("ip"):
-            scanned_ip_set.add(prior_dev["ip"])
-
-    def _run_batch(batch_ips: list[str], batch_explicit: dict[str, list[tuple[int, str]]]):
-        if not batch_ips:
-            return
-        scanned_ip_set.update(batch_ips)
-        print(f"[+] Pre-scanning {len(batch_ips)} target(s) for SSH {eff_ssh_ports} / Telnet {eff_telnet_ports}...")
-        _log_event(crawler_log, f"Pre-scanning {len(batch_ips)} targets: {batch_ips}")
-
-        scan_ips = [ip for ip in batch_ips if ip not in batch_explicit]
-        open_ports_map = (
-            scan_subnet_ports(
-                scan_ips,
-                ssh_ports=eff_ssh_ports,
-                telnet_ports=eff_telnet_ports,
-                timeout=min(float(timeout), 1.0),
-                max_workers=max(max_workers, 32),
-            )
-            if scan_ips
-            else {}
-        )
-        for ip, ports in batch_explicit.items():
-            open_ports_map[ip] = ports
-
-        reachable_targets = [ip for ip in batch_ips if open_ports_map.get(ip)]
-        print(f"[+] Found {len(reachable_targets)} reachable host(s) with open management ports.")
-        _log_event(crawler_log, f"Reachable targets ({len(reachable_targets)}): {reachable_targets}")
-
-        targets_to_crawl = []
-        for ip in reachable_targets:
-            if not registry.start_crawl(ip):
-                print(f"[*] Skipping {ip}: already registered as alias/SVI of a crawled device.")
-                _log_event(crawler_log, f"Skipping {ip}: already registered as alias/SVI of a crawled device.")
-                continue
-            targets_to_crawl.append(ip)
-
-        if not targets_to_crawl:
-            return
-
-        worker_count = max(1, min(max_workers, len(targets_to_crawl)))
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            future_to_ip = {
-                pool.submit(
-                    crawl_target_with_ports,
-                    ip,
-                    credentials,
-                    timeout=timeout,
-                    session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
-                    log_file=crawler_log,
-                    open_ports=open_ports_map.get(ip),
-                    mac=registry.get_arp_mac(ip),
-                    http_fingerprint=http_fingerprint,
-                    vendor_hint=vendor_hint,
-                    try_all_creds=try_all_creds,
-                ): ip
-                for ip in targets_to_crawl
-            }
-            results_by_ip: dict[str, dict | None] = {}
-            for fut in as_completed(future_to_ip):
-                ip = future_to_ip[fut]
-                try:
-                    results_by_ip[ip] = fut.result()
-                except Exception as exc:
-                    _log_event(crawler_log, f"Unhandled worker exception for {ip}: {exc}")
-                    results_by_ip[ip] = None
-
-        for ip in targets_to_crawl:
-            device_data = results_by_ip.get(ip)
-            if device_data:
-                registry.register_device(device_data)
-                raw_devices.append(device_data)
-            else:
-                registry.release_crawl(ip)
-
-    _run_batch(expanded_targets, explicit_ports)
-
-    # Neighbor-first discovery: crawl CDP/LLDP management IPs discovered on crawled infrastructure
-    if follow_neighbors and not retry_failed:
-        nbr_hops = max(1, max_hops)
-        for hop in range(1, nbr_hops + 1):
-            nbr_ips = [
-                ip
-                for ip in extract_neighbor_ips(
-                    raw_devices,
-                    registry=registry,
-                    allow_cgnat=allow_cgnat,
-                    allow_public=allow_public_subnets,
-                )
-                if ip not in scanned_ip_set
-            ]
-            if not nbr_ips:
-                break
-            print(f"[+] Neighbor Hop {hop}: queuing {len(nbr_ips)} CDP/LLDP neighbor IP(s): {nbr_ips}")
-            _log_event(crawler_log, f"Neighbor Hop {hop} queuing IPs: {nbr_ips}")
-            _run_batch(nbr_ips, {})
-
-    # Optional multi-hop routed subnet discovery (--follow-subnets / --follow-arp-only)
-    if (follow_subnets or follow_arp_only) and max_hops > 0:
-        for hop in range(1, max_hops + 1):
-            candidate_cidrs = extract_followable_subnets(
-                raw_devices,
-                allow_cgnat=allow_cgnat,
-                allow_public=allow_public_subnets,
-                include_routes=follow_routes,
-                mgmt_only=mgmt_subnets_only,
-                subnet_include=subnet_include,
-                subnet_exclude=subnet_exclude,
-            )
-            new_cidrs = [c for c in candidate_cidrs if c not in scanned_cidrs]
-            if not new_cidrs:
-                break
-            scanned_cidrs.update(new_cidrs)
-            hop_ips = _select_hop_targets_for_cidrs(
-                new_cidrs,
-                registry,
-                scanned_ip_set,
-                arp_only=follow_arp_only,
-            )
-            if not hop_ips:
-                break
-            print(f"[+] Hop {hop}: following {len(new_cidrs)} subnet(s) ({len(hop_ips)} target IP(s)): {new_cidrs}")
-            _log_event(crawler_log, f"Hop {hop} following subnets ({len(hop_ips)} IPs): {new_cidrs}")
-            _run_batch(hop_ips, {})
-
-    # ARP-only host inventory: include local ARP-visible hosts with no open SSH/Telnet ports
-    arp_entries = get_arp_table_entries()
-    for arp_ip, arp_mac in arp_entries.items():
-        if scanned_ip_set and arp_ip not in scanned_ip_set:
-            continue
-        if not registry.start_crawl(arp_ip):
-            continue
-        arp_rec = build_partial_device_record(
-            ip=arp_ip,
-            mac=arp_mac,
-            vendor="Unknown",
-            banner="",
-            port=0,
-            transport="arp",
-            status="discovered",
-        )
-        registry.register_device(arp_rec)
-        raw_devices.append(arp_rec)
-
-    # Enrich partial/ARP-discovered hosts via read-only HTTP/HTTPS banner & TLS cert fingerprinting
-    partial_devs = [d for d in raw_devices if d.get("status") in ("discovered", "unauthenticated", "unsupported")]
-    if http_fingerprint and partial_devs:
-        to_probe = [d for d in partial_devs if "_http_fp" not in d]
-        probed_results: dict[int, dict | None] = {}
-        if to_probe:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(to_probe))) as pool:
-                http_futs = {
-                    pool.submit(probe_http_fingerprint, d["ip"], timeout=min(float(timeout), 1.5)): d for d in to_probe
-                }
-                for fut in as_completed(http_futs):
-                    dev = http_futs[fut]
-                    try:
-                        probed_results[id(dev)] = fut.result()
-                    except Exception:
-                        probed_results[id(dev)] = None
-
-        for dev in partial_devs:
-            fp = dev.pop("_http_fp", None) if "_http_fp" in dev else probed_results.get(id(dev))
-            if not fp:
-                continue
-            label = _sanitize_http_model_label(fp)
-            if label and (dev.get("model") in ("Unknown", "") or dev.get("model", "").endswith(" Device")):
-                dev["model"] = label
-            if dev.get("status") == "discovered":
-                scheme = fp["scheme"].upper()
-                port = fp["port"]
-                dev["mgmt_method"] = scheme if port in (80, 443) else f"{scheme}:{port}"
-                dev["status"] = "unsupported"
-    else:
-        for dev in partial_devs:
-            dev.pop("_http_fp", None)
-
-    # Optional SNMP sysDescr / sysName enrichment (--snmp)
-    if snmp and partial_devs:
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(partial_devs))) as pool:
-            snmp_futs = {
-                pool.submit(probe_snmp_sysinfo, d["ip"], community=snmp_community, timeout=min(float(timeout), 1.5)): d
-                for d in partial_devs
-            }
-            for fut in as_completed(snmp_futs):
-                dev = snmp_futs[fut]
-                try:
-                    info = fut.result()
-                except Exception:
-                    info = None
-                if not info:
-                    continue
-                if info.get("sysName") and dev.get("hostname") == dev.get("ip"):
-                    dev["hostname"] = info["sysName"]
-                if info.get("sysDescr"):
-                    dev["model"] = info["sysDescr"][:60]
-                if dev.get("status") == "discovered":
-                    dev["mgmt_method"] = "SNMP"
-                    dev["status"] = "unsupported"
-
-        # SNMPv2c GetBulk MIB fallback for unauthenticated infrastructure hosts
-        from net_docu_crawler.snmp_collector import collect_snmp_fallback
-
-        unauth_infra = [d for d in partial_devs if d.get("status") == "unauthenticated"]
-        if unauth_infra:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(unauth_infra))) as pool:
-                fb_futs = {
-                    pool.submit(
-                        collect_snmp_fallback, d["ip"], community=snmp_community, timeout=min(float(timeout), 2.0)
-                    ): d
-                    for d in unauth_infra
-                }
-                for fut in as_completed(fb_futs):
-                    dev = fb_futs[fut]
-                    try:
-                        fb = fut.result() or {}
-                    except Exception:
-                        fb = {}
-                    if fb.get("interfaces_detail"):
-                        dev["interfaces_detail"] = fb["interfaces_detail"]
-                        dev["mgmt_method"] = "SNMPv2c-Fallback"
-                    if fb.get("lldp_remote_names"):
-                        dev.setdefault("neighbors", []).extend(
-                            [
-                                {
-                                    "local_port": f"ifIndex-{n.get('index', '')}",
-                                    "remote_device": n.get("remote_device", ""),
-                                    "remote_port": "",
-                                    "remote_ip": "",
-                                    "remote_mac": "",
-                                    "platform": "",
-                                    "device_type": "switch",
-                                    "link_confidence": "one-way",
-                                }
-                                for n in fb["lldp_remote_names"]
-                                if n.get("remote_device")
-                            ]
-                        )
-
-    return render_deliverables_from_dataset(
-        raw_devices=raw_devices,
-        registry=registry,
-        run_output_dir=run_output_dir,
-        targets=targets,
-        is_organized=is_organized,
-        sanitize_passwords=sanitize_passwords,
-        target_vendor=target_vendor,
-        save_baseline=save_baseline,
-        compare_baseline=compare_baseline,
-        logs_dir=logs_dir,
-    )
+    """
+    Crawl target network devices and generate full documentation deliverables.
+    Accepts either a `CrawlOptions` (`config=...`) dataclass or legacy positional/keyword arguments.
+    """
+    overrides: dict[str, object] = {
+        "credentials_path": credentials_path,
+        "output_dir": output_dir,
+        "organize": organize,
+        "site": site,
+        "domain": domain,
+        "sanitize_passwords": sanitize_passwords,
+        "timeout": timeout,
+        "ssh_ports": ssh_ports,
+        "telnet_ports": telnet_ports,
+        "max_workers": max_workers,
+        "http_fingerprint": http_fingerprint,
+        "snmp": snmp,
+        "snmp_community": snmp_community,
+        "follow_subnets": follow_subnets,
+        "follow_arp_only": follow_arp_only,
+        "mgmt_subnets_only": mgmt_subnets_only,
+        "subnet_include": subnet_include,
+        "subnet_exclude": subnet_exclude,
+        "follow_routes": follow_routes,
+        "follow_neighbors": follow_neighbors,
+        "max_hops": max_hops,
+        "allow_cgnat": allow_cgnat,
+        "allow_public_subnets": allow_public_subnets,
+        "target_vendor": target_vendor,
+        "vendor_hint": vendor_hint,
+        "try_all_creds": try_all_creds,
+        "save_baseline": save_baseline,
+        "compare_baseline": compare_baseline,
+        "retry_failed": retry_failed,
+    }
+    cfg = _resolve_crawl_options(targets=targets, config=config, overrides=overrides)
+    return _execute_crawl(cfg)
 
 
 def _sanitize_session_logs(logs_dir: str):
@@ -1407,8 +1631,8 @@ def _sanitize_session_logs(logs_dir: str):
             if cleaned != raw_txt:
                 with open(fpath, "w", encoding="utf-8") as f:
                     f.write(cleaned)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Failed to sanitize session log %s: %s", fpath, exc)
 
 
 def enrich_devices_from_dhcp_reservations(raw_devices: list[dict]) -> list[dict]:
@@ -1512,34 +1736,10 @@ def parse_target_vendor_spec(raw_spec: str) -> dict[str, str]:
     return out
 
 
-def render_deliverables_from_dataset(
-    raw_devices: list[dict],
-    registry: DeviceRegistry | None = None,
-    run_output_dir: str = "docs/net_docu_crawler",
-    targets: list[str] | None = None,
-    is_organized: bool = False,
-    sanitize_passwords: bool = False,
-    target_vendor: str = "",
-    save_baseline: str = "",
-    compare_baseline: str = "",
-    logs_dir: str = "",
-) -> list[dict]:
-    """
-    Resolve topology links, optionally sanitize secrets (including raw session logs),
-    export JSON/failed_hosts.json, and generate all Markdown/CSV/script deliverables.
-    Can be called live after `crawl_network()` or offline via `--from-dataset`.
-    """
-    os.makedirs(run_output_dir, exist_ok=True)
-    enrich_devices_from_dhcp_reservations(raw_devices)
-    if registry is None:
-        registry = DeviceRegistry()
-        for dev in raw_devices:
-            if isinstance(dev, dict):
-                registry.register_device(dev)
-
-    # Cross-resolve neighbor IPs/personas from crawled devices & Global ARP, then stitch topology edges
+def _stitch_dataset_topology(raw_devices: list[dict], registry: DeviceRegistry) -> None:
+    """Cross-resolve neighbor IPs/personas from crawled devices and Global ARP, then stitch topology edges."""
     crawled_by_ip = {d["ip"]: d for d in raw_devices if d.get("ip")}
-    crawled_by_host = {}
+    crawled_by_host: dict[str, dict] = {}
     for d in raw_devices:
         for h_key in (d.get("hostname", ""), d.get("canonical_hostname", "")):
             if h_key:
@@ -1587,104 +1787,74 @@ def render_deliverables_from_dataset(
                 link_class=l_class,
             )
 
-    from net_docu_crawler.correlator import correlate_dataset
-    from net_docu_crawler.domain_detector import detect_environment_dns_domain
-    from net_docu_crawler.quality_gates import evaluate_quality_gates, write_quality_report
 
-    corr_result = correlate_dataset(raw_devices)
-    trunk_audit = corr_result.get("trunk_audit") if isinstance(corr_result, dict) else None
-    dns_info = detect_environment_dns_domain(raw_devices)
-    quality_report = evaluate_quality_gates(raw_devices, trunk_audit=trunk_audit)
-    if dns_info["primary_domain"]:
-        quality_report["dns_domain"] = dns_info["primary_domain"]
-    if dns_info["local_dns_suffix"]:
-        quality_report["local_dns_suffix"] = dns_info["local_dns_suffix"]
-    if dns_info["device_domains"]:
-        quality_report["device_domains"] = dns_info["device_domains"]
-    manifest_dir = os.path.join(run_output_dir, "00_manifest")
-    norm_dir = os.path.join(run_output_dir, "02_normalized")
-    corr_dir = os.path.join(run_output_dir, "03_correlated")
-    mig_dir = os.path.join(run_output_dir, "04_migration")
-    rep_dir = os.path.join(run_output_dir, "05_reports")
-    for d in (manifest_dir, norm_dir, corr_dir, mig_dir, rep_dir):
-        os.makedirs(d, exist_ok=True)
-    write_quality_report(quality_report, manifest_dir)
-    print(
-        f"[+] Quality Gates: {'PASS' if quality_report['passed'] else 'FAIL'} (see {os.path.join(manifest_dir, 'data_quality_report.md')})"
-    )
+def _update_latest_run_pointer(run_output_dir: str) -> None:
+    """Update the `deliverables/latest` symlink (or Windows junction / `latest.txt` fallback)."""
+    latest_link = os.path.join(os.path.dirname(run_output_dir), "latest")
+    try:
+        if os.path.islink(latest_link):
+            os.unlink(latest_link)
+        elif os.path.exists(latest_link):
+            if os.path.isdir(latest_link):
+                try:
+                    os.rmdir(latest_link)
+                except OSError:
+                    shutil.rmtree(latest_link)
+            else:
+                os.remove(latest_link)
+        os.symlink(os.path.basename(run_output_dir), latest_link, target_is_directory=True)
+        print(f"[+] Updated symlink: {latest_link} -> {os.path.basename(run_output_dir)}")
+    except OSError as exc:
+        logger.debug("Symlink update failed for %s (%s); trying platform fallback.", latest_link, exc)
+        junction_created = False
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", os.path.abspath(latest_link), os.path.abspath(run_output_dir)],
+                    check=True,
+                    capture_output=True,
+                )
+                print(f"[+] Updated junction: {latest_link} -> {os.path.basename(run_output_dir)}")
+                junction_created = True
+            except (OSError, subprocess.SubprocessError) as j_exc:
+                logger.debug("Failed to create Windows junction %s: %s", latest_link, j_exc)
+                junction_created = False
+        if not junction_created:
+            try:
+                latest_txt = os.path.join(os.path.dirname(run_output_dir), "latest.txt")
+                with open(latest_txt, "w", encoding="utf-8") as f:
+                    f.write(os.path.basename(run_output_dir) + "\n")
+                print(f"[+] Recorded latest run pointer: {latest_txt} -> {os.path.basename(run_output_dir)}")
+            except OSError as txt_exc:
+                logger.debug("Failed to write latest.txt pointer in %s: %s", run_output_dir, txt_exc)
 
-    confirmed_count = sum(1 for lk in registry.links if lk["status"] == "confirmed")
-    print(f"\n[+] Processed {len(raw_devices)} network devices!")
-    print(f"[+] Unique devices in registry: {len(registry.devices)}")
-    print(f"[+] Discovered topology links: {len(registry.links)} ({confirmed_count} bidirectional confirmed)")
 
-    # Optional security sanitization of secrets in configs and raw session logs
-    if sanitize_passwords:
-        print("[+] Sanitizing passwords and pre-shared keys in configuration backups and session logs...")
-        for dev in raw_devices:
-            if dev.get("raw_config"):
-                dev["raw_config"] = sanitize_raw_config(dev["raw_config"])
-        _sanitize_session_logs(logs_dir or os.path.join(run_output_dir, "logs"))
-
-    # Save consolidated raw crawl JSON
-    json_path = os.path.join(run_output_dir, "net_docu_crawler_dataset.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(raw_devices, f, indent=2)
-    print(f"[+] Saved crawl dataset to: {json_path}")
-
-    # Export failed / unauthenticated / unsupported hosts for targeted --retry-failed follow-ups
-    failed_hosts = [
-        {
-            "ip": dev.get("ip", ""),
-            "status": dev.get("status", "unknown"),
-            "vendor": dev.get("vendor", "Unknown"),
-            "device_type": dev.get("device_type", "unknown"),
-            "mgmt_method": dev.get("mgmt_method", ""),
-            "model": dev.get("model", ""),
-            "mac_address": dev.get("mac_address", ""),
-        }
-        for dev in raw_devices
-        if dev.get("status") in ("unauthenticated", "unsupported")
-    ]
-    failed_path = os.path.join(run_output_dir, "failed_hosts.json")
-    with open(failed_path, "w", encoding="utf-8") as f:
-        json.dump(failed_hosts, f, indent=2)
-    if failed_hosts:
-        print(f"[+] Saved {len(failed_hosts)} failed/partial host(s) to: {failed_path}")
-
-    # Generate Reports using canonical device records
-    devices_dict = {dev["ip"]: dev for dev in registry.devices.values()}
-
-    # Determine scope label
-    t_list = targets or []
-    scope_label = (
-        t_list[0]
-        if len(t_list) == 1
-        else ("192.168.1.0/24" if any("192.168.1." in t for t in t_list) else "Multi-Target Campus")
-    )
-
-    # 1. Master Migration Blueprint (Network_Analysis.md)
+def _write_standard_deliverables(
+    devices_dict: dict[str, dict],
+    raw_devices: list[dict],
+    trunk_audit: dict | None,
+    run_output_dir: str,
+    scope_label: str,
+    primary_domain: str,
+    target_vendor: str,
+    json_path: str,
+    norm_dir: str,
+    mig_dir: str,
+    rep_dir: str,
+) -> None:
+    """Render core Markdown/CSV/script deliverables and mirror them into layered folders."""
     blueprint_path = os.path.join(run_output_dir, "Network_Analysis.md")
     report_generator.generate_master_network_analysis_migration_blueprint(
-        devices_dict,
-        output_path=blueprint_path,
-        scope=scope_label,
-        dns_domain=dns_info["primary_domain"],
+        devices_dict, output_path=blueprint_path, scope=scope_label, dns_domain=primary_domain
     )
     print(f"[+] Generated master migration blueprint: {blueprint_path}")
 
-    # 2. Automated Post-Cutover Validation Smoke Test Script (validate_cutover.sh)
     smoke_path = os.path.join(run_output_dir, "validate_cutover.sh")
     report_generator.generate_cutover_validation_script(devices_dict, output_path=smoke_path)
     print(f"[+] Generated cutover validation smoke script: {smoke_path}")
 
-    # 3. Standard deliverables (L2/L3 Diagrams, Asset Inventory, Cabling Matrix, Protocol Translation, Live Report)
     rep_path = os.path.join(run_output_dir, "net_docu_crawler_live_report.md")
-    report_generator.generate_network_analysis_report(
-        devices_dict,
-        output_path=rep_path,
-        dns_domain=dns_info["primary_domain"],
-    )
+    report_generator.generate_network_analysis_report(devices_dict, output_path=rep_path, dns_domain=primary_domain)
     print(f"[+] Generated network analysis report: {rep_path}")
 
     inv_path = os.path.join(run_output_dir, "asset_inventory.csv")
@@ -1713,19 +1883,41 @@ def render_deliverables_from_dataset(
 
     trunk_rep_path = os.path.join(run_output_dir, "trunk_vlan_audit.md")
     report_generator.generate_trunk_audit_report(
-        trunk_audit if trunk_audit is not None else raw_devices,
-        output_path=trunk_rep_path,
+        trunk_audit if trunk_audit is not None else raw_devices, output_path=trunk_rep_path
     )
     print(f"[+] Generated trunk VLAN audit report: {trunk_rep_path}")
 
     bom_path = os.path.join(run_output_dir, "bom_hardware_sizing.csv")
     report_generator.generate_bom_hardware_sizing(
-        devices_dict,
-        output_path=bom_path,
-        target_vendor=target_vendor or "juniper",
+        devices_dict, output_path=bom_path, target_vendor=target_vendor or "juniper"
     )
     print(f"[+] Generated BOM & hardware sizing CSV: {bom_path}")
 
+    _layer_copies = [
+        (json_path, os.path.join(norm_dir, "devices.json")),
+        (inv_path, os.path.join(mig_dir, "asset_inventory.csv")),
+        (cable_path, os.path.join(mig_dir, "cabling_matrix.csv")),
+        (bom_path, os.path.join(mig_dir, "bom_hardware_sizing.csv")),
+        (smoke_path, os.path.join(mig_dir, "validate_cutover.sh")),
+        (blueprint_path, os.path.join(rep_dir, "Network_Analysis.md")),
+        (l2_path, os.path.join(rep_dir, "L2_network_diagrams.md")),
+        (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
+        (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
+        (trunk_rep_path, os.path.join(rep_dir, "trunk_vlan_audit.md")),
+    ]
+    for src_p, dst_p in _layer_copies:
+        if os.path.isfile(src_p):
+            shutil.copy2(src_p, dst_p)
+
+
+def _write_optional_migration_deliverables(
+    devices_dict: dict[str, dict],
+    run_output_dir: str,
+    target_vendor: str,
+    save_baseline: str,
+    compare_baseline: str,
+) -> None:
+    """Generate optional target-vendor CLI migration configs and pre/post-cutover baseline diffs."""
     target_map = parse_target_vendor_spec(target_vendor)
     if target_map:
         for persona_key, tv in target_map.items():
@@ -1755,73 +1947,146 @@ def render_deliverables_from_dataset(
         report_generator.compare_baseline_state(devices_dict, baseline_path=compare_baseline, output_path=ver_path)
         print(f"[+] Generated post-cutover verification diff report: {ver_path}")
 
-    # If organized run folder was created, update latest pointer and maintain legacy path compatibility
-    if is_organized:
-        latest_link = os.path.join(os.path.dirname(run_output_dir), "latest")
-        try:
-            if os.path.islink(latest_link):
-                os.unlink(latest_link)
-            elif os.path.exists(latest_link):
-                if os.path.isdir(latest_link):
-                    try:
-                        # On Windows, os.rmdir removes an NTFS junction without deleting target contents
-                        os.rmdir(latest_link)
-                    except OSError:
-                        shutil.rmtree(latest_link)
-                else:
-                    os.remove(latest_link)
-            os.symlink(os.path.basename(run_output_dir), latest_link, target_is_directory=True)
-            print(f"[+] Updated symlink: {latest_link} -> {os.path.basename(run_output_dir)}")
-        except OSError:
-            # On Windows without SeCreateSymbolicLinkPrivilege, try an NTFS junction first, then latest.txt
-            junction_created = False
-            if os.name == "nt":
-                try:
-                    subprocess.run(
-                        ["cmd", "/c", "mklink", "/J", os.path.abspath(latest_link), os.path.abspath(run_output_dir)],
-                        check=True,
-                        capture_output=True,
-                    )
-                    print(f"[+] Updated junction: {latest_link} -> {os.path.basename(run_output_dir)}")
-                    junction_created = True
-                except Exception:
-                    junction_created = False
-            if not junction_created:
-                try:
-                    latest_txt = os.path.join(os.path.dirname(run_output_dir), "latest.txt")
-                    with open(latest_txt, "w", encoding="utf-8") as f:
-                        f.write(os.path.basename(run_output_dir) + "\n")
-                    print(f"[+] Recorded latest run pointer: {latest_txt} -> {os.path.basename(run_output_dir)}")
-                except Exception:
-                    pass
 
-    # Mirror key deliverables into layered subdirectories (02_normalized, 04_migration, 05_reports)
-    _layer_copies = [
-        (json_path, os.path.join(norm_dir, "devices.json")),
-        (inv_path, os.path.join(mig_dir, "asset_inventory.csv")),
-        (cable_path, os.path.join(mig_dir, "cabling_matrix.csv")),
-        (bom_path, os.path.join(mig_dir, "bom_hardware_sizing.csv")),
-        (smoke_path, os.path.join(mig_dir, "validate_cutover.sh")),
-        (blueprint_path, os.path.join(rep_dir, "Network_Analysis.md")),
-        (l2_path, os.path.join(rep_dir, "L2_network_diagrams.md")),
-        (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
-        (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
-        (trunk_rep_path, os.path.join(rep_dir, "trunk_vlan_audit.md")),
+def _export_dataset_and_failed_hosts(
+    raw_devices: list[dict],
+    run_output_dir: str,
+    sanitize_passwords: bool,
+    logs_dir: str,
+) -> str:
+    """Optionally sanitize secrets, then write `net_docu_crawler_dataset.json` and `failed_hosts.json`."""
+    if sanitize_passwords:
+        print("[+] Sanitizing passwords and pre-shared keys in configuration backups and session logs...")
+        for dev in raw_devices:
+            if dev.get("raw_config"):
+                dev["raw_config"] = sanitize_raw_config(dev["raw_config"])
+        _sanitize_session_logs(logs_dir or os.path.join(run_output_dir, "logs"))
+
+    json_path = os.path.join(run_output_dir, "net_docu_crawler_dataset.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(raw_devices, f, indent=2)
+    print(f"[+] Saved crawl dataset to: {json_path}")
+
+    failed_hosts = [
+        {
+            "ip": dev.get("ip", ""),
+            "status": dev.get("status", "unknown"),
+            "vendor": dev.get("vendor", "Unknown"),
+            "device_type": dev.get("device_type", "unknown"),
+            "mgmt_method": dev.get("mgmt_method", ""),
+            "model": dev.get("model", ""),
+            "mac_address": dev.get("mac_address", ""),
+        }
+        for dev in raw_devices
+        if dev.get("status") in ("unauthenticated", "unsupported")
     ]
-    for src_p, dst_p in _layer_copies:
-        if os.path.isfile(src_p):
-            shutil.copy2(src_p, dst_p)
+    failed_path = os.path.join(run_output_dir, "failed_hosts.json")
+    with open(failed_path, "w", encoding="utf-8") as f:
+        json.dump(failed_hosts, f, indent=2)
+    if failed_hosts:
+        print(f"[+] Saved {len(failed_hosts)} failed/partial host(s) to: {failed_path}")
+    return json_path
 
-    report_generator.export_layered_csvs(
-        raw_devices,
-        registry,
-        run_output_dir,
-        source_logs_dir=logs_dir,
-        trunk_audit=trunk_audit,
+
+def _prepare_layered_dirs_and_quality_report(
+    raw_devices: list[dict],
+    run_output_dir: str,
+) -> tuple[dict | None, dict, str, str, str]:
+    """Run dataset correlation, DNS detection, and quality gate report generation."""
+    from net_docu_crawler.correlator import correlate_dataset
+    from net_docu_crawler.domain_detector import detect_environment_dns_domain
+    from net_docu_crawler.quality_gates import evaluate_quality_gates, write_quality_report
+
+    corr_result = correlate_dataset(raw_devices)
+    trunk_audit = corr_result.get("trunk_audit") if isinstance(corr_result, dict) else None
+    dns_info = detect_environment_dns_domain(raw_devices)
+    quality_report = evaluate_quality_gates(raw_devices, trunk_audit=trunk_audit)
+    for k_src, k_dst in (
+        ("primary_domain", "dns_domain"),
+        ("local_dns_suffix", "local_dns_suffix"),
+        ("device_domains", "device_domains"),
+    ):
+        if dns_info[k_src]:
+            quality_report[k_dst] = dns_info[k_src]
+
+    manifest_dir = os.path.join(run_output_dir, "00_manifest")
+    norm_dir = os.path.join(run_output_dir, "02_normalized")
+    corr_dir = os.path.join(run_output_dir, "03_correlated")
+    mig_dir = os.path.join(run_output_dir, "04_migration")
+    rep_dir = os.path.join(run_output_dir, "05_reports")
+    for d in (manifest_dir, norm_dir, corr_dir, mig_dir, rep_dir):
+        os.makedirs(d, exist_ok=True)
+    write_quality_report(quality_report, manifest_dir)
+    print(
+        f"[+] Quality Gates: {'PASS' if quality_report['passed'] else 'FAIL'} (see {os.path.join(manifest_dir, 'data_quality_report.md')})"
+    )
+    return trunk_audit, dns_info, norm_dir, mig_dir, rep_dir
+
+
+def render_deliverables_from_dataset(
+    raw_devices: list[dict],
+    registry: DeviceRegistry | None = None,
+    run_output_dir: str = "docs/net_docu_crawler",
+    targets: list[str] | None = None,
+    is_organized: bool = False,
+    sanitize_passwords: bool = False,
+    target_vendor: str = "",
+    save_baseline: str = "",
+    compare_baseline: str = "",
+    logs_dir: str = "",
+) -> list[dict]:
+    """
+    Resolve topology links, optionally sanitize secrets (including raw session logs),
+    export JSON/failed_hosts.json, and generate all Markdown/CSV/script deliverables.
+    Can be called live after `crawl_network()` or offline via `--from-dataset`.
+    """
+    os.makedirs(run_output_dir, exist_ok=True)
+    enrich_devices_from_dhcp_reservations(raw_devices)
+    if registry is None:
+        registry = DeviceRegistry()
+        for dev in raw_devices:
+            if isinstance(dev, dict):
+                registry.register_device(dev)
+
+    _stitch_dataset_topology(raw_devices, registry)
+    trunk_audit, dns_info, norm_dir, mig_dir, rep_dir = _prepare_layered_dirs_and_quality_report(
+        raw_devices, run_output_dir
     )
 
-    # Run directory already holds deliverables/<Subnet>_<TimeStamp>_<domain>/; do not mirror into docs/net_docu_crawler/
+    confirmed_count = sum(1 for lk in registry.links if lk["status"] == "confirmed")
+    print(f"\n[+] Processed {len(raw_devices)} network devices!")
+    print(f"[+] Unique devices in registry: {len(registry.devices)}")
+    print(f"[+] Discovered topology links: {len(registry.links)} ({confirmed_count} bidirectional confirmed)")
 
+    json_path = _export_dataset_and_failed_hosts(raw_devices, run_output_dir, sanitize_passwords, logs_dir)
+    devices_dict = {dev["ip"]: dev for dev in registry.devices.values()}
+    t_list = targets or []
+    scope_label = (
+        t_list[0]
+        if len(t_list) == 1
+        else ("192.168.1.0/24" if any("192.168.1." in t for t in t_list) else "Multi-Target Campus")
+    )
+
+    _write_standard_deliverables(
+        devices_dict,
+        raw_devices,
+        trunk_audit,
+        run_output_dir,
+        scope_label,
+        dns_info["primary_domain"],
+        target_vendor,
+        json_path,
+        norm_dir,
+        mig_dir,
+        rep_dir,
+    )
+    _write_optional_migration_deliverables(devices_dict, run_output_dir, target_vendor, save_baseline, compare_baseline)
+    if is_organized:
+        _update_latest_run_pointer(run_output_dir)
+
+    report_generator.export_layered_csvs(
+        raw_devices, registry, run_output_dir, source_logs_dir=logs_dir, trunk_audit=trunk_audit
+    )
     return raw_devices
 
 
@@ -1874,7 +2139,6 @@ class LogReplayConnection:
         lines = cleaned.splitlines()
         base_prompt = ""
         prompt_re = None
-        # Identify the device prompt prefix from the first prompt+command line
         for ln in lines:
             m = re.match(r"^([A-Za-z0-9._@-]+)(?:\s*\([^)]+\))?\s*[#>$]\s*([a-zA-Z/].*)$", ln)
             if m:
@@ -1915,7 +2179,6 @@ class LogReplayConnection:
         cmd = command_string.strip()
         if cmd in self.commands:
             return self.commands[cmd]
-        # Fallback: case-insensitive or prefix match
         cmd_l = cmd.lower()
         for k, v in self.commands.items():
             if k.lower() == cmd_l:
@@ -1980,6 +2243,37 @@ def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
     return "cisco"
 
 
+def _reparse_single_session_log(lf: str, existing_by_ip: dict[str, dict]) -> tuple[str, dict | None]:
+    """Replay a single `<ip>_raw_session.log` file through its detected vendor driver."""
+    ip = os.path.basename(lf).replace("_raw_session.log", "")
+    with open(lf, encoding="utf-8", errors="ignore") as f:
+        log_text = f.read()
+
+    conn = LogReplayConnection(log_text)
+    if len(conn.commands) < 2:
+        prev = existing_by_ip.get(ip)
+        if prev:
+            if prev.get("hostname") in ("authentication", "Password", "Login", "Username", ""):
+                prev["status"] = "unauthenticated"
+                prev["hostname"] = prev.get("ip", ip)
+            return ip, prev
+        return ip, None
+
+    prev = existing_by_ip.get(ip, {})
+    vendor = _infer_vendor_from_log(log_text, prev.get("vendor", ""))
+    driver_cls = resolve_driver_for_vendor(vendor, default=CiscoDriver) or CiscoDriver
+    driver = driver_cls(ip)
+    print(f"[+] Re-parsing {ip} ({vendor}) from {os.path.basename(lf)} ({len(conn.commands)} commands)")
+    dev = driver.crawl(conn)
+    dev["ip"] = ip
+    if not dev.get("mac_address") and prev.get("mac_address"):
+        dev["mac_address"] = prev["mac_address"]
+    for extra_k in ("http_title", "http_server", "ssh_banner", "open_ports", "discovery_source"):
+        if prev.get(extra_k) and not dev.get(extra_k):
+            dev[extra_k] = prev[extra_k]
+    return ip, dev
+
+
 def reparse_logs_dir(
     run_dir: str,
     output_dir: str = "",
@@ -2017,43 +2311,14 @@ def reparse_logs_dir(
 
     reparsed_by_ip: dict[str, dict] = {}
     for lf in log_files:
-        ip = os.path.basename(lf).replace("_raw_session.log", "")
-        with open(lf, encoding="utf-8", errors="ignore") as f:
-            log_text = f.read()
-
-        conn = LogReplayConnection(log_text)
-        # Skip tiny auth-failed stubs with fewer than 2 recorded commands
-        if len(conn.commands) < 2:
-            prev = existing_by_ip.get(ip)
-            if prev:
-                # Fix legacy misclassified auth-failure stubs
-                if prev.get("hostname") in ("authentication", "Password", "Login", "Username", ""):
-                    prev["status"] = "unauthenticated"
-                    prev["hostname"] = prev.get("ip", ip)
-                reparsed_by_ip[ip] = prev
-            continue
-
-        prev = existing_by_ip.get(ip, {})
-        vendor = _infer_vendor_from_log(log_text, prev.get("vendor", ""))
-        driver_cls = VENDOR_DRIVER_MAP.get(vendor, CiscoDriver)
-        driver = driver_cls(ip)
-        print(f"[+] Re-parsing {ip} ({vendor}) from {os.path.basename(lf)} ({len(conn.commands)} commands)")
-        dev = driver.crawl(conn)
-        dev["ip"] = ip
-        if not dev.get("mac_address") and prev.get("mac_address"):
-            dev["mac_address"] = prev["mac_address"]
-        for extra_k in ("http_title", "http_server", "ssh_banner", "open_ports", "discovery_source"):
-            if prev.get(extra_k) and not dev.get(extra_k):
-                dev[extra_k] = prev[extra_k]
-        reparsed_by_ip[ip] = dev
+        ip, dev = _reparse_single_session_log(lf, existing_by_ip)
+        if dev is not None:
+            reparsed_by_ip[ip] = dev
 
     merged: list[dict] = []
     seen: set[str] = set()
     for ip in existing_order:
-        if ip in reparsed_by_ip:
-            merged.append(reparsed_by_ip[ip])
-        else:
-            merged.append(existing_by_ip[ip])
+        merged.append(reparsed_by_ip[ip] if ip in reparsed_by_ip else existing_by_ip[ip])
         seen.add(ip)
     for ip, dev in reparsed_by_ip.items():
         if ip not in seen:
@@ -2089,8 +2354,8 @@ def format_duration(seconds: float) -> str:
     return f"{total:.2f} seconds ({' '.join(parts)})"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Net-Docu-Crawler Multi-Vendor Network Discovery")
+def _add_core_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register target, credential, transport, and output directory CLI flags."""
     parser.add_argument(
         "--targets",
         nargs="+",
@@ -2166,6 +2431,10 @@ def main():
         default="public",
         help="SNMPv2c community string when --snmp is enabled (default: public)",
     )
+
+
+def _add_scope_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register L3 hop discovery and subnet scope filtering CLI flags."""
     parser.add_argument(
         "--follow-subnets",
         action="store_true",
@@ -2219,6 +2488,10 @@ def main():
         action="store_true",
         help="Allow --follow-subnets to follow non-RFC1918 public subnets (explicit ISP override)",
     )
+
+
+def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Register migration target, vendor hint, baseline, and offline mode CLI flags."""
     parser.add_argument(
         "--target-vendor",
         default="",
@@ -2240,9 +2513,7 @@ def main():
         help="Disable online OUI lookup fallback for unseen MAC prefixes (air-gapped mode)",
     )
     parser.add_argument(
-        "--save-baseline",
-        default="",
-        help="Save pre-cutover baseline state JSON to the specified path",
+        "--save-baseline", default="", help="Save pre-cutover baseline state JSON to the specified path"
     )
     parser.add_argument(
         "--compare-baseline",
@@ -2270,7 +2541,17 @@ def main():
         help="Validate --credentials JSON file(s) and exit without running a crawl",
     )
 
-    args = parser.parse_args()
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Net-Docu-Crawler Multi-Vendor Network Discovery")
+    _add_core_cli_args(parser)
+    _add_scope_cli_args(parser)
+    _add_mode_cli_args(parser)
+    return parser
+
+
+def main():
+    args = _build_arg_parser().parse_args()
 
     if args.validate_credentials:
         creds, warnings, errors = load_and_validate_credentials(args.credentials)
@@ -2312,7 +2593,7 @@ def main():
             print(f"\n[+] Offline deliverable regeneration completed in {format_duration(time.time() - t_start)}")
             return
 
-        crawl_network(
+        options = CrawlOptions(
             targets=args.targets,
             credentials_path=args.credentials,
             output_dir=args.output_dir,
@@ -2343,6 +2624,7 @@ def main():
             compare_baseline=args.compare_baseline,
             retry_failed=args.retry_failed,
         )
+        crawl_network(config=options)
     except ValueError:
         sys.exit(1)
     print(f"\n[+] Total crawl and documentation runtime: {format_duration(time.time() - t_start)}")

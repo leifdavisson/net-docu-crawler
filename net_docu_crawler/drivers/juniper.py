@@ -20,10 +20,13 @@ Official Documentation: https://www.juniper.net/documentation/product/us/en/juno
 """
 
 import json
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 # Internal Junos control-plane, PFE fabric, and tunnel pseudo-devices excluded from physical port counts
 JUNOS_INTERNAL_INTERFACES = (
@@ -62,19 +65,8 @@ class JuniperDriver(BaseDriver):
     paging_cmd = "set cli screen-length 0"
 
     def connect(self):
-        device = {
-            "device_type": "juniper_junos",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-            "global_delay_factor": 2,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("juniper_junos", global_delay_factor=2)
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -99,7 +91,8 @@ class JuniperDriver(BaseDriver):
             info["hostname"] = sw_info.get("host-name", [{}])[0].get("data", "")
             info["firmware"] = sw_info.get("junos-version", [{}])[0].get("data", "")
             info["model"] = sw_info.get("product-model", [{}])[0].get("data", "")
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Junos show version | display json failed, falling back to text: %s", self.ip, exc)
             raw = conn.send_command("show version")
             m_host = re.search(r"Hostname:\s+(\S+)", raw)
             if m_host:
@@ -131,7 +124,10 @@ class JuniperDriver(BaseDriver):
                 info["serial"] = sn
             if desc and info["model"] == "Juniper Device":
                 info["model"] = desc
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show chassis hardware | display json failed, falling back to text: %s", self.ip, exc
+            )
             raw_hw = conn.send_command("show chassis hardware")
             m_sn = re.search(r"Chassis\s+(\S+)", raw_hw)
             if m_sn:
@@ -143,8 +139,8 @@ class JuniperDriver(BaseDriver):
             m_mac = re.search(r"(?:Base|Public base)\s+address\s+([0-9a-fA-F:]{17})", raw_mac, re.IGNORECASE)
             if m_mac:
                 info["mac_address"] = oui_lookup.normalize_mac(m_mac.group(1)).lower()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show chassis mac-addresses failed: %s", self.ip, exc)
 
         if not info["hostname"]:
             info["hostname"] = conn.find_prompt().split("@")[-1].replace(">", "").replace("#", "").strip()
@@ -215,7 +211,10 @@ class JuniperDriver(BaseDriver):
                                     "protocol": log_oper,
                                 }
                             )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show interfaces terse | display json failed, falling back to text: %s", self.ip, exc
+            )
             raw = conn.send_command("show interfaces terse")
             for line in raw.splitlines():
                 parts = line.split()
@@ -265,8 +264,8 @@ class JuniperDriver(BaseDriver):
                         interfaces_detail[cur_if]["input_errors"] = int(m_in.group(1))
                     if m_out:
                         interfaces_detail[cur_if]["output_errors"] = int(m_out.group(1))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show interfaces error counters failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -332,7 +331,10 @@ class JuniperDriver(BaseDriver):
                         "device_type": dev_type,
                     }
                 )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show lldp neighbors detail | display json failed, falling back to text: %s", self.ip, exc
+            )
             raw = conn.send_command("show lldp neighbors detail")
             blocks = raw.split("Local Interface:")
             for b in blocks[1:]:
@@ -421,7 +423,10 @@ class JuniperDriver(BaseDriver):
                                 "device_type": dev_type,
                             }
                         )
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "[%s] Junos show lldp neighbors | display json failed, falling back to text: %s", self.ip, exc
+                )
                 try:
                     raw_sum_txt = conn.send_command("show lldp neighbors")
                     for line in raw_sum_txt.splitlines():
@@ -445,8 +450,8 @@ class JuniperDriver(BaseDriver):
                                     "device_type": "switch",
                                 }
                             )
-                except Exception:
-                    pass
+                except Exception as txt_exc:
+                    logger.debug("[%s] Junos show lldp neighbors text fallback failed: %s", self.ip, txt_exc)
 
         return neighbors
 
@@ -497,8 +502,8 @@ class JuniperDriver(BaseDriver):
                     if "this bridge is the root" in raw_str:
                         stp["is_root"] = True
                     return stp
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show spanning-tree bridge | display json failed: %s", self.ip, exc)
 
         try:
             raw_txt = conn.send_command("show spanning-tree bridge")
@@ -524,8 +529,8 @@ class JuniperDriver(BaseDriver):
                     stp["root_port"] = m_port.group(1).strip()
                 if "this bridge is the root" in low or (m_root and m_bridge and m_root.group(1) == m_bridge.group(1)):
                     stp["is_root"] = True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show spanning-tree bridge text fallback failed: %s", self.ip, exc)
         return stp
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -548,7 +553,8 @@ class JuniperDriver(BaseDriver):
                     via = nh.get("to", [{}])[0].get("data", "Directly Connected")
                     nh_if = nh.get("via", [{}])[0].get("data", "")
                     routes.append({"subnet": dest, "protocol": proto, "next_hop": via, "interface": nh_if})
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Junos show route | display json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_txt = conn.send_command("show route table inet.0")
                 cur_dest = ""
@@ -573,8 +579,8 @@ class JuniperDriver(BaseDriver):
                                 }
                             )
                             cur_dest = ""
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show route table inet.0 text fallback failed: %s", self.ip, txt_exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -599,7 +605,8 @@ class JuniperDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Junos show arp no-resolve | display json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_txt = conn.send_command("show arp no-resolve")
                 for line in raw_txt.splitlines():
@@ -623,8 +630,8 @@ class JuniperDriver(BaseDriver):
                                 "vendor": oui_lookup.lookup_oui(norm_mac),
                             }
                         )
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show arp no-resolve text fallback failed: %s", self.ip, txt_exc)
         return arp_entries
 
     def get_poe(self, conn) -> dict:
@@ -658,7 +665,8 @@ class JuniperDriver(BaseDriver):
                     poe["total_power_watts"] += tot_v
                     poe["used_power_watts"] += used_v
                     poe["available_power_watts"] += avail_v
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Junos show poe controller | display json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_txt = conn.send_command("show poe controller")
                 if "syntax error" in raw_txt.lower() or "unknown command" in raw_txt.lower():
@@ -679,8 +687,8 @@ class JuniperDriver(BaseDriver):
                         poe["used_power_watts"] = float(m_con.group(1))
                     if m_avail:
                         poe["available_power_watts"] = float(m_avail.group(1))
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show poe controller text fallback failed: %s", self.ip, txt_exc)
 
         try:
             raw_if = conn.send_command("show poe interface | display json")
@@ -712,7 +720,8 @@ class JuniperDriver(BaseDriver):
                             "watts": float(pwr or 0),
                             "class": p_cls,
                         }
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Junos show poe interface | display json failed, falling back to text: %s", self.ip, exc)
             try:
                 raw_if_txt = conn.send_command("show poe interface")
                 for line in raw_if_txt.splitlines():
@@ -723,8 +732,8 @@ class JuniperDriver(BaseDriver):
                             "watts": float(parts[3].replace("W", "")),
                             "class": parts[4] if len(parts) > 4 else "unknown",
                         }
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show poe interface text fallback failed: %s", self.ip, txt_exc)
 
         if poe["total_power_watts"] > 0 or poe["ports"]:
             poe["poe_supported"] = True
@@ -783,7 +792,12 @@ class JuniperDriver(BaseDriver):
                                     "vendor": oui_lookup.lookup_oui(norm_mac),
                                 }
                             )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show ethernet-switching table | display json failed, falling back to text: %s",
+                self.ip,
+                exc,
+            )
             try:
                 raw_txt = conn.send_command("show ethernet-switching table")
                 for line in raw_txt.splitlines():
@@ -802,8 +816,8 @@ class JuniperDriver(BaseDriver):
                                 "vendor": oui_lookup.lookup_oui(mac),
                             }
                         )
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show ethernet-switching table text fallback failed: %s", self.ip, txt_exc)
         return entries
 
     def get_optics(self, conn) -> list[dict]:
@@ -856,7 +870,10 @@ class JuniperDriver(BaseDriver):
                             "temperature_c": None,
                             "voltage_v": None,
                         }
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show chassis hardware | display json optics failed, falling back to text: %s", self.ip, exc
+            )
             try:
                 raw_hw_txt = conn.send_command("show chassis hardware")
                 fpc_idx, pic_idx = "0", "0"
@@ -884,8 +901,8 @@ class JuniperDriver(BaseDriver):
                             "temperature_c": None,
                             "voltage_v": None,
                         }
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show chassis hardware optics text fallback failed: %s", self.ip, txt_exc)
 
         # 2. Merge live DOM telemetry from `show interfaces diagnostics optics`
         def _merge_dom(port: str, tx, rx, temp, volt):
@@ -956,7 +973,12 @@ class JuniperDriver(BaseDriver):
                         float(temp) if temp and temp != "N/A" else None,
                         float(volt) if volt and volt != "N/A" else None,
                     )
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show interfaces diagnostics optics | display json failed, falling back to text: %s",
+                self.ip,
+                exc,
+            )
             try:
                 raw_txt = conn.send_command("show interfaces diagnostics optics")
                 current_port = ""
@@ -995,14 +1017,19 @@ class JuniperDriver(BaseDriver):
                         cur_data.get("temperature_c"),
                         cur_data.get("voltage_v"),
                     )
-            except Exception:
-                pass
+            except Exception as txt_exc:
+                logger.debug("[%s] Junos show interfaces diagnostics optics text fallback failed: %s", self.ip, txt_exc)
         return list(optics_by_port.values())
 
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("show configuration | display set")
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "[%s] Junos show configuration | display set failed, falling back to show configuration: %s",
+                self.ip,
+                exc,
+            )
             return conn.send_command("show configuration")
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
@@ -1084,8 +1111,8 @@ class JuniperDriver(BaseDriver):
                                 rec["native_vlan_tagged"] = True
                         elif mode == "access" and untagged_vid:
                             rec["access_vlan"] = untagged_vid
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show ethernet-switching interfaces | display json failed: %s", self.ip, exc)
 
         # Text fallback for `show ethernet-switching interfaces` (ELS & pre-ELS Junos)
         if not parsed_es_json:
@@ -1156,8 +1183,8 @@ class JuniperDriver(BaseDriver):
                             rec["mode"] = "access"
                             rec["oper_mode"] = "down" if p_state["down"] else "access"
                             rec["access_vlan"] = untagged[0]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Junos show ethernet-switching interfaces text fallback failed: %s", self.ip, exc)
 
         try:
             raw_lacp = conn.send_command("show lacp interfaces | display json")
@@ -1174,8 +1201,8 @@ class JuniperDriver(BaseDriver):
                             role = (p_ent.get("lacp-activity", [{}])[0].get("data") or "").lower()
                             if role in ("active", "passive"):
                                 ops[pname]["lacp_mode"] = role
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show lacp interfaces | display json failed: %s", self.ip, exc)
 
         try:
             raw_stp = conn.send_command("show spanning-tree interface | display json")
@@ -1192,8 +1219,8 @@ class JuniperDriver(BaseDriver):
                             ops.setdefault(pname, {})["stp_role"] = role
                         if state:
                             ops.setdefault(pname, {})["stp_state"] = state
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show spanning-tree interface | display json failed: %s", self.ip, exc)
 
         try:
             raw_dot1x = conn.send_command("show dot1x interface | display json")
@@ -1203,7 +1230,7 @@ class JuniperDriver(BaseDriver):
                     pname = (d_ent.get("interface-name", [{}])[0].get("data") or "").split(".")[0]
                     if pname:
                         ops.setdefault(pname, {})["auth_policy"] = "dot1x"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Junos show dot1x interface | display json failed: %s", self.ip, exc)
 
         return ops

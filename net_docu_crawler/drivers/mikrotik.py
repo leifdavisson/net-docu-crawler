@@ -18,10 +18,13 @@ MikroTik RouterOS Driver: Routers and Switches running RouterOS v7+.
 Official Documentation: https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface
 """
 
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_ros_token(val: str) -> str:
@@ -41,18 +44,8 @@ class MikroTikDriver(BaseDriver):
     paging_cmd = ""
 
     def connect(self):
-        device = {
-            "device_type": "mikrotik_routeros",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("mikrotik_routeros")
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -68,8 +61,8 @@ class MikroTikDriver(BaseDriver):
             m_name = re.search(r"name:\s*(.+)", ident)
             if m_name:
                 info["hostname"] = _clean_ros_token(m_name.group(1))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /system identity print failed: %s", self.ip, exc)
 
         try:
             res = conn.send_command("/system resource print")
@@ -79,16 +72,16 @@ class MikroTikDriver(BaseDriver):
             m_board = re.search(r"board-name:\s*(.+)", res)
             if m_board:
                 info["model"] = _clean_ros_token(m_board.group(1))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /system resource print failed: %s", self.ip, exc)
 
         try:
             rb = conn.send_command("/system routerboard print")
             m_ser = re.search(r"serial-number:\s*(.+)", rb)
             if m_ser:
                 info["serial"] = _clean_ros_token(m_ser.group(1))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /system routerboard print failed: %s", self.ip, exc)
 
         return info
 
@@ -112,8 +105,8 @@ class MikroTikDriver(BaseDriver):
                         "mac_address": oui_lookup.normalize_mac(m_mac.group(1)).lower() if m_mac else "",
                         "description": "",
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /interface ethernet print detail failed: %s", self.ip, exc)
 
         # 2. Harvest Layer 3 IPv4 addresses
         try:
@@ -142,8 +135,8 @@ class MikroTikDriver(BaseDriver):
                             "mac_address": "",
                             "description": "",
                         }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /ip address print detail failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -182,8 +175,8 @@ class MikroTikDriver(BaseDriver):
                             "device_type": dev_type,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /ip neighbor print detail failed: %s", self.ip, exc)
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -218,8 +211,8 @@ class MikroTikDriver(BaseDriver):
                                 "interface": intf,
                             }
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /ip route print detail failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -241,8 +234,8 @@ class MikroTikDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS /ip arp print detail failed: %s", self.ip, exc)
         return arp_entries
 
     def get_optics(self, conn) -> list[dict]:
@@ -289,12 +282,9 @@ class MikroTikDriver(BaseDriver):
                         cur_entry["temperature_c"] = float(m_temp.group(1))
             if cur_entry and cur_entry.get("part_number") != "Unknown":
                 optics.append(cur_entry)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] RouterOS SFP optics monitor failed: %s", self.ip, exc)
         return optics
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("/export compact")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "/export compact")

@@ -15,13 +15,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Multi-stage SSH cryptographic compatibility and legacy fallback layer for Net-Docu-Crawler.
+Multi-stage SSH cryptographic compatibility and per-connection legacy fallback layer
+for Net-Docu-Crawler.
 
 Bridges modern hardened SSHv2 peers (RFC 8731 ``curve25519-sha256`` and RFC 3526
 ``diffie-hellman-group18-sha512``) and legacy network management planes requiring
 deprecated KEX, ciphers, MACs, read-only ``ssh-dss`` host-key verification, or
-RFC 8332 ``rsa-sha2-256``/``512`` downgrade workarounds without weakening default
-sessions or re-trying failed authentication credentials.
+RFC 8332 ``rsa-sha2-256``/``512`` downgrade workarounds. Legacy fallback algorithms
+are scoped strictly per connection/transport instance without mutating global
+``paramiko.Transport`` algorithm tables for concurrent or subsequent sessions, and
+without retrying failed authentication credentials.
 
 Official Upstream Documentation & References:
 - Paramiko: https://www.paramiko.org/
@@ -31,10 +34,13 @@ Official Upstream Documentation & References:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import socket
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import netmiko
@@ -60,7 +66,10 @@ from paramiko.ssh_exception import (
 )
 from paramiko.transport import Transport
 
+logger = logging.getLogger(__name__)
+
 _COMPAT_LOCK = threading.RLock()
+_LEGACY_SCOPE_STATE = threading.local()
 
 LEGACY_KEX_ALGORITHMS: tuple[str, ...] = (
     "diffie-hellman-group14-sha1",
@@ -81,6 +90,13 @@ LEGACY_MACS: tuple[str, ...] = (
     "hmac-sha1-96",
     "hmac-md5-96",
 )
+
+STAGE1_DISABLED_ALGORITHMS: dict[str, tuple[str, ...]] = {
+    "keys": ("ssh-dss", "ssh-dss-cert-v01@openssh.com"),
+    "kex": ("diffie-hellman-group1-sha1",),
+    "ciphers": LEGACY_CIPHERS,
+    "macs": ("hmac-md5", "hmac-md5-96"),
+}
 
 RSA_SHA2_PUBKEYS: list[str] = ["rsa-sha2-256", "rsa-sha2-512"]
 
@@ -260,7 +276,8 @@ class LegacyDSSKey(PKey):
             try:
                 sig_type = msg.get_text()
                 sig_bytes = msg.get_binary()
-            except (EOFError, UnicodeDecodeError):
+            except (EOFError, UnicodeDecodeError) as exc:
+                logger.debug("Malformed ssh-dss signature message framing: %s", exc)
                 return False
             if sig_type != self.name:
                 return False
@@ -273,7 +290,8 @@ class LegacyDSSKey(PKey):
         der_sig = encode_dss_signature(r, s)
         try:
             self.key.verify(der_sig, data, hashes.SHA1())
-        except (InvalidSignature, ValueError):
+        except (InvalidSignature, ValueError) as exc:
+            logger.debug("ssh-dss signature verification rejected: %s", exc)
             return False
         return True
 
@@ -288,14 +306,99 @@ def _append_missing_tuple_items(current: tuple[str, ...], items: list[str] | tup
     return tuple(updated) if changed else current
 
 
+def _stage1_disabled_algorithms_dict() -> dict[str, list[str]]:
+    """Returns a fresh per-connection ``disabled_algorithms`` mapping for hardened Stage 1."""
+    return {alg_type: list(alg_names) for alg_type, alg_names in STAGE1_DISABLED_ALGORITHMS.items()}
+
+
+def _is_legacy_scope_active() -> bool:
+    return int(getattr(_LEGACY_SCOPE_STATE, "depth", 0)) > 0
+
+
+@contextmanager
+def legacy_ssh_fallback_scope() -> Iterator[None]:
+    """
+    Thread-local context manager scoping legacy SSH algorithm fallback (``ssh-dss``,
+    CBC ciphers, ``diffie-hellman-group1-sha1``, ``hmac-md5*``) strictly to ``Transport``
+    instances created by ``SSHClient.connect`` within the current fallback attempt,
+    without mutating global ``paramiko.Transport`` algorithm tables.
+    """
+    prev = int(getattr(_LEGACY_SCOPE_STATE, "depth", 0))
+    _LEGACY_SCOPE_STATE.depth = prev + 1
+    try:
+        yield
+    finally:
+        _LEGACY_SCOPE_STATE.depth = prev
+
+
+def apply_legacy_algorithms_to_transport(transport: Transport) -> Transport:
+    """
+    Attaches read-only ``ssh-dss`` host-key verification and legacy KEX/cipher/MAC
+    tuples strictly onto a single ``paramiko.Transport`` instance without mutating
+    ``paramiko.Transport`` class-wide algorithm registries.
+    """
+    transport._key_info = {
+        **Transport._key_info,
+        "ssh-dss": LegacyDSSKey,
+        "ssh-dss-cert-v01@openssh.com": LegacyDSSKey,
+    }
+    transport._preferred_keys = _append_missing_tuple_items(Transport._preferred_keys, ("ssh-dss",))
+
+    supported_legacy_kex = [k for k in LEGACY_KEX_ALGORITHMS if k in Transport._kex_info]
+    transport._preferred_kex = _append_missing_tuple_items(Transport._preferred_kex, supported_legacy_kex)
+
+    supported_legacy_ciphers = [c for c in LEGACY_CIPHERS if c in Transport._cipher_info]
+    transport._preferred_ciphers = _append_missing_tuple_items(Transport._preferred_ciphers, supported_legacy_ciphers)
+
+    supported_legacy_macs = [m for m in LEGACY_MACS if m in Transport._mac_info]
+    transport._preferred_macs = _append_missing_tuple_items(Transport._preferred_macs, supported_legacy_macs)
+    return transport
+
+
+def build_legacy_transport(*args: Any, **kwargs: Any) -> Transport:
+    """Per-connection ``SSHClient.connect(transport_factory=...)`` factory for legacy SSH peers."""
+    transport = Transport(*args, **kwargs)
+    return apply_legacy_algorithms_to_transport(transport)
+
+
+def _install_scoped_ssh_client_hook() -> None:
+    """
+    Idempotently wraps ``paramiko.SSHClient.connect`` so callers such as Netmiko that
+    do not expose ``transport_factory`` receive ``build_legacy_transport`` only when
+    invoked inside ``legacy_ssh_fallback_scope()``.
+    """
+    current_connect = paramiko.SSHClient.connect
+    if getattr(current_connect, "_ndc_scoped_compat", False):
+        return
+
+    @functools.wraps(current_connect)
+    def _scoped_ssh_client_connect(self_client: paramiko.SSHClient, *args: Any, **kwargs: Any) -> Any:
+        if _is_legacy_scope_active() and kwargs.get("transport_factory") is None:
+            scoped_kwargs = dict(kwargs)
+            scoped_kwargs["transport_factory"] = build_legacy_transport
+            return current_connect(self_client, *args, **scoped_kwargs)
+        return current_connect(self_client, *args, **kwargs)
+
+    _scoped_ssh_client_connect._ndc_scoped_compat = True  # type: ignore[attr-defined]
+    paramiko.SSHClient.connect = _scoped_ssh_client_connect  # type: ignore[method-assign]
+
+
 def configure_paramiko_compat(enable_legacy_dss: bool = False) -> None:
     """
-    Idempotently registers missing modern and (optionally) legacy SSH algorithms on
-    ``paramiko.Transport`` while silencing noisy Paramiko background-thread tracebacks.
+    Idempotently registers missing modern safe KEX algorithms (``curve25519-sha256``,
+    ``diffie-hellman-group18-sha512``) on ``paramiko.Transport`` while silencing noisy
+    Paramiko background-thread tracebacks.
+
+    Note: ``connect_netmiko_with_fallback`` and ``connect_paramiko_with_fallback``
+    always pass ``enable_legacy_dss=False`` and scope legacy algorithms per connection
+    via ``legacy_ssh_fallback_scope()`` / ``build_legacy_transport`` instead of mutating
+    global ``Transport`` tables. The optional ``enable_legacy_dss=True`` branch is
+    retained solely for explicit backward-compatible callers/tests.
     """
     with _COMPAT_LOCK:
         logging.getLogger("paramiko").setLevel(logging.CRITICAL)
         logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
+        _install_scoped_ssh_client_hook()
 
         modern_kex: list[str] = []
         if KexCurve25519.is_available():
@@ -387,74 +490,111 @@ def _should_retry_stage3(exc: BaseException) -> bool:
     return False
 
 
+def _close_paramiko_client_quietly(client: paramiko.SSHClient, target: str, stage: int) -> None:
+    """Closes a failed Paramiko client before retrying the next negotiation stage."""
+    try:
+        client.close()
+    except (OSError, SSHException, AttributeError) as close_exc:
+        logger.debug("Ignoring client.close() error after Stage %d failure on %s: %s", stage, target, close_exc)
+
+
 def connect_netmiko_with_fallback(device_params: dict[str, Any]):
     """
-    Establishes a Netmiko SSH/Telnet connection using a 3-stage compatibility ladder:
+    Establishes a Netmiko SSH/Telnet connection using a 3-stage per-connection ladder:
 
     - Stage 1: Modern hardened KEX registered (``curve25519-sha256``, ``diffie-hellman-group18-sha512``),
-      legacy ``ssh-dss`` disabled, default Netmiko settings.
-    - Stage 2: Triggered only on ``is_ssh_negotiation_error``; enables ``LegacyDSSKey`` / legacy
-      KEX/ciphers/MACs with ``disabled_algorithms={}``, ``disable_sha2_fix=False`` (keeping
-      ``rsa-sha2-256``/``512`` active), and ``ssh_strict=False``.
+      legacy ``ssh-dss``, ``*-cbc``, ``diffie-hellman-group1-sha1``, and ``hmac-md5*`` disabled
+      per connection via ``disabled_algorithms`` (unless explicitly overridden by caller).
+    - Stage 2: Triggered only on ``is_ssh_negotiation_error``; enables ``LegacyDSSKey`` and legacy
+      KEX/ciphers/MACs strictly on that single connection's ``Transport`` via
+      ``legacy_ssh_fallback_scope()`` (never mutating global ``Transport`` tables) with
+      ``disabled_algorithms={}``, ``disable_sha2_fix=False``, and ``ssh_strict=False``.
     - Stage 3: Triggered if Stage 2 still fails SSH negotiation / ``SSHException`` (never auth
-      failure); sets ``disable_sha2_fix=True`` for legacy peers with broken RFC 8332 SHA-2 RSA.
+      failure); sets ``disable_sha2_fix=True`` within ``legacy_ssh_fallback_scope()`` for legacy
+      peers with broken RFC 8332 SHA-2 RSA.
     """
     configure_paramiko_compat(enable_legacy_dss=False)
+    target = str(device_params.get("ip") or device_params.get("host") or "unknown")
+    dev_type = str(device_params.get("device_type", ""))
+
+    stage1_params = dict(device_params)
+    if "disabled_algorithms" not in stage1_params and not dev_type.endswith("_telnet"):
+        stage1_params["disabled_algorithms"] = _stage1_disabled_algorithms_dict()
+
     try:
-        return netmiko.ConnectHandler(**device_params)
+        return netmiko.ConnectHandler(**stage1_params)
     except Exception as exc1:
         if not is_ssh_negotiation_error(exc1):
             raise
+        logger.debug(
+            "Netmiko Stage 1 SSH negotiation failed for %s; retrying Stage 2 scoped fallback: %s", target, exc1
+        )
 
-    configure_paramiko_compat(enable_legacy_dss=True)
     stage2_params = dict(device_params)
     stage2_params["disabled_algorithms"] = {}
     stage2_params["disable_sha2_fix"] = False
     stage2_params["ssh_strict"] = False
     try:
-        return netmiko.ConnectHandler(**stage2_params)
+        with legacy_ssh_fallback_scope():
+            return netmiko.ConnectHandler(**stage2_params)
     except Exception as exc2:
         if not _should_retry_stage3(exc2):
             raise
+        logger.debug(
+            "Netmiko Stage 2 SSH negotiation failed for %s; retrying Stage 3 (disable_sha2_fix=True): %s",
+            target,
+            exc2,
+        )
 
     stage3_params = dict(device_params)
     stage3_params["disabled_algorithms"] = {}
     stage3_params["disable_sha2_fix"] = True
     stage3_params["ssh_strict"] = False
-    return netmiko.ConnectHandler(**stage3_params)
+    with legacy_ssh_fallback_scope():
+        return netmiko.ConnectHandler(**stage3_params)
 
 
 def connect_paramiko_with_fallback(client: paramiko.SSHClient, **connect_kwargs: Any) -> None:
     """
     Establishes a direct ``paramiko.SSHClient`` connection (used by ``OPNsenseDriver``)
-    mirroring the 3-stage SSH negotiation fallback ladder.
+    mirroring the 3-stage per-connection SSH negotiation fallback ladder without mutating
+    global ``paramiko.Transport`` algorithm tables.
     """
     configure_paramiko_compat(enable_legacy_dss=False)
+    target = str(connect_kwargs.get("hostname", "unknown"))
+
+    stage1_kwargs = dict(connect_kwargs)
+    if "disabled_algorithms" not in stage1_kwargs:
+        stage1_kwargs["disabled_algorithms"] = _stage1_disabled_algorithms_dict()
+
     try:
-        client.connect(**connect_kwargs)
+        client.connect(**stage1_kwargs)
         return
     except Exception as exc1:
         if not is_ssh_negotiation_error(exc1):
             raise
-        try:
-            client.close()
-        except Exception:
-            pass
+        logger.debug(
+            "Paramiko Stage 1 SSH negotiation failed for %s; retrying Stage 2 scoped fallback: %s", target, exc1
+        )
+        _close_paramiko_client_quietly(client, target, stage=1)
 
-    configure_paramiko_compat(enable_legacy_dss=True)
     stage2_kwargs = dict(connect_kwargs)
     stage2_kwargs["disabled_algorithms"] = {}
+    stage2_kwargs.setdefault("transport_factory", build_legacy_transport)
     try:
-        client.connect(**stage2_kwargs)
+        with legacy_ssh_fallback_scope():
+            client.connect(**stage2_kwargs)
         return
     except Exception as exc2:
         if not _should_retry_stage3(exc2):
             raise
-        try:
-            client.close()
-        except Exception:
-            pass
+        logger.debug(
+            "Paramiko Stage 2 SSH negotiation failed for %s; retrying Stage 3 (RSA SHA-2 disabled): %s", target, exc2
+        )
+        _close_paramiko_client_quietly(client, target, stage=2)
 
     stage3_kwargs = dict(connect_kwargs)
     stage3_kwargs["disabled_algorithms"] = {"pubkeys": list(RSA_SHA2_PUBKEYS)}
-    client.connect(**stage3_kwargs)
+    stage3_kwargs.setdefault("transport_factory", build_legacy_transport)
+    with legacy_ssh_fallback_scope():
+        client.connect(**stage3_kwargs)

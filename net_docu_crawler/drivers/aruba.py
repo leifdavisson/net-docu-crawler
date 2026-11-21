@@ -20,10 +20,13 @@ Official Documentation:
 - Aruba AOS-CX: https://www.arubanetworks.com/techdocs/AOS-CX/help_portal/Content/home.htm
 """
 
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class ArubaDriver(BaseDriver):
@@ -33,19 +36,8 @@ class ArubaDriver(BaseDriver):
     paging_cmd = "no page"
 
     def connect(self):
-        device = {
-            "device_type": "aruba_os",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-            "global_delay_factor": 2,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("aruba_os", global_delay_factor=2)
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -99,16 +91,13 @@ class ArubaDriver(BaseDriver):
                         m_m2 = re.search(r"(?:Base\s+)?MAC\s+Address\s*:\s*([0-9a-fA-F:.-]+)", raw_sys, re.IGNORECASE)
                         if m_m2:
                             info["mac_address"] = oui_lookup.normalize_mac(m_m2.group(1)).lower()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show system failed: %s", self.ip, exc)
 
             if not info["hostname"]:
-                try:
-                    prompt = conn.find_prompt()
-                    if isinstance(prompt, str):
-                        info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
-                except Exception:
-                    pass
+                prompt = self._safe_find_prompt(conn)
+                if prompt:
+                    info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
             return info
 
         self._is_aoscx = False
@@ -119,12 +108,9 @@ class ArubaDriver(BaseDriver):
         if m_ver:
             info["firmware"] = m_ver.group(1)
 
-        try:
-            prompt = conn.find_prompt()
-            if isinstance(prompt, str):
-                info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
-        except Exception:
-            pass
+        prompt = self._safe_find_prompt(conn)
+        if prompt:
+            info["hostname"] = prompt.replace("#", "").replace(">", "").strip()
 
         # Query AP cluster details if IAP
         try:
@@ -136,8 +122,8 @@ class ArubaDriver(BaseDriver):
                         info["hostname"] = parts[0]
                         info["serial"] = parts[9]
                         break
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba show aps failed: %s", self.ip, exc)
 
         return info
 
@@ -178,8 +164,8 @@ class ArubaDriver(BaseDriver):
                             "device_type": "switch",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba show ap debug lldp info failed: %s", self.ip, exc)
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -203,8 +189,8 @@ class ArubaDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(norm_mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba show clients failed: %s", self.ip, exc)
         return arp_entries
 
     def get_optics(self, conn) -> list[dict]:
@@ -242,8 +228,8 @@ class ArubaDriver(BaseDriver):
                         cur_entry["serial"] = m_sn.group(1).strip()
             if cur_port and cur_entry:
                 optics.append(cur_entry)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba show interface transceiver failed: %s", self.ip, exc)
         return optics
 
     def get_running_config(self, conn) -> str:
@@ -252,11 +238,12 @@ class ArubaDriver(BaseDriver):
                 raw = conn.send_command("show running-config")
                 if isinstance(raw, str) and raw.strip() and "Invalid input" not in raw:
                     return raw
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] Aruba AOS-CX show running-config failed: %s", self.ip, exc)
         try:
             return conn.send_command("show configuration")
-        except Exception:
+        except Exception as exc:
+            logger.debug("[%s] Aruba show configuration failed, falling back to show run: %s", self.ip, exc)
             return conn.send_command("show run")
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
@@ -311,8 +298,8 @@ class ArubaDriver(BaseDriver):
                         rec["trunk_allowed_vlans"] = allowed_clean
                         if status_l == "up":
                             rec["trunk_active_vlans"] = allowed_clean
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba AOS-CX show interface trunk failed: %s", self.ip, exc)
 
         try:
             raw_lacp = conn.send_command("show lacp interfaces")
@@ -346,7 +333,7 @@ class ArubaDriver(BaseDriver):
                         rec = ops.setdefault(pname, {})
                         rec["lag_group"] = lag_name.lower()
                         rec["lacp_mode"] = lmode.lower()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] Aruba AOS-CX show lacp interfaces failed: %s", self.ip, exc)
 
         return ops

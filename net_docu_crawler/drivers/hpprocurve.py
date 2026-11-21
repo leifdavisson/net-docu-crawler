@@ -19,11 +19,14 @@ Official Documentation: https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/c
 """
 
 import ipaddress
+import logging
 import re
 
 import oui_lookup
 import parser as cli_parser
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 _BARE_VT100_RE = re.compile(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])")
 
@@ -102,17 +105,7 @@ class HPProCurveDriver(BaseDriver):
     paging_cmd = "no page"
 
     def connect(self):
-        device = {
-            "device_type": "hp_procurve",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "secret": self.secret,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
+        device = self._build_netmiko_params("hp_procurve", secret=self.secret)
         return _CleanProCurveConn(self.connect_netmiko(device))
 
     def get_version(self, conn) -> dict:
@@ -126,20 +119,15 @@ class HPProCurveDriver(BaseDriver):
         }
 
         # Query show system
-        raw_sys = ""
-        try:
-            raw_sys = conn.send_command("show system")
-        except Exception:
-            pass
+        raw_sys = self._safe_send_command(conn, "show system")
 
         m_host = re.search(r"System Name\s*:\s*(\S+)", raw_sys)
         if m_host:
             info["hostname"] = m_host.group(1).strip()
         else:
-            try:
-                info["hostname"] = conn.find_prompt().rstrip(">#").strip()
-            except Exception:
-                pass
+            prompt = self._safe_find_prompt(conn)
+            if prompt:
+                info["hostname"] = prompt.rstrip(">#").strip()
 
         m_fw = re.search(r"Software revision\s*:\s*(\S+)", raw_sys)
         if m_fw:
@@ -163,8 +151,8 @@ class HPProCurveDriver(BaseDriver):
                 m_c = re.search(r"Chassis:\s*([^\r\n]+)", raw_mod)
                 if m_c:
                     info["model"] = f"HP {m_c.group(1).split()[0].strip()}"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show modules failed: %s", self.ip, exc)
 
         return info
 
@@ -205,7 +193,10 @@ class HPProCurveDriver(BaseDriver):
                                         "protocol": "up",
                                     }
                                 )
-                            except Exception:
+                            except ValueError as exc:
+                                logger.debug(
+                                    "[%s] HP ProCurve invalid netmask '%s' on %s: %s", self.ip, mask, vlan_name, exc
+                                )
                                 l3_interfaces.append(
                                     {
                                         "interface": vlan_name,
@@ -214,8 +205,8 @@ class HPProCurveDriver(BaseDriver):
                                         "protocol": "up",
                                     }
                                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show ip failed: %s", self.ip, exc)
 
         # 2. Port descriptions via show name
         port_names = {}
@@ -225,8 +216,8 @@ class HPProCurveDriver(BaseDriver):
                 m_name = re.match(r"^\s*([A-Za-z0-9/]+)\s+\S+\s+(.+)$", line)
                 if m_name and not ("Port" in line or "---" in line):
                     port_names[m_name.group(1).strip()] = m_name.group(2).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show name failed: %s", self.ip, exc)
 
         # 3. Physical port status via show interfaces brief
         try:
@@ -264,8 +255,8 @@ class HPProCurveDriver(BaseDriver):
                         "mac_address": "",
                         "description": port_names.get(port, ""),
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show interfaces brief failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -343,8 +334,8 @@ class HPProCurveDriver(BaseDriver):
                                     "device_type": dev_type,
                                 }
                             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show lldp info remote-device failed: %s", self.ip, exc)
 
         # Enrich with untruncated System Name / PortId from detail output when available
         if neighbors:
@@ -374,8 +365,8 @@ class HPProCurveDriver(BaseDriver):
                                 n["remote_device"] = d_info["sys_name"]
                             if d_info.get("port_id") and not n.get("remote_port"):
                                 n["remote_port"] = d_info["port_id"]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] HP ProCurve show lldp info remote-device detail failed: %s", self.ip, exc)
 
         # 2. Fallback: CDP neighbor detail if LLDP is empty
         if not neighbors:
@@ -419,8 +410,8 @@ class HPProCurveDriver(BaseDriver):
                             curr["device_type"] = "ap"
                 if curr and curr.get("local_port") and curr.get("remote_device"):
                     neighbors.append(curr)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[%s] HP ProCurve show cdp neighbor detail failed: %s", self.ip, exc)
 
         return neighbors
 
@@ -448,8 +439,8 @@ class HPProCurveDriver(BaseDriver):
                             "interface": intf,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show ip route failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -473,8 +464,8 @@ class HPProCurveDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show arp failed: %s", self.ip, exc)
         return arp
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -502,8 +493,8 @@ class HPProCurveDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show mac-address failed: %s", self.ip, exc)
         return mac_table
 
     def get_stp(self, conn) -> dict:
@@ -542,18 +533,16 @@ class HPProCurveDriver(BaseDriver):
                 stp["bridge_id"] = oui_lookup.normalize_mac(m_this.group(1)).lower()
             if stp["root_bridge"] and stp["bridge_id"] and stp["root_bridge"] == stp["bridge_id"]:
                 stp["is_root"] = True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show spanning-tree failed: %s", self.ip, exc)
         return stp
 
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("show running-config")
-        except Exception:
-            try:
-                return conn.send_command("show config")
-            except Exception:
-                return ""
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show running-config failed, trying show config: %s", self.ip, exc)
+            return self._safe_send_command(conn, "show config")
 
     def get_poe(self, conn) -> dict:
         from net_docu_crawler.schema import build_empty_poe_summary
@@ -646,8 +635,8 @@ class HPProCurveDriver(BaseDriver):
                 poe["budget_unreported"] = True
                 if poe["used_power_watts"] == 0.0:
                     poe["used_power_watts"] = round(sum(p.get("draw_watts", 0.0) for p in poe["ports"].values()), 2)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show power-over-ethernet brief failed: %s", self.ip, exc)
         return poe
 
     def get_optics(self, conn) -> list[dict]:
@@ -677,8 +666,8 @@ class HPProCurveDriver(BaseDriver):
                             "status": "present",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show interfaces transceiver failed: %s", self.ip, exc)
         return optics
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
@@ -692,8 +681,8 @@ class HPProCurveDriver(BaseDriver):
                         p, grp, proto = m_tr.group(1), m_tr.group(2), m_tr.group(3)
                         ops.setdefault(p, {})["lag_group"] = grp
                         ops[p]["lacp_mode"] = "active" if "lacp" in proto.lower() else "on"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show trunks failed: %s", self.ip, exc)
 
         try:
             raw_lacp = conn.send_command("show lacp")
@@ -704,8 +693,8 @@ class HPProCurveDriver(BaseDriver):
                         p, grp, mode = m_lc.group(1), m_lc.group(2), m_lc.group(3).lower()
                         ops.setdefault(p, {})["lag_group"] = grp
                         ops[p]["lacp_mode"] = mode
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show lacp failed: %s", self.ip, exc)
 
         try:
             raw_vp = conn.send_command("show vlans ports all")
@@ -770,8 +759,8 @@ class HPProCurveDriver(BaseDriver):
                         rec["encapsulation"] = "dot1q"
                         rec["access_vlan"] = untagged
                         rec["native_vlan_tagged"] = False
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show vlans ports all failed: %s", self.ip, exc)
 
         try:
             raw_stp = conn.send_command("show spanning-tree detail")
@@ -785,8 +774,8 @@ class HPProCurveDriver(BaseDriver):
                         p, state, role = m_st.group(1), m_st.group(2), m_st.group(3)
                         ops.setdefault(p, {})["stp_state"] = state
                         ops[p]["stp_role"] = role
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show spanning-tree detail failed: %s", self.ip, exc)
 
         try:
             raw_auth = conn.send_command("show port-access authenticator")
@@ -795,7 +784,7 @@ class HPProCurveDriver(BaseDriver):
                     m_au = re.match(r"^\s*([A-Za-z]?\d+(?:/\d+)?)\s+(?:Enabled|Active)", line, re.I)
                     if m_au:
                         ops.setdefault(m_au.group(1), {})["auth_policy"] = "dot1x"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] HP ProCurve show port-access authenticator failed: %s", self.ip, exc)
 
         return ops

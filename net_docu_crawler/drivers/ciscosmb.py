@@ -24,10 +24,13 @@ Official Documentation:
 https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html
 """
 
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 
 class CiscoSMBDriver(BaseDriver):
@@ -42,28 +45,17 @@ class CiscoSMBDriver(BaseDriver):
     paging_cmd = "terminal datadump"
 
     def connect(self):
-        device = {
-            "device_type": "cisco_s300",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "secret": self.secret or self.password,
-            "timeout": self.timeout,
-            "conn_timeout": self.timeout,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
+        device = self._build_netmiko_params(
+            "cisco_s300",
+            include_auth_timeout=False,
+            secret=self.secret or self.password,
+            conn_timeout=self.timeout,
+        )
 
         conn = self.connect_netmiko(device)
         if self.secret or self.password:
-            try:
-                conn.enable()
-            except Exception:
-                pass
-        try:
-            conn.send_command(self.paging_cmd)
-        except Exception:
-            pass
+            self._safe_enable(conn)
+        self._safe_send_command(conn, self.paging_cmd)
         return conn
 
     def get_version(self, conn) -> dict:
@@ -91,8 +83,8 @@ class CiscoSMBDriver(BaseDriver):
             m_desc = re.search(r"System Description:\s*(.+)", raw_sys, re.IGNORECASE)
             if m_desc and "cisco" in m_desc.group(1).lower():
                 info["model"] = m_desc.group(1).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show system failed: %s", self.ip, exc)
 
         try:
             raw_id = conn.send_command("show system id")
@@ -102,8 +94,8 @@ class CiscoSMBDriver(BaseDriver):
             m_ser = re.search(r"Serial\s+Number\s*:\s*(\S+)", raw_id, re.IGNORECASE)
             if m_ser:
                 info["serial"] = m_ser.group(1).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show system id failed: %s", self.ip, exc)
 
         try:
             raw_ver = conn.send_command("show version")
@@ -114,8 +106,8 @@ class CiscoSMBDriver(BaseDriver):
                 m_hw = re.search(r"(SG\d+\S*|CBS\d+\S*)", raw_ver, re.IGNORECASE)
                 if m_hw:
                     info["model"] = m_hw.group(1).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show version failed: %s", self.ip, exc)
 
         return info
 
@@ -144,8 +136,8 @@ class CiscoSMBDriver(BaseDriver):
                             "protocol": "up",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show ip interface failed: %s", self.ip, exc)
 
         # 2. Physical Port Status (`show interfaces status`)
         try:
@@ -178,8 +170,8 @@ class CiscoSMBDriver(BaseDriver):
                         "mac_address": "",
                         "description": "",
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show interfaces status failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -220,8 +212,8 @@ class CiscoSMBDriver(BaseDriver):
                             "protocol": "LLDP",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show lldp neighbors failed: %s", self.ip, exc)
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -245,8 +237,8 @@ class CiscoSMBDriver(BaseDriver):
                             "interface": iface or "",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show ip route failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -267,8 +259,8 @@ class CiscoSMBDriver(BaseDriver):
                             "interface": iface,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show arp failed: %s", self.ip, exc)
         return arp
 
     def get_stp(self, conn) -> dict:
@@ -279,8 +271,8 @@ class CiscoSMBDriver(BaseDriver):
                 stp["enabled"] = True
             if re.search(r"This\s+bridge\s+is\s+(?:the\s+)?root", raw, re.IGNORECASE):
                 stp["is_root"] = True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show spanning-tree failed: %s", self.ip, exc)
         return stp
 
     def get_poe(self, conn) -> dict:
@@ -301,8 +293,8 @@ class CiscoSMBDriver(BaseDriver):
                     w_val = float(watts)
                     if w_val > 0:
                         poe["ports"][port] = {"status": "delivering", "power_watts": w_val}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show power inline failed: %s", self.ip, exc)
         return poe
 
     def get_mac_table(self, conn) -> list[dict]:
@@ -324,8 +316,8 @@ class CiscoSMBDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show mac address-table failed: %s", self.ip, exc)
         return macs
 
     def get_optics(self, conn) -> list[dict]:
@@ -342,15 +334,12 @@ class CiscoSMBDriver(BaseDriver):
                             "status": "present",
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show fiber-ports optical-transceiver failed: %s", self.ip, exc)
         return optics
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("show running-config")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "show running-config")
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
         ops: dict[str, dict] = {}
@@ -434,8 +423,8 @@ class CiscoSMBDriver(BaseDriver):
                             if vid not in bucket:
                                 bucket.append(vid)
                 _flush_port()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show interfaces switchport failed: %s", self.ip, exc)
 
         try:
             raw_pc = conn.send_command("show interfaces port-channel")
@@ -454,7 +443,7 @@ class CiscoSMBDriver(BaseDriver):
                             if pname:
                                 ops.setdefault(pname, {})["lag_group"] = po_name
                                 ops[pname]["lacp_mode"] = "active"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] CiscoSMB show interfaces port-channel failed: %s", self.ip, exc)
 
         return ops

@@ -18,10 +18,14 @@ Abstract Base Driver for Net-Docu-Crawler multi-vendor discovery architecture.
 Defines normalized device schema and interface contract across all network hardware platforms.
 """
 
+import json
+import logging
 import re
 from abc import ABC, abstractmethod
 
 from net_docu_crawler.drivers.detector import get_mac_from_system_arp
+
+logger = logging.getLogger(__name__)
 
 
 def extract_services_from_config(raw_config: str) -> dict:
@@ -271,6 +275,78 @@ class BaseDriver(ABC):
         self.session_log = session_log
         self.transport = (transport or "ssh").lower()
         self.port = port if port is not None else (23 if self.transport == "telnet" else 22)
+
+    def _driver_logger(self) -> logging.Logger:
+        """Return the module-scoped logger for this driver subclass."""
+        return logging.getLogger(self.__class__.__module__)
+
+    def _log_cmd_failure(self, command: str, exc: Exception, *, context: str = "") -> None:
+        """Emit a structured debug log entry when a read-only CLI command or parser fails."""
+        prefix = f"{context} " if context else ""
+        self._driver_logger().debug("[%s] %s'%s' failed: %s", self.ip, prefix, command, exc)
+
+    def _build_netmiko_params(
+        self,
+        device_type: str,
+        *,
+        include_auth_timeout: bool = True,
+        **extra,
+    ) -> dict:
+        """Build standard Netmiko connection parameters shared across vendor drivers."""
+        device = {
+            "device_type": device_type,
+            "ip": self.ip,
+            "username": self.username,
+            "password": self.password,
+            "timeout": self.timeout,
+        }
+        if include_auth_timeout:
+            device["auth_timeout"] = self.timeout
+        device.update(extra)
+        if self.session_log:
+            device["session_log"] = self.session_log
+        return device
+
+    def _safe_enable(self, conn) -> bool:
+        """Attempt privileged exec elevation, logging failures at debug level."""
+        try:
+            conn.enable()
+            return True
+        except Exception as exc:
+            self._log_cmd_failure("enable", exc, context="privileged mode")
+            return False
+
+    def _safe_find_prompt(self, conn, default: str = "") -> str:
+        """Read the device CLI prompt safely, returning default on transport error."""
+        try:
+            prompt = conn.find_prompt()
+            return prompt if isinstance(prompt, str) else default
+        except Exception as exc:
+            self._log_cmd_failure("find_prompt", exc)
+            return default
+
+    def _safe_send_command(self, conn, command: str, default: str = "") -> str:
+        """Execute a read-only CLI command and return default on transport/command failure."""
+        try:
+            return conn.send_command(command)
+        except Exception as exc:
+            self._log_cmd_failure(command, exc)
+            return default
+
+    def _safe_send_json(self, conn, command: str):
+        """Execute a read-only JSON CLI command and parse its payload, returning None on failure."""
+        try:
+            raw = conn.send_command(command)
+        except Exception as exc:
+            self._log_cmd_failure(command, exc)
+            return None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            self._log_cmd_failure(command, exc, context="JSON parse")
+            return None
 
     @staticmethod
     def safe_netmiko_connect(device_params: dict):

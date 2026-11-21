@@ -33,7 +33,7 @@ from net_docu_crawler.drivers.openwrt import OpenWrtDriver
 from net_docu_crawler.drivers.opnsense import OPNsenseDriver
 from net_docu_crawler.drivers.paloalto import PaloAltoDriver
 
-# Registry mapping vendor string to driver class
+# Registry mapping vendor string to driver class (single source of truth)
 DRIVER_REGISTRY: dict[str, type[BaseDriver]] = {
     "cisco": CiscoDriver,
     "ciscosmb": CiscoSMBDriver,
@@ -55,6 +55,41 @@ DRIVER_REGISTRY: dict[str, type[BaseDriver]] = {
     "opnsense": OPNsenseDriver,
     "openwrt": OpenWrtDriver,
 }
+
+# Canonical alias used by crawler and external callers/tests
+VENDOR_DRIVER_MAP: dict[str, type[BaseDriver]] = DRIVER_REGISTRY
+
+# Reverse mapping from driver class to canonical vendor key
+DRIVER_VENDOR_MAP: dict[type[BaseDriver], str] = {
+    CiscoDriver: "cisco",
+    CiscoSMBDriver: "ciscosmb",
+    AristaDriver: "arista",
+    JuniperDriver: "juniper",
+    FortinetDriver: "fortinet",
+    ArubaDriver: "aruba",
+    HPProCurveDriver: "hpprocurve",
+    PaloAltoDriver: "paloalto",
+    MikroTikDriver: "mikrotik",
+    OPNsenseDriver: "opnsense",
+    OpenWrtDriver: "openwrt",
+    FRRDriver: "frrouting",
+}
+
+
+def resolve_driver_for_vendor(
+    vendor: str | None,
+    default: type[BaseDriver] | None = None,
+) -> type[BaseDriver] | None:
+    """Resolve a vendor identifier or alias to its registered `BaseDriver` subclass."""
+    norm = (vendor or "").strip().lower()
+    if not norm:
+        return default
+    return DRIVER_REGISTRY.get(norm, default)
+
+
+def resolve_vendor_for_driver(driver_cls: type[BaseDriver]) -> str:
+    """Return the canonical vendor identifier for a `BaseDriver` subclass."""
+    return DRIVER_VENDOR_MAP.get(driver_cls, "")
 
 
 def get_driver(
@@ -82,7 +117,7 @@ def get_driver(
         vendor = detected_vendor
 
     # Default fallback to CiscoDriver if unknown (preserves legacy behavior safely)
-    driver_cls = DRIVER_REGISTRY.get(vendor, CiscoDriver)
+    driver_cls = resolve_driver_for_vendor(vendor, default=CiscoDriver) or CiscoDriver
     return driver_cls(
         ip=ip,
         username=username,
@@ -97,6 +132,7 @@ def get_driver(
 __all__ = [
     "BaseDriver",
     "CiscoDriver",
+    "CiscoSMBDriver",
     "JuniperDriver",
     "ArubaDriver",
     "PaloAltoDriver",
@@ -108,5 +144,9 @@ __all__ = [
     "OPNsenseDriver",
     "OpenWrtDriver",
     "DRIVER_REGISTRY",
+    "VENDOR_DRIVER_MAP",
+    "DRIVER_VENDOR_MAP",
+    "resolve_driver_for_vendor",
+    "resolve_vendor_for_driver",
     "get_driver",
 ]

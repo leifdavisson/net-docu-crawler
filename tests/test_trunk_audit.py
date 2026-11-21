@@ -24,7 +24,16 @@ import pytest
 from net_docu_crawler.topology_resolver import DeviceRegistry
 from net_docu_crawler.trunk_audit import (
     CSV_COLUMNS,
+    TrunkDiscrepancySpec,
+    TrunkEdgeContext,
     TrunkPortState,
+    _build_audit_summary,
+    _check_allowed_vlan_asymmetry,
+    _check_native_tagging_mismatch,
+    _check_native_vlan_mismatch,
+    _check_oper_mode_mismatch,
+    _record_discrepancy,
+    _TrunkAuditStats,
     canonicalize_interface_full,
     evaluate_trunk_mismatches,
     expand_vlan_spec,
@@ -740,3 +749,121 @@ def test_asymmetric_discovery_raw_and_reconciled_inferred() -> None:
     rules_rec = [d["rule_id"] for d in audit_reconciled["findings"][0]["discrepancies"]]
     assert "WARN_ASYMMETRIC_DISCOVERY" in rules_rec
     assert "TRK-004" in rules_rec
+
+
+def test_typed_discrepancy_spec_and_record_discrepancy_contract() -> None:
+    """Verify `TrunkDiscrepancySpec` + `_record_discrepancy` schema parity and counter aggregation."""
+    edge = TrunkEdgeContext(
+        edge_id="core-01:Port-channel1<->dist-01:ae0",
+        side_a_host="core-01",
+        side_a_port="Port-channel1",
+        side_b_host="dist-01",
+        side_b_port="ae0",
+    )
+    spec = TrunkDiscrepancySpec(
+        edge=edge,
+        rule_id="TRK-004",
+        severity="HIGH",
+        message="Allowed VLAN mismatch on uplink.",
+        remediation_hint="Synchronize allowed VLANs.",
+        side_a_only_vlans=[10, 11, 12],
+        side_b_only_vlans=[50],
+    )
+    discrepancies: list[dict] = []
+    stats = _TrunkAuditStats(total_trunk_ports=2, evaluated_edges=1, matched_edges=1, mismatched_edges=1)
+
+    recorded = _record_discrepancy(spec, discrepancies, stats)
+    assert recorded == {
+        "rule_id": "TRK-004",
+        "severity": "HIGH",
+        "message": "Allowed VLAN mismatch on uplink.",
+        "side_a_only_vlans": [10, 11, 12],
+        "side_b_only_vlans": [50],
+        "remediation_hint": "Synchronize allowed VLANs.",
+    }
+    assert len(discrepancies) == 1
+    assert len(stats.csv_rows) == 1
+    csv_row = stats.csv_rows[0]
+    assert tuple(csv_row.keys()) == CSV_COLUMNS
+    assert csv_row["Side_A_Only_VLANs"] == "10-12"
+    assert csv_row["Side_B_Only_VLANs"] == "50"
+
+    summary = _build_audit_summary(stats)
+    assert summary["high_count"] == 1
+    assert summary["total_discrepancies"] == 1
+    assert summary["by_rule"] == {"TRK-004": 1}
+
+
+def test_single_link_discrepancy_helpers_and_routed_p2p_skip() -> None:
+    """Verify decomposed single-link rule helpers and pure L3 routed link exclusion."""
+    st_a = TrunkPortState(
+        device_hostname="sw-a",
+        device_mgmt_ip="10.0.0.1",
+        vendor="cisco_ios",
+        interface_name="GigabitEthernet1/0/1",
+        admin_mode="trunk",
+        oper_mode="trunk",
+        native_vlan=10,
+        native_vlan_tagged=False,
+        allowed_vlans={10, 20, 30},
+        active_vlans={10, 20, 30},
+    )
+    st_b = TrunkPortState(
+        device_hostname="sw-b",
+        device_mgmt_ip="10.0.0.2",
+        vendor="juniper_junos",
+        interface_name="ge-0/0/1",
+        admin_mode="trunk",
+        oper_mode="access",
+        native_vlan=20,
+        native_vlan_tagged=True,
+        allowed_vlans={20, 40},
+        active_vlans={20, 40},
+    )
+    edge = TrunkEdgeContext(
+        edge_id="sw-a:GigabitEthernet1/0/1<->sw-b:ge-0/0/1",
+        side_a_host="sw-a",
+        side_a_port="GigabitEthernet1/0/1",
+        side_b_host="sw-b",
+        side_b_port="ge-0/0/1",
+        state_a=st_a,
+        state_b=st_b,
+    )
+
+    assert _check_oper_mode_mismatch(edge, is_qinq_edge=False) is not None
+    nat_spec = _check_native_vlan_mismatch(edge)
+    assert nat_spec is not None and nat_spec.side_a_only_vlans == [10] and nat_spec.side_b_only_vlans == [20]
+    assert _check_native_tagging_mismatch(edge) is not None
+    allowed_spec = _check_allowed_vlan_asymmetry(edge)
+    assert (
+        allowed_spec is not None
+        and allowed_spec.side_a_only_vlans == [10, 30]
+        and allowed_spec.side_b_only_vlans == [40]
+    )
+
+    # Pure L3 routed point-to-point links without 802.1Q subinterfaces must be skipped
+    rtr_a = {
+        "hostname": "rtr-a",
+        "ip": "172.16.0.1",
+        "vendor": "Cisco",
+        "os_type": "cisco_ios",
+        "device_type": "router",
+        "port_profiles": {"Gi0/0": {"mode": "routed", "admin_mode": "routed", "oper_mode": "routed"}},
+        "neighbors": [
+            {"local_port": "Gi0/0", "remote_device": "rtr-b", "remote_port": "Gi0/0", "device_type": "router"}
+        ],
+    }
+    rtr_b = {
+        "hostname": "rtr-b",
+        "ip": "172.16.0.2",
+        "vendor": "Cisco",
+        "os_type": "cisco_ios",
+        "device_type": "router",
+        "port_profiles": {"Gi0/0": {"mode": "routed", "admin_mode": "routed", "oper_mode": "routed"}},
+        "neighbors": [
+            {"local_port": "Gi0/0", "remote_device": "rtr-a", "remote_port": "Gi0/0", "device_type": "router"}
+        ],
+    }
+    routed_audit = evaluate_trunk_mismatches([rtr_a, rtr_b])
+    assert routed_audit["summary"]["evaluated_edges"] == 0
+    assert routed_audit["findings"] == []

@@ -18,10 +18,13 @@ Fortinet Driver: FortiGate Firewalls running FortiOS.
 Official Documentation: https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference
 """
 
+import logging
 import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+
+logger = logging.getLogger(__name__)
 
 FORTIOS_VIRTUAL_PSEUDO_PREFIXES = ("naf.", "l2t.", "ssl.", "vsw.", "npu")
 
@@ -39,19 +42,8 @@ class FortinetDriver(BaseDriver):
     paging_cmd = "config system console\nset output standard\nend"
 
     def connect(self):
-        device = {
-            "device_type": "fortinet",
-            "ip": self.ip,
-            "username": self.username,
-            "password": self.password,
-            "timeout": self.timeout,
-            "auth_timeout": self.timeout,
-            "global_delay_factor": 2,
-        }
-        if self.session_log:
-            device["session_log"] = self.session_log
-        conn = self.connect_netmiko(device)
-        return conn
+        device = self._build_netmiko_params("fortinet", global_delay_factor=2)
+        return self.connect_netmiko(device)
 
     def get_version(self, conn) -> dict:
         info = {
@@ -76,8 +68,8 @@ class FortinetDriver(BaseDriver):
             m_sn = re.search(r"Serial-Number:\s*(\S+)", raw)
             if m_sn:
                 info["serial"] = m_sn.group(1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FortiOS get system status failed: %s", self.ip, exc)
 
         if not info["hostname"]:
             prompt = conn.find_prompt()
@@ -147,8 +139,8 @@ class FortinetDriver(BaseDriver):
                 elif "set status down" in line and current_intf:
                     interfaces_detail[current_intf]["status"] = "down"
                     interfaces_detail[current_intf]["protocol"] = "down"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FortiOS show system interface failed: %s", self.ip, exc)
 
         return l3_interfaces, interfaces_detail
 
@@ -199,8 +191,8 @@ class FortinetDriver(BaseDriver):
                 parsed = self._parse_lldp_blocks(raw)
                 if parsed:
                     return parsed
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.debug("[%s] FortiOS LLDP command '%s' failed: %s", self.ip, cmd, exc)
         return []
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -225,8 +217,8 @@ class FortinetDriver(BaseDriver):
                             "protocol": proto,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FortiOS get router info routing-table all failed: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -249,8 +241,8 @@ class FortinetDriver(BaseDriver):
                             "vendor": oui_lookup.lookup_oui(mac),
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FortiOS get system arp failed: %s", self.ip, exc)
         return arp_entries
 
     def get_optics(self, conn) -> list[dict]:
@@ -286,12 +278,9 @@ class FortinetDriver(BaseDriver):
                         cur_entry["serial"] = m_sn.group(1).strip()
             if cur_entry:
                 optics.append(cur_entry)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[%s] FortiOS get system interface transceiver failed: %s", self.ip, exc)
         return optics
 
     def get_running_config(self, conn) -> str:
-        try:
-            return conn.send_command("show full-configuration")
-        except Exception:
-            return ""
+        return self._safe_send_command(conn, "show full-configuration")

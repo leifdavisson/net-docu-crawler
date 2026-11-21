@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -23,6 +24,7 @@ Cascades across:
 """
 
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -32,6 +34,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import oui_lookup
+
+logger = logging.getLogger(__name__)
 
 # Virtual NIC OUIs assigned by hypervisors (Proxmox, QEMU/KVM, VMware, VirtualBox, Hyper-V, Xen).
 # A virtual NIC MAC identifies the hypervisor, NOT the guest network OS, so Tier 1 must cascade to Tier 2.
@@ -61,7 +65,8 @@ def probe_tcp_port(ip: str, port: int, timeout: float = 0.8) -> bool:
     s.settimeout(timeout)
     try:
         return s.connect_ex((ip, port)) == 0
-    except Exception:
+    except OSError as exc:
+        logger.debug("TCP port probe failed for %s:%d: %s", ip, port, exc)
         return False
     finally:
         s.close()
@@ -109,9 +114,19 @@ def scan_subnet_ports(
                 open_ports = fut.result()
                 if open_ports:
                     results[ip] = open_ports
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Subnet port scan worker failed for %s: %s", ip, exc)
     return results
+
+
+def _is_valid_arp_unicast_ipv4(ip_addr: str) -> bool:
+    """Returns True when ``ip_addr`` is a valid non-loopback, non-multicast IPv4 address."""
+    try:
+        ip_obj = ipaddress.IPv4Address(ip_addr)
+    except ValueError as exc:
+        logger.debug("Skipping malformed ARP IPv4 entry %r: %s", ip_addr, exc)
+        return False
+    return not (ip_obj.is_multicast or ip_obj.is_loopback)
 
 
 def get_arp_table_entries() -> dict[str, str]:
@@ -130,15 +145,11 @@ def get_arp_table_entries() -> dict[str, str]:
                     ip_addr, mac = parts[0], parts[3].lower()
                     if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                         continue
-                    try:
-                        ip_obj = ipaddress.IPv4Address(ip_addr)
-                        if ip_obj.is_multicast or ip_obj.is_loopback:
-                            continue
-                    except ValueError:
+                    if not _is_valid_arp_unicast_ipv4(ip_addr):
                         continue
                     entries[ip_addr] = mac
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Unable to read /proc/net/arp: %s", exc)
     elif sys.platform == "win32":
         try:
             out = subprocess.check_output(["arp", "-a"], text=True, timeout=3, errors="ignore")
@@ -149,16 +160,48 @@ def get_arp_table_entries() -> dict[str, str]:
                 ip_addr, mac = m.group(1), m.group(2).replace("-", ":").lower()
                 if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                     continue
-                try:
-                    ip_obj = ipaddress.IPv4Address(ip_addr)
-                    if ip_obj.is_multicast or ip_obj.is_loopback:
-                        continue
-                except ValueError:
+                if not _is_valid_arp_unicast_ipv4(ip_addr):
                     continue
                 entries[ip_addr] = mac
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Windows arp -a cache lookup failed: %s", exc)
     return entries
+
+
+def _build_unverified_probe_tls_context() -> ssl.SSLContext:
+    """
+    Constructs an isolated TLS client context strictly for unauthenticated, read-only
+    banner and X.509 ``CommonName`` fingerprinting in ``probe_http_fingerprint()``.
+
+    Security Boundary: Network appliances (switches, wireless APs, firewalls, printers,
+    and iDRAC/iLO BMCs) overwhelmingly serve self-signed or device-serial certificates
+    on RFC 1918 management IPs. ``ssl.CERT_NONE`` is intentionally confined to this
+    helper; zero credentials, session cookies, or state-changing payloads are ever
+    transmitted over this socket.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # nosec B501 - strictly unauthenticated read-only banner/cert CN probe
+    return ctx
+
+
+def _extract_peer_cert_cn(tls_sock: ssl.SSLSocket, ip: str, port: int) -> str:
+    """Extracts the X.509 Subject CommonName from an unverified appliance TLS handshake."""
+    try:
+        der_cert = tls_sock.getpeercert(binary_form=True)
+        if not der_cert:
+            return ""
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der_cert)
+        cn_attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+        if cn_attrs:
+            cert_cn = str(cn_attrs[0].value).strip()
+            logger.debug("Extracted unverified TLS peer certificate CN=%r from %s:%d", cert_cn, ip, port)
+            return cert_cn
+    except (ssl.SSLError, ValueError, OSError) as exc:
+        logger.debug("Failed parsing X.509 peer certificate on %s:%d: %s", ip, port, exc)
+    return ""
 
 
 def probe_http_fingerprint(
@@ -179,25 +222,15 @@ def probe_http_fingerprint(
         cert_cn = ""
         raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw_sock.settimeout(timeout)
-        conn_sock = raw_sock
+        conn_sock: socket.socket = raw_sock
         try:
             raw_sock.connect((ip, port))
             if scheme == "https":
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                conn_sock = ctx.wrap_socket(raw_sock, server_hostname=ip)
-                try:
-                    der_cert = conn_sock.getpeercert(binary_form=True)
-                    if der_cert:
-                        from cryptography import x509
-
-                        cert = x509.load_der_x509_certificate(der_cert)
-                        cn_attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-                        if cn_attrs:
-                            cert_cn = str(cn_attrs[0].value).strip()
-                except Exception:
-                    pass
+                logger.debug("Performing unverified read-only HTTPS fingerprint probe on %s:%d", ip, port)
+                ctx = _build_unverified_probe_tls_context()
+                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=ip)
+                conn_sock = tls_sock
+                cert_cn = _extract_peer_cert_cn(tls_sock, ip, port)
             req = f"GET / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode("ascii")
             conn_sock.sendall(req)
             chunks = []
@@ -205,7 +238,8 @@ def probe_http_fingerprint(
             while total < 8192:
                 try:
                     data = conn_sock.recv(2048)
-                except TimeoutError:
+                except TimeoutError as exc:
+                    logger.debug("HTTP fingerprint read timed out after %d bytes on %s:%d: %s", total, ip, port, exc)
                     break
                 if not data:
                     break
@@ -225,13 +259,13 @@ def probe_http_fingerprint(
                 "title": title,
                 "cert_cn": cert_cn,
             }
-        except Exception:
-            continue
+        except (OSError, ssl.SSLError) as exc:
+            logger.debug("HTTP/HTTPS fingerprint probe failed on %s:%d: %s", ip, port, exc)
         finally:
             try:
                 conn_sock.close()
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HTTP fingerprint probe socket on %s:%d: %s", ip, port, exc)
     return None
 
 
@@ -291,8 +325,8 @@ def probe_appliance_ports(ip: str, timeout: float = 0.25) -> list[int]:
         try:
             if sock.connect_ex((ip, port)) == 0:
                 open_ports.append(port)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Appliance port probe failed for %s:%d: %s", ip, port, exc)
         finally:
             sock.close()
     return open_ports
@@ -443,7 +477,8 @@ def probe_snmp_sysinfo(
             "sysDescr": values[0] if len(values) >= 1 else "",
             "sysName": values[1] if len(values) >= 2 else "",
         }
-    except Exception:
+    except OSError as exc:
+        logger.debug("SNMPv2c sysinfo probe failed on %s:%d: %s", ip, port, exc)
         return None
     finally:
         sock.close()
@@ -460,8 +495,8 @@ def get_ssh_banner(ip: str, port: int = 22, timeout: float = 3.0) -> str:
         # Keep only the RFC 4253 SSH identification line; discard trailing binary KEXINIT bytes.
         raw_line = raw.split(b"\n", 1)[0].split(b"\r", 1)[0]
         banner = raw_line.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.debug("SSH pre-auth banner read failed on %s:%d: %s", ip, port, exc)
     finally:
         s.close()
     return banner
@@ -488,7 +523,8 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
                 # If only IAC bytes arrived, decline options so server sends banner
                 if all(b >= 240 or b in (1, 3, 24, 31, 32, 33, 34, 35, 36, 39) for b in chunk[:6]):
                     s.sendall(b"\xff\xfc\x18\xff\xfc\x1f\r\n")
-            except TimeoutError:
+            except TimeoutError as exc:
+                logger.debug("Telnet banner chunk read timed out on %s:%d: %s", ip, port, exc)
                 break
         # Strip 3-byte Telnet IAC commands (0xFF, cmd, opt) and 2-byte commands
         cleaned = bytearray()
@@ -505,8 +541,8 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
                 i += 1
         banner = cleaned.decode("utf-8", errors="ignore")
         banner = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", banner).strip()
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.debug("Telnet banner probe failed on %s:%d: %s", ip, port, exc)
     finally:
         s.close()
     return banner
@@ -524,8 +560,8 @@ def get_mac_from_system_arp(ip: str) -> str:
                         mac = parts[3]
                         if mac != "00:00:00:00:00:00":
                             return mac.lower()
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug("Failed reading /proc/net/arp for %s: %s", ip, exc)
 
     # 2. Windows / macOS / BSD system ARP cache table
     try:
@@ -540,10 +576,78 @@ def get_mac_from_system_arp(ip: str) -> str:
                     )
                     if m:
                         return oui_lookup.normalize_mac(m.group(1)).lower()
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("System arp command lookup failed for %s: %s", ip, exc)
 
     return ""
+
+
+def _match_vendor_from_oui(vendor_oui: str) -> str:
+    """Maps a normalized IEEE OUI vendor name string to a canonical driver candidate key."""
+    if "cisco" in vendor_oui:
+        return "cisco"
+    if "juniper" in vendor_oui:
+        return "juniper"
+    if any(h in vendor_oui for h in ("hewlett packard", "procurve")):
+        return "hpprocurve"
+    if any(h in vendor_oui for h in ("aruba", "hpe")):
+        return "aruba"
+    if "palo alto" in vendor_oui:
+        return "paloalto"
+    if "fortinet" in vendor_oui:
+        return "fortinet"
+    if "arista" in vendor_oui:
+        return "arista"
+    if "mikrotik" in vendor_oui:
+        return "mikrotik"
+    return "unknown"
+
+
+def _match_vendor_from_banner(banner_lower: str, current_candidate: str) -> str:
+    """Refines or classifies a vendor candidate from a lowercase SSH/Telnet banner string."""
+    if any(
+        k in banner_lower
+        for k in (
+            "sg300",
+            "sg350",
+            "sg500",
+            "cbs250",
+            "cbs350",
+            "cisco small business",
+            "cisco_s300",
+            "openssh_7.3p1.rl",
+        )
+    ) or banner_lower.endswith(".rl"):
+        return "ciscosmb"
+
+    if current_candidate != "unknown":
+        return current_candidate
+
+    if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
+        return "hpprocurve"
+    if "cisco" in banner_lower or "user access verification" in banner_lower:
+        return "cisco"
+    if "aruba" in banner_lower:
+        return "aruba"
+    if "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
+        return "fortinet"
+    if "junos" in banner_lower or "juniper" in banner_lower:
+        return "juniper"
+    if "panos" in banner_lower or "paloalto" in banner_lower:
+        return "paloalto"
+    if "rosssh" in banner_lower or "mikrotik" in banner_lower:
+        return "mikrotik"
+    if "arista" in banner_lower:
+        return "arista"
+    if "debian" in banner_lower or "ubuntu" in banner_lower:
+        return "frrouting"
+    if "freebsd" in banner_lower or "opnsense" in banner_lower:
+        return "opnsense"
+    if "dropbear" in banner_lower or "openwrt" in banner_lower:
+        return "openwrt"
+    if "crestron" in banner_lower or "openssh_for_windows" in banner_lower:
+        return "unsupported_appliance"
+    return "unknown"
 
 
 def detect_vendor_range(
@@ -564,23 +668,7 @@ def detect_vendor_range(
         mac = get_mac_from_system_arp(ip)
 
     if mac and not is_hypervisor_mac(mac):
-        vendor_oui = oui_lookup.lookup_oui(mac).lower()
-        if "cisco" in vendor_oui:
-            candidate = "cisco"
-        elif "juniper" in vendor_oui:
-            candidate = "juniper"
-        elif any(h in vendor_oui for h in ["hewlett packard", "procurve"]):
-            candidate = "hpprocurve"
-        elif any(h in vendor_oui for h in ["aruba", "hpe"]):
-            candidate = "aruba"
-        elif "palo alto" in vendor_oui:
-            candidate = "paloalto"
-        elif "fortinet" in vendor_oui:
-            candidate = "fortinet"
-        elif "arista" in vendor_oui:
-            candidate = "arista"
-        elif "mikrotik" in vendor_oui:
-            candidate = "mikrotik"
+        candidate = _match_vendor_from_oui(oui_lookup.lookup_oui(mac).lower())
 
     # Tier 2: Transport Banner inspection (runs when MAC is unknown, across an L3 gateway,
     # on a VM NIC, or to refine generic Cisco OUI matches into Cisco Small Business)
@@ -590,47 +678,7 @@ def detect_vendor_range(
             banner = get_telnet_banner(ip, port=port, timeout=timeout)
         else:
             banner = get_ssh_banner(ip, port=port, timeout=timeout)
-        banner_lower = banner.lower()
-
-        if any(
-            k in banner_lower
-            for k in (
-                "sg300",
-                "sg350",
-                "sg500",
-                "cbs250",
-                "cbs350",
-                "cisco small business",
-                "cisco_s300",
-                "openssh_7.3p1.rl",
-            )
-        ) or banner_lower.endswith(".rl"):
-            candidate = "ciscosmb"
-        elif candidate == "unknown":
-            if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
-                candidate = "hpprocurve"
-            elif "cisco" in banner_lower or "user access verification" in banner_lower:
-                candidate = "cisco"
-            elif "aruba" in banner_lower:
-                candidate = "aruba"
-            elif "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
-                candidate = "fortinet"
-            elif "junos" in banner_lower or "juniper" in banner_lower:
-                candidate = "juniper"
-            elif "panos" in banner_lower or "paloalto" in banner_lower:
-                candidate = "paloalto"
-            elif "rosssh" in banner_lower or "mikrotik" in banner_lower:
-                candidate = "mikrotik"
-            elif "arista" in banner_lower:
-                candidate = "arista"
-            elif "debian" in banner_lower or "ubuntu" in banner_lower:
-                candidate = "frrouting"
-            elif "freebsd" in banner_lower or "opnsense" in banner_lower:
-                candidate = "opnsense"
-            elif "dropbear" in banner_lower or "openwrt" in banner_lower:
-                candidate = "openwrt"
-            elif "crestron" in banner_lower or "openssh_for_windows" in banner_lower:
-                candidate = "unsupported_appliance"
+        candidate = _match_vendor_from_banner(banner.lower(), candidate)
 
     return candidate, banner
 

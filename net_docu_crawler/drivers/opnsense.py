@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -16,10 +17,17 @@
 """
 OPNsense Driver: Next-generation open-source firewalls based on FreeBSD.
 Parses system details, ifconfig interfaces, routing table, ARP table, and config.xml.
-Official Documentation: https://docs.opnsense.org/
+
+Official Upstream Documentation & References:
+- OPNsense: https://docs.opnsense.org/
+- Paramiko: https://www.paramiko.org/
 """
 
+import base64
+import hashlib
 import json
+import logging
+import os
 import re
 
 import paramiko
@@ -27,7 +35,48 @@ import paramiko
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
 
+logger = logging.getLogger(__name__)
+
 OPNSENSE_PSEUDO_INTERFACES = ("lo", "enc", "pflog", "pfsync")
+_STRICT_HOST_KEY_ENV_VAR = "NDC_STRICT_HOST_KEYS"
+
+
+def _format_host_key_fingerprint(key: paramiko.PKey) -> str:
+    """Computes an OpenSSH-style ``SHA256:<base64>`` host-key fingerprint for audit logs."""
+    try:
+        raw_bytes = key.asbytes()
+        if isinstance(raw_bytes, (bytes, bytearray)):
+            digest = base64.b64encode(hashlib.sha256(raw_bytes).digest()).decode("ascii").rstrip("=")
+            return f"SHA256:{digest}"
+    except (OSError, TypeError, ValueError, AttributeError) as exc:
+        logger.debug("Unable to compute SSH host-key SHA-256 fingerprint: %s", exc)
+    return "SHA256:unavailable"
+
+
+class AuditedMissingHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """
+    Explicit host-key policy for read-only discovery of unprovisioned/ephemeral network
+    appliances not yet recorded in system ``known_hosts``.
+
+    Unlike ``paramiko.AutoAddPolicy``, this policy NEVER mutates or persists untrusted
+    host keys into ``SSHClient``'s host-key store, and always emits a structured warning
+    recording the peer hostname, algorithm, and SHA-256 fingerprint. Known hosts loaded
+    via ``load_system_host_keys()`` are still strictly verified against key changes by
+    Paramiko before this policy is ever consulted; set ``strict_host_key_checking=True``
+    or ``NDC_STRICT_HOST_KEYS=1`` to enforce ``paramiko.RejectPolicy()`` for unknown hosts.
+    """
+
+    def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
+        key_type = key.get_name() if hasattr(key, "get_name") else "unknown"
+        fingerprint = _format_host_key_fingerprint(key)
+        logger.warning(
+            "Unverified SSH host key for %s (%s %s) during read-only OPNsense discovery; "
+            "set strict_host_key_checking=True or %s=1 to reject unknown hosts.",
+            hostname,
+            key_type,
+            fingerprint,
+            _STRICT_HOST_KEY_ENV_VAR,
+        )
 
 
 class OPNsenseSSHConnection:
@@ -44,8 +93,8 @@ class OPNsenseSSHConnection:
             try:
                 with open(self.session_log, "a", encoding="utf-8") as f:
                     f.write(f"\n--- COMMAND: {cmd} ---\n{output}\n")
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.debug("Failed writing OPNsense session log %s: %s", self.session_log, exc)
         return output
 
     def disconnect(self):
@@ -63,11 +112,52 @@ class OPNsenseDriver(BaseDriver):
     default_device_type = "firewall"
     paging_cmd = ""
 
+    def __init__(
+        self,
+        ip: str,
+        username: str = "",
+        password: str = "",
+        secret: str = "",
+        timeout: int = 10,
+        session_log: str = "",
+        port: int | None = None,
+        transport: str = "ssh",
+        strict_host_key_checking: bool | None = None,
+        known_hosts_path: str | None = None,
+    ):
+        super().__init__(
+            ip=ip,
+            username=username,
+            password=password,
+            secret=secret,
+            timeout=timeout,
+            session_log=session_log,
+            port=port,
+            transport=transport,
+        )
+        if strict_host_key_checking is None:
+            env_val = os.environ.get(_STRICT_HOST_KEY_ENV_VAR, "").strip().lower()
+            strict_host_key_checking = env_val in {"1", "true", "yes", "on"}
+        self.strict_host_key_checking = strict_host_key_checking
+        self.known_hosts_path = known_hosts_path
+
     def connect(self):
         from net_docu_crawler.ssh_compat import connect_paramiko_with_fallback
 
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.load_system_host_keys()
+        except OSError as exc:
+            logger.warning("Unable to load system SSH known_hosts for OPNsense target %s: %s", self.ip, exc)
+
+        if self.known_hosts_path:
+            client.load_host_keys(self.known_hosts_path)
+
+        if self.strict_host_key_checking:
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            client.set_missing_host_key_policy(AuditedMissingHostKeyPolicy())
+
         connect_paramiko_with_fallback(
             client,
             hostname=self.ip,
@@ -93,15 +183,15 @@ class OPNsenseDriver(BaseDriver):
             h = conn.send_command("hostname").strip()
             if h:
                 info["hostname"] = h
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("OPNsense hostname query failed on %s: %s", self.ip, exc)
 
         try:
             raw_ver = conn.send_command("opnsense-version").strip()
             if raw_ver:
                 info["firmware"] = raw_ver
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("OPNsense firmware version query failed on %s: %s", self.ip, exc)
 
         try:
             prod = conn.send_command("kenv smbios.system.product 2>/dev/null").strip()
@@ -110,8 +200,8 @@ class OPNsenseDriver(BaseDriver):
             ser = conn.send_command("kenv smbios.system.serial 2>/dev/null").strip()
             if ser and ser.lower() not in ("0", "none", "not specified", "default string"):
                 info["serial"] = ser
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("OPNsense SMBIOS kenv query failed on %s: %s", self.ip, exc)
 
         return info
 
@@ -153,7 +243,14 @@ class OPNsenseDriver(BaseDriver):
                         try:
                             mask_int = int(mask_hex, 16)
                             prefix_len = bin(mask_int).count("1")
-                        except Exception:
+                        except ValueError as exc:
+                            logger.debug(
+                                "Invalid OPNsense hex netmask %r on %s (%s); defaulting to /24: %s",
+                                mask_hex,
+                                self.ip,
+                                intf_name,
+                                exc,
+                            )
                             prefix_len = 24
                         full_ip = f"{ip_val}/{prefix_len}"
                         inet_addrs.append(full_ip)
@@ -173,8 +270,8 @@ class OPNsenseDriver(BaseDriver):
                     "mac_address": mac,
                     "description": desc,
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("OPNsense interface discovery failed on %s: %s", self.ip, exc)
         return l3_interfaces, interfaces_detail
 
     def get_neighbors(self, conn) -> list[dict]:
@@ -199,8 +296,10 @@ class OPNsenseDriver(BaseDriver):
                                 "device_type": "switch",
                             }
                         )
-        except Exception:
-            pass
+        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+            logger.debug("OPNsense LLDP JSON parse failed on %s: %s", self.ip, exc)
+        except Exception as exc:
+            logger.debug("OPNsense LLDP query failed on %s: %s", self.ip, exc)
         return neighbors
 
     def get_routing_table(self, conn) -> list[dict]:
@@ -232,8 +331,8 @@ class OPNsenseDriver(BaseDriver):
                             "interface": netif,
                         }
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("OPNsense routing table query failed on %s: %s", self.ip, exc)
         return routes
 
     def get_arp_table(self, conn) -> list[dict]:
@@ -256,12 +355,13 @@ class OPNsenseDriver(BaseDriver):
                                 "vendor": oui_lookup.lookup_oui(mac_val),
                             }
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("OPNsense ARP table query failed on %s: %s", self.ip, exc)
         return arp_entries
 
     def get_running_config(self, conn) -> str:
         try:
             return conn.send_command("cat /conf/config.xml")
-        except Exception:
+        except Exception as exc:
+            logger.warning("OPNsense config.xml retrieval failed on %s: %s", self.ip, exc)
             return ""

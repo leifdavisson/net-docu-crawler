@@ -14,13 +14,31 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import csv
+import datetime
 import json
+import logging
 import os
 import re
+import shutil
 
-from netaddr import IPNetwork
+from netaddr import AddrFormatError, IPNetwork
 
 import oui_lookup
+
+logger = logging.getLogger(__name__)
+
+
+def _route_sort_key(rt: dict) -> tuple:
+    """Sort default routes first, valid CIDR networks numerically, and unparseable strings last."""
+    sub = rt["subnet"]
+    if sub == "0.0.0.0/0" or sub.startswith("0.0.0.0"):
+        return (0, "")
+    try:
+        ip_net = IPNetwork(sub)
+        return (1, ip_net)
+    except (AddrFormatError, ValueError, TypeError) as exc:
+        logger.debug("Unable to parse route subnet %r for sorting: %s", sub, exc)
+        return (2, sub)
 
 
 def normalize_interface_name(name):
@@ -72,7 +90,8 @@ def parse_interface_network(ip_str, mask_hint=None):
             net = IPNetwork(f"{clean_ip}/{mask_hint.lstrip('/')}")
         else:
             net = IPNetwork(f"{clean_ip}/24")
-    except Exception:
+    except (AddrFormatError, ValueError, TypeError) as exc:
+        logger.debug("Failed to parse interface network from %r (mask_hint=%r): %s", ip_str, mask_hint, exc)
         net = None
 
     return clean_ip, net
@@ -1004,17 +1023,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             for r in routes:
                 sorted_routes.append(get_route_details(r))
 
-            def route_sort_key(rt):
-                sub = rt["subnet"]
-                if sub == "0.0.0.0/0" or sub.startswith("0.0.0.0"):
-                    return (0, "")
-                try:
-                    ip_net = IPNetwork(sub)
-                    return (1, ip_net)
-                except Exception:
-                    return (2, sub)
-
-            sorted_routes.sort(key=route_sort_key)
+            sorted_routes.sort(key=_route_sort_key)
 
             omitted_host_routes = 0
             for rt in sorted_routes:
@@ -1091,28 +1100,9 @@ def parse_interface_ips_from_config(raw_config):
     return intf_ips
 
 
-def generate_network_analysis_report(devices, output_path="network_analysis_report.md", dns_domain: str = ""):
-    """
-    Generates a structured Layer 1-7 network analysis report.
-    Details cabling errors, speed mismatches, STP loop risks, subnets, and L4-L7 services.
-    """
-    lines = [
-        "# Layered Network Analysis Report (OSI-Oriented)",
-        "",
-        "This report evaluates network behavior, health indicators, configuration consistency, and security gaps parsed from active switch running-states.",
-    ]
-    if dns_domain:
-        lines.extend(["", f"**Detected DNS Domain**: `{dns_domain}`"])
-    lines.extend(
-        [
-            "",
-            "## 1. Layer 1/2 (Physical & Data Link) Analysis",
-            "",
-        ]
-    )
-
-    # A. Cabling & Speed Mismatches
-    lines.append("### Cabling Issues & Speed/Duplex Mismatches")
+def _render_l1_l2_cabling_and_errors_section(devices: dict) -> list[str]:
+    """Render Layer 1/2 cabling speed/duplex mismatches and interface error counters."""
+    lines = ["### Cabling Issues & Speed/Duplex Mismatches"]
     mismatches = []
     errors_found = []
 
@@ -1120,11 +1110,8 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         if not _is_network_infra(dev):
             continue
         hostname = dev.get("hostname") or ip
-        ints_detail = dev.get("interfaces_detail", {})
-
-        for name, stats in ints_detail.items():
-            status_str = str(stats.get("status", "")).lower()
-            if "up" not in status_str:
+        for name, stats in dev.get("interfaces_detail", {}).items():
+            if "up" not in str(stats.get("status", "")).lower():
                 continue
             desc = stats.get("description", "")
             speed = str(stats.get("speed", ""))
@@ -1134,18 +1121,15 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             out_err = stats.get("output_errors", 0)
             drops = stats.get("drops", 0)
 
-            # Check half duplex (often a mismatch indicator on switchports)
             if duplex and "half" in duplex.lower():
                 mismatches.append(
                     f"* **{hostname}** Interface `{name}` (`{desc}`): Operating at **{duplex}** / **{speed}** (Potential mismatch)."
                 )
 
-            # Speed constraints (10Mb/s or 100Mb/s down-shift on Gigabit+ ports)
             is_gig_port = "gigabit" in name.lower() or name.lower().startswith(("gi", "ge-", "xe-", "te", "et-"))
             if speed and ("10Mb/s" in speed or (is_gig_port and "100Mb/s" in speed)):
                 mismatches.append(f"* **{hostname}** Interface `{name}` (`{desc}`): Speed restricted to **{speed}**.")
 
-            # Errors / Drops on UP links
             if in_err > 0 or crc > 0 or out_err > 0 or drops > 0:
                 desc_str = f" (`{desc}`)" if desc else ""
                 drop_str = f", Drops: `{drops}`" if drops > 0 else ""
@@ -1153,11 +1137,9 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
                     f"* **{hostname}** Interface `{name}`{desc_str}: Input Errors: `{in_err}`, CRCs: `{crc}`, Output Errors: `{out_err}`{drop_str}."
                 )
 
-    if mismatches:
-        lines.extend(mismatches)
-    else:
-        lines.append("  * No active speed/duplex mismatches or half-duplex anomalies detected.")
-
+    lines.extend(
+        mismatches if mismatches else ["  * No active speed/duplex mismatches or half-duplex anomalies detected."]
+    )
     lines.append("\n### Interface Packet & CRC Errors")
     if errors_found:
         lines.extend(errors_found)
@@ -1165,11 +1147,16 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         lines.append(
             "  * No packet errors or CRC checksum failures detected on active interfaces (clean physical paths)."
         )
+    return lines
 
-    # B. Port Utilization
-    lines.append("\n### Interface Port Utilization Summary")
-    lines.append("| Switch Hostname | Connected Ports | Total Ports | Utilization % |")
-    lines.append("| --- | --- | --- | --- |")
+
+def _render_port_utilization_section(devices: dict) -> list[str]:
+    """Render interface port utilization summary table across succeeded devices."""
+    lines = [
+        "\n### Interface Port Utilization Summary",
+        "| Switch Hostname | Connected Ports | Total Ports | Utilization % |",
+        "| --- | --- | --- | --- |",
+    ]
     for ip, dev in devices.items():
         if dev.get("status", "success") != "success":
             continue
@@ -1178,19 +1165,19 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         if total == 0:
             continue
         hostname = dev.get("hostname") or ip
-        connected = 0
-        for _name, stats in ints_detail.items():
-            if stats.get("status") == "up":
-                connected += 1
-
+        connected = sum(1 for stats in ints_detail.values() if stats.get("status") == "up")
         pct = (connected / total * 100) if total > 0 else 0
         lines.append(f"| {hostname} | {connected} | {total} | {pct:.1f}% |")
+    return lines
 
-    # C. Spanning Tree State
-    lines.append("\n### Loop Risks & Spanning Tree (STP) Audit")
+
+def _render_stp_audit_section(devices: dict) -> list[str]:
+    """Render Spanning Tree Protocol loop-risk and blocked-port audit."""
+    lines = ["\n### Loop Risks & Spanning Tree (STP) Audit"]
     stp_issues = []
     stp_blocked_lines = []
     audited_switches = 0
+
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
@@ -1198,7 +1185,6 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         stp = dev.get("stp", {})
         dev_type = dev.get("device_type", "switch").lower()
 
-        # Only require Spanning Tree on Layer 2 switches (firewalls, pure routers, and APs do not run L2 STP by design)
         if not stp.get("enabled"):
             if dev_type == "switch":
                 audited_switches += 1
@@ -1208,13 +1194,12 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             continue
 
         audited_switches += 1
-        # Count blocked interfaces
-        blocked_ports = []
-        for vlan_id, ports in stp.get("vlans", {}).items():
-            for port_name, state_dict in ports.items():
-                if state_dict.get("state") == "BLK":
-                    blocked_ports.append(f"`{port_name}` (VLAN {vlan_id})")
-
+        blocked_ports = [
+            f"`{port_name}` (VLAN {vlan_id})"
+            for vlan_id, ports in stp.get("vlans", {}).items()
+            for port_name, state_dict in ports.items()
+            if state_dict.get("state") == "BLK"
+        ]
         if blocked_ports:
             stp_blocked_lines.append(
                 f"* **{hostname}**: Currently blocking loops on {len(set(blocked_ports))} ports: {', '.join(sorted(set(blocked_ports)))}"
@@ -1229,45 +1214,43 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             f"  * Spanning Tree is active on all {audited_switches} Layer 2 switch(es) with zero loop-blocked ports "
             "(Layer 3 routers, firewalls, and wireless APs excluded from L2 STP requirement)."
         )
+    return lines
 
-    # C2. Trunk VLAN Mismatch & L2 Symmetry Audit
-    lines.extend(_build_trunk_audit_markdown_section(devices, heading="### Trunk VLAN Mismatch & L2 Symmetry Audit"))
 
-    # D. Interface Descriptions & Port Naming
-    lines.append("\n### Configured Interface Descriptions & Port Naming")
+def _render_interface_descriptions_section(devices: dict) -> list[str]:
+    """Render configured interface descriptions and port naming tables."""
+    lines = ["\n### Configured Interface Descriptions & Port Naming"]
     desc_found = False
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
         hostname = dev.get("hostname") or ip
-        ints_detail = dev.get("interfaces_detail", {})
-
-        has_local_desc = False
         device_lines = []
-        for name, stats in ints_detail.items():
+        has_local_desc = False
+        for name, stats in dev.get("interfaces_detail", {}).items():
             desc = stats.get("description", "")
-            if desc:
-                if not has_local_desc:
-                    device_lines.append(f"\n#### {hostname} Port Naming Mappings:")
-                    device_lines.append("| Port Interface | Speed | Status | Configured Description / Name |")
-                    device_lines.append("| --- | --- | --- | --- |")
-                    has_local_desc = True
-                    desc_found = True
-                status = stats.get("status", "unknown")
-                speed = stats.get("speed", "unknown")
-                device_lines.append(f"| `{name}` | {speed} | {status} | {desc} |")
-
+            if not desc:
+                continue
+            if not has_local_desc:
+                device_lines.append(f"\n#### {hostname} Port Naming Mappings:")
+                device_lines.append("| Port Interface | Speed | Status | Configured Description / Name |")
+                device_lines.append("| --- | --- | --- | --- |")
+                has_local_desc = True
+                desc_found = True
+            status = stats.get("status", "unknown")
+            speed = stats.get("speed", "unknown")
+            device_lines.append(f"| `{name}` | {speed} | {status} | {desc} |")
         if has_local_desc:
             lines.extend(device_lines)
 
     if not desc_found:
         lines.append("  * No interface descriptions or port names were found configured on scanned devices.")
+    return lines
 
-    # 2. Layer 3 (Routing) Analysis
-    lines.extend(["", "## 2. Layer 3 (Routing) Analysis", ""])
 
-    # Subnet overlaps
-    lines.append("### Overlapping Subnets & IP Space Conflicts")
+def _render_subnet_overlap_section(devices: dict) -> list[str]:
+    """Render overlapping subnets and duplicate IP address space conflict warnings."""
+    lines = ["### Overlapping Subnets & IP Space Conflicts"]
     ip_subnets = []
 
     for ip, dev in devices.items():
@@ -1276,9 +1259,7 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         hostname = dev.get("hostname") or ip
         raw_config = dev.get("raw_config", "")
         config_ips = parse_interface_ips_from_config(raw_config) if raw_config else {}
-
-        l3_ints = dev.get("l3_interfaces", [])
-        for intf in l3_ints:
+        for intf in dev.get("l3_interfaces", []):
             intf_name = intf.get("interface")
             intf_ip = intf.get("ip_address")
             if intf_ip and intf_ip not in ["unassigned", "down", "up", "unset"]:
@@ -1290,25 +1271,18 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
 
     ip_conflicts = []
     subnet_overlaps = []
-
-    # Compare each interface IP & CIDR for duplicate IPs and mismatched/overlapping routing boundaries
     for i in range(len(ip_subnets)):
         for j in range(i + 1, len(ip_subnets)):
             h1, int1, ip1, net1 = ip_subnets[i]
             h2, int2, ip2, net2 = ip_subnets[j]
-
-            # 1. Exact duplicate IP address on different devices (or distinct interfaces)
             if ip1 == ip2 and (h1 != h2 or int1 != int2):
                 ip_conflicts.append((h1, int1, ip1, h2, int2, ip2))
-            # 2. Same router/firewall assigning overlapping subnets across two distinct routed interfaces
             elif h1 == h2 and int1 != int2 and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
                 subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
-            # 3. Different devices using unequal overlapping CIDR masks on the same address range (e.g. /24 vs /25)
             elif h1 != h2 and net1.cidr != net2.cidr and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
                 subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
 
     overlap_found = False
-
     if ip_conflicts:
         overlap_found = True
         lines.append("#### Critical IP Address Conflicts")
@@ -1330,16 +1304,18 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
 
     if not overlap_found:
         lines.append("  * No overlapping subnets or IP address space collisions detected.")
+    return lines
 
-    # Routing protocols
-    lines.append("\n### Active Routing Protocols")
+
+def _render_routing_protocols_and_tables_section(devices: dict) -> list[str]:
+    """Render active routing protocols and complete per-device routing tables."""
+    lines = ["\n### Active Routing Protocols"]
     routes_summary = {}
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
         hostname = dev.get("hostname") or ip
-        routes = dev.get("routes", [])
-        protocols = list(set([get_route_details(r)["protocol"] for r in routes]))
+        protocols = list({get_route_details(r)["protocol"] for r in dev.get("routes", [])})
         protocols = [p for p in protocols if p and p != "Unknown"]
         if protocols:
             routes_summary[hostname] = protocols
@@ -1350,7 +1326,6 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
     else:
         lines.append("  * Devices are operating entirely on Static routing or directly connected Layer 3 boundaries.")
 
-    # Complete Routing Tables
     lines.append("\n### Complete Routing Tables")
     has_routes_any = False
     for ip, dev in devices.items():
@@ -1358,41 +1333,31 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             continue
         hostname = dev.get("hostname") or ip
         routes = dev.get("routes", [])
-        if routes:
-            has_routes_any = True
-            lines.append(f"\n#### {hostname} Routing Table:")
-            lines.append("| Route Prefix | Protocol | Next Hop / Gateway | Outgoing Interface |")
-            lines.append("| --- | --- | --- | --- |")
-
-            sorted_routes = []
-            for r in routes:
-                sorted_routes.append(get_route_details(r))
-
-            def route_sort_key(rt):
-                sub = rt["subnet"]
-                if sub == "0.0.0.0/0" or sub.startswith("0.0.0.0"):
-                    return (0, "")
-                try:
-                    ip_net = IPNetwork(sub)
-                    return (1, ip_net)
-                except Exception:
-                    return (2, sub)
-
-            sorted_routes.sort(key=route_sort_key)
-
-            for rt in sorted_routes:
-                lines.append(f"| `{rt['subnet']}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |")
+        if not routes:
+            continue
+        has_routes_any = True
+        lines.append(f"\n#### {hostname} Routing Table:")
+        lines.append("| Route Prefix | Protocol | Next Hop / Gateway | Outgoing Interface |")
+        lines.append("| --- | --- | --- | --- |")
+        sorted_routes = sorted((get_route_details(r) for r in routes), key=_route_sort_key)
+        for rt in sorted_routes:
+            lines.append(f"| `{rt['subnet']}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |")
 
     if not has_routes_any:
         lines.append("  * No routing table entries were parsed or simulated for the scanned devices.")
+    return lines
 
-    # 3. Layer 4-7 Services Analysis
-    lines.extend(["", "## 3. Layer 4-7 (Services & Security) Analysis", ""])
 
-    lines.append("### Infrastructure Services Consistency (NTP, DNS, AAA)")
-    lines.append("| Switch Hostname | DNS Servers | NTP Servers | RADIUS/TACACS Servers | Management Protocol |")
-    lines.append("| --- | --- | --- | --- | --- |")
-
+def _render_l4_l7_services_and_gaps_section(devices: dict) -> list[str]:
+    """Render Layer 4-7 infrastructure services consistency and visibility/security gaps."""
+    lines = [
+        "",
+        "## 3. Layer 4-7 (Services & Security) Analysis",
+        "",
+        "### Infrastructure Services Consistency (NTP, DNS, AAA)",
+        "| Switch Hostname | DNS Servers | NTP Servers | RADIUS/TACACS Servers | Management Protocol |",
+        "| --- | --- | --- | --- | --- |",
+    ]
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
@@ -1407,17 +1372,14 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             aaa.append(f"TACACS({len(services['tacacs_servers'])})")
         aaa_str = ", ".join(aaa) or "None"
         mgmt = dev.get("mgmt_method", "SSH")
-
         lines.append(f"| {hostname} | {dns} | {ntp} | {aaa_str} | {mgmt} |")
 
-    # Security/Visibility Gaps
     lines.append("\n### Visibility & Security Gaps")
     gaps = []
     for ip, dev in devices.items():
         hostname = dev.get("hostname") or ip
         mgmt = dev.get("mgmt_method", "SSH")
         services = dev.get("services", {})
-
         if mgmt == "Telnet":
             gaps.append(f"* **{hostname}** is using unencrypted **Telnet** for management interface (Security risk).")
         if not services.get("ntp_servers"):
@@ -1433,14 +1395,19 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         lines.append(
             "  * No primary visibility or security gaps found. Central AAA, NTP synchronization, and secure SSH management are properly configured."
         )
+    return lines
 
-    # 5. Migration Intent, Routing Peers/FHRP, DHCP, & Hardware Sizing
-    lines.append("\n## 5. Migration Intent, Control-Plane, & Hardware Sizing")
 
-    # 5a. PoE & Optics BOM Summary
-    lines.append("\n### PoE Power Budget & Optical Transceiver Summary")
-    lines.append("| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+def _render_poe_and_control_plane_section(devices: dict) -> list[str]:
+    """Render PoE power budget summary, dynamic routing peers, and FHRP groups."""
+    lines = [
+        "\n## 5. Migration Intent, Control-Plane, & Hardware Sizing",
+        "\n### PoE Power Budget & Optical Transceiver Summary",
+        "| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+    peer_rows = []
+    fhrp_rows = []
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
@@ -1452,14 +1419,6 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         optics_cnt = len(dev.get("optics", []) or [])
         if tot_w > 0 or used_w > 0 or poe_ports > 0 or optics_cnt > 0:
             lines.append(f"| {hostname} | {ip} | {tot_w:.1f} | {used_w:.1f} | {poe_ports} | {optics_cnt} |")
-
-    # 5b. Dynamic Routing Peers & FHRP
-    peer_rows = []
-    fhrp_rows = []
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
-        hostname = dev.get("hostname") or ip
         for p in dev.get("routing_peers", []) or []:
             peer_rows.append(
                 f"| {hostname} | {p.get('protocol', '').upper()} | {p.get('neighbor_ip', '')} | "
@@ -1470,6 +1429,7 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
                 f"| {hostname} | {f_item.get('protocol', '').upper()} | {f_item.get('group', '')} | "
                 f"{f_item.get('interface', '')} | {f_item.get('vip', '')} | {f_item.get('priority', '')} |"
             )
+
     if peer_rows:
         lines.append("\n### Dynamic Routing Peers (BGP / OSPF)")
         lines.append("| Device | Protocol | Neighbor / Network | AS / Area | State |")
@@ -1480,11 +1440,17 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         lines.append("| Device | Protocol | Group | Interface | VIP | Priority |")
         lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
         lines.extend(fhrp_rows)
+    return lines
 
-    # 5c. DHCP Scopes, Reservations & Relays
+
+def _render_dhcp_and_port_intent_section(devices: dict) -> list[str]:
+    """Render DHCP scopes/relays and per-port L2 switching intent summary."""
+    lines = []
     dhcp_pool_rows = []
     dhcp_res_count = 0
     dhcp_relay_rows = []
+    port_summary_rows = []
+
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
@@ -1498,6 +1464,15 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
         dhcp_res_count += len(dhcp.get("reservations", []) or [])
         for rel in dhcp.get("relays", []) or []:
             dhcp_relay_rows.append(f"| {hostname} | {rel.get('interface', '')} | {rel.get('helper_ip', '')} |")
+
+        pp = dev.get("port_profiles", {}) or {}
+        if pp:
+            acc = sum(1 for v in pp.values() if v.get("mode") == "access")
+            trk = sum(1 for v in pp.values() if v.get("mode") == "trunk")
+            rtd = sum(1 for v in pp.values() if v.get("mode") == "routed")
+            lags = len({v.get("lag_group") for v in pp.values() if v.get("lag_group")})
+            port_summary_rows.append(f"| {hostname} | {len(pp)} | {acc} | {trk} | {rtd} | {lags} |")
+
     if dhcp_pool_rows or dhcp_relay_rows or dhcp_res_count:
         lines.append(f"\n### DHCP Services (Static Reservations Discovered: **{dhcp_res_count}**)")
         if dhcp_pool_rows:
@@ -1509,31 +1484,45 @@ def generate_network_analysis_report(devices, output_path="network_analysis_repo
             lines.append("| :--- | :--- | :--- |")
             lines.extend(dhcp_relay_rows)
 
-    # 5d. Per-Port L2 Intent Summary
-    port_summary_rows = []
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
-        hostname = dev.get("hostname") or ip
-        pp = dev.get("port_profiles", {}) or {}
-        if not pp:
-            continue
-        acc = sum(1 for v in pp.values() if v.get("mode") == "access")
-        trk = sum(1 for v in pp.values() if v.get("mode") == "trunk")
-        rtd = sum(1 for v in pp.values() if v.get("mode") == "routed")
-        lags = len({v.get("lag_group") for v in pp.values() if v.get("lag_group")})
-        port_summary_rows.append(f"| {hostname} | {len(pp)} | {acc} | {trk} | {rtd} | {lags} |")
     if port_summary_rows:
         lines.append("\n### Per-Port L2 Switching Intent")
         lines.append("| Device | Profiled Ports | Access | Trunk | Routed | LAG Bundles |")
         lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
         lines.extend(port_summary_rows)
+    return lines
+
+
+def generate_network_analysis_report(devices, output_path="network_analysis_report.md", dns_domain: str = ""):
+    """
+    Generates a structured Layer 1-7 network analysis report.
+    Details cabling errors, speed mismatches, STP loop risks, subnets, and L4-L7 services.
+    """
+    lines = [
+        "# Layered Network Analysis Report (OSI-Oriented)",
+        "",
+        "This report evaluates network behavior, health indicators, configuration consistency, and security gaps parsed from active switch running-states.",
+    ]
+    if dns_domain:
+        lines.extend(["", f"**Detected DNS Domain**: `{dns_domain}`"])
+    lines.extend(["", "## 1. Layer 1/2 (Physical & Data Link) Analysis", ""])
+    lines.extend(_render_l1_l2_cabling_and_errors_section(devices))
+    lines.extend(_render_port_utilization_section(devices))
+    lines.extend(_render_stp_audit_section(devices))
+    lines.extend(_build_trunk_audit_markdown_section(devices, heading="### Trunk VLAN Mismatch & L2 Symmetry Audit"))
+    lines.extend(_render_interface_descriptions_section(devices))
+    lines.extend(["", "## 2. Layer 3 (Routing) Analysis", ""])
+    lines.extend(_render_subnet_overlap_section(devices))
+    lines.extend(_render_routing_protocols_and_tables_section(devices))
+    lines.extend(_render_l4_l7_services_and_gaps_section(devices))
+    lines.extend(_render_poe_and_control_plane_section(devices))
+    lines.extend(_render_dhcp_and_port_intent_section(devices))
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         print(f"Network analysis report successfully written to {output_path}")
     except Exception as e:
+        logger.debug("Error generating network analysis report at %s: %s", output_path, e, exc_info=True)
         print(f"Error generating network analysis report: {e}")
 
 
@@ -2482,26 +2471,8 @@ def compare_baseline_state(devices, baseline_path, output_path="migration_verifi
         print(f"Error generating verification report: {e}")
 
 
-def generate_master_network_analysis_migration_blueprint(
-    devices: dict,
-    output_path: str = "Network_Analysis.md",
-    scope: str = "Discovered Network",
-    timestamp: str = "",
-    dns_domain: str = "",
-) -> None:
-    """
-    Generates the comprehensive, unified Master Migration Blueprint (Network_Analysis.md)
-    containing all operational, physical, logical, services, and procedural intelligence
-    required by a Senior Network Engineer to execute a flawless cutover to new network gear.
-    """
-    import datetime
-
-    if not timestamp:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
-    total_nodes = len(unique_devs)
-
+def _render_blueprint_header_and_toc(scope: str, dns_domain: str, timestamp: str, total_nodes: int) -> list[str]:
+    """Render the blueprint title, scope metadata table, and table of contents."""
     lines = [
         "# Network Migration Analysis Blueprint & Engineering Cutover Dossier",
         "",
@@ -2536,19 +2507,25 @@ def generate_master_network_analysis_migration_blueprint(
             "10. [Infrastructure Services (DNS, NTP, Syslog, SNMP, AAA)](#10-infrastructure-services-dns-ntp-syslog-snmp-aaa)",
             "11. [Proprietary Feature De-risking & Protocol Translation](#11-proprietary-feature-de-risking--protocol-translation)",
             "12. [Maintenance Window Cutover Runbook & Rollback Plan](#12-maintenance-window-cutover-runbook--rollback-plan)",
-            "",
-            "---",
-            "",
-            "## 1. Executive Summary & Current Hardware Estate",
-            "",
-            "The following estate reflects the physical and virtual network appliances discovered during discovery. "
-            "Review model lifecycle status and recommended target architecture replacements:",
-            "",
-            "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Target Replacement Guidance |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
     )
+    return lines
 
+
+def _render_blueprint_executive_summary_section(unique_devs: dict) -> list[str]:
+    """Render Section 1: Executive Summary & Current Hardware Estate."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 1. Executive Summary & Current Hardware Estate",
+        "",
+        "The following estate reflects the physical and virtual network appliances discovered during discovery. "
+        "Review model lifecycle status and recommended target architecture replacements:",
+        "",
+        "| Hostname | Management IP | Vendor | Model | Serial Number | Firmware OS | Persona | Target Replacement Guidance |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         vendor = dev.get("vendor", "Unknown")
@@ -2557,7 +2534,6 @@ def generate_master_network_analysis_migration_blueprint(
         firmware = dev.get("firmware", "Unknown")
         persona = dev.get("device_persona", dev.get("device_type", "switch"))
 
-        # Target replacement recommendation heuristics
         target_rec = "Standard Enterprise Managed Switch"
         if persona == "firewall":
             target_rec = "Next-Gen Firewall / Core Gateway (HA Pair)"
@@ -2573,49 +2549,29 @@ def generate_master_network_analysis_migration_blueprint(
         lines.append(
             f"| **{hostname}** | `{ip}` | {vendor} | `{model}` | `{serial}` | `{firmware}` | `{persona}` | {target_rec} |"
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 2. Physical Layer 1/2 Cabling, Optics & MTU Matrix",
-            "",
-            "### 2.1 Patch Cabling, Port-Channels & Media Types",
-            "Every physical patch cord, optic type, and uplink LAG/LACP bond must be accounted for before cutover night:",
-            "",
-            "| Source Switch | Source Port | Media / Form Factor | Speed / Duplex | Status | Connected Neighbor | Neighbor Port | LAG / Port-Channel |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], list[tuple]]:
+    """Collect cabling matrix rows and detect cross-device MTU mismatches."""
     mtu_mismatches = []
     cabling_rows = []
-    transceiver_counts = {
-        "1000BASE-T (RJ45)": 0,
-        "10GBASE-SR (Multimode LC)": 0,
-        "10GBASE-LR (Singlemode LC)": 0,
-        "Direct Attach Copper (DAC)": 0,
-    }
 
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         ints_detail = dev.get("interfaces_detail", {})
-        neighbors = dev.get("neighbors", [])
         cfg = dev.get("raw_config", "")
 
-        # Channel group map
         channel_map = {}
         if cfg:
             for cg_m in re.finditer(r"interface\s+(\S+)[\s\S]*?channel-group\s+(\d+)", cfg, re.IGNORECASE):
-                intf_name = normalize_interface_name(cg_m.group(1))
-                channel_map[intf_name] = f"Po{cg_m.group(2)}"
+                channel_map[normalize_interface_name(cg_m.group(1))] = f"Po{cg_m.group(2)}"
 
-        neighbor_map = {}
-        for nbr in neighbors:
-            lport = normalize_interface_name(nbr.get("local_port", ""))
-            if lport:
-                neighbor_map[lport] = nbr
+        neighbor_map = {
+            normalize_interface_name(nbr.get("local_port", "")): nbr
+            for nbr in dev.get("neighbors", [])
+            if normalize_interface_name(nbr.get("local_port", ""))
+        }
 
         for port_name, stats in sorted(ints_detail.items()):
             norm_port = normalize_interface_name(port_name)
@@ -2625,19 +2581,14 @@ def generate_master_network_analysis_migration_blueprint(
             duplex = stats.get("duplex") or "Full"
             mtu = stats.get("mtu") or (9000 if "jumbo" in stats.get("description", "").lower() else 1500)
 
-            # Transceiver / media from correlated ports first, fallback to port name
             if cport.get("optic_part_number"):
                 media = f"{cport.get('media') or 'SFP'} ({cport['optic_part_number']})"
-                transceiver_counts["10GBASE-SR (Multimode LC)"] += 1
             elif cport.get("media"):
                 media = cport["media"]
-                transceiver_counts["1000BASE-T (RJ45)"] += 1
             elif any(p in norm_port.lower() for p in ["xe-", "te", "eth1/", "et-", "mgmt", "10ge"]):
                 media = "10GBASE-SR (SFP+ LC)"
-                transceiver_counts["10GBASE-SR (Multimode LC)"] += 1
             else:
                 media = "1000BASE-T (RJ45)"
-                transceiver_counts["1000BASE-T (RJ45)"] += 1
 
             nbr = neighbor_map.get(norm_port)
             nbr_host = cport.get("neighbor_hostname") or (
@@ -2653,7 +2604,6 @@ def generate_master_network_analysis_migration_blueprint(
                 f"| **{hostname}** | `{norm_port}` | {media} | {speed} / {duplex} | `{status}` | **{nbr_host}** | `{nbr_port}` | `{lag_group}` |"
             )
 
-            # MTU check across neighbor link
             if nbr and nbr_host != "Unconnected":
                 for _rip, rdev in unique_devs.items():
                     if (rdev.get("hostname") or "").lower().split(".")[0] == nbr_host.lower().split(".")[0]:
@@ -2666,18 +2616,31 @@ def generate_master_network_analysis_migration_blueprint(
                             if mtu != r_mtu:
                                 mtu_mismatches.append((hostname, norm_port, mtu, nbr_host, nbr_port, r_mtu))
 
-    lines.extend(cabling_rows[:60])  # Top active interfaces
+    return cabling_rows, mtu_mismatches
+
+
+def _render_blueprint_cabling_and_mtu_section(unique_devs: dict) -> list[str]:
+    """Render Sections 2.1 (Patch Cabling Matrix) and 2.2 (MTU Discrepancy Guard)."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 2. Physical Layer 1/2 Cabling, Optics & MTU Matrix",
+        "",
+        "### 2.1 Patch Cabling, Port-Channels & Media Types",
+        "Every physical patch cord, optic type, and uplink LAG/LACP bond must be accounted for before cutover night:",
+        "",
+        "| Source Switch | Source Port | Media / Form Factor | Speed / Duplex | Status | Connected Neighbor | Neighbor Port | LAG / Port-Channel |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+    cabling_rows, mtu_mismatches = _collect_blueprint_cabling_and_mtu(unique_devs)
+    lines.extend(cabling_rows[:60])
     if len(cabling_rows) > 60:
         lines.append(
             f"| ... and {len(cabling_rows) - 60} additional switch access ports recorded in migration_cabling_matrix.csv | | | | | | | |"
         )
 
-    lines.extend(
-        [
-            "",
-            "### 2.2 MTU Discrepancy & Jumbo Frame Guard",
-        ]
-    )
+    lines.extend(["", "### 2.2 MTU Discrepancy & Jumbo Frame Guard"])
     if mtu_mismatches:
         lines.append("> [!WARNING]")
         lines.append("> **CRITICAL MTU MISMATCH DETECTED ACROSS UPLINKS:**")
@@ -2689,17 +2652,19 @@ def generate_master_network_analysis_migration_blueprint(
         lines.append(
             "✓ **No MTU Mismatches Detected**: All discovered switch-to-switch uplinks share consistent standard MTU boundaries (1500 bytes)."
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "### 2.3 Optical Transceiver & Digital Optical Monitoring (DOM) Telemetry",
-            "Detailed physical telemetry for pluggable fiber/copper SFP, SFP+, and QSFP transceivers:",
-            "",
-            "| Switch Hostname | Port | Transceiver Model / Part | Serial Number | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
+
+def _render_blueprint_optics_section(unique_devs: dict) -> list[str]:
+    """Render Section 2.3: Optical Transceiver & Digital Optical Monitoring (DOM) Telemetry."""
+    lines = [
+        "",
+        "### 2.3 Optical Transceiver & Digital Optical Monitoring (DOM) Telemetry",
+        "Detailed physical telemetry for pluggable fiber/copper SFP, SFP+, and QSFP transceivers:",
+        "",
+        "| Switch Hostname | Port | Transceiver Model / Part | Serial Number | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     optics_found = 0
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
@@ -2733,17 +2698,19 @@ def generate_master_network_analysis_migration_blueprint(
         lines.append(
             "| *All Switches* | *N/A* | *No pluggable SFP/DOM optics detected (All RJ-45 copper access)* | *N/A* | `1000BASE-T` | N/A | N/A | N/A | N/A | ✓ Healthy (Copper PHY) |"
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "### 2.4 Port-to-Endpoint MAC Address Mapping & Access Layer Topology",
-            "Active Layer 2 MAC forwarding table entries mapped to physical switch ports and endpoint identities (exported to `port_mac_endpoint_mapping.csv`):",
-            "",
-            "| Switch Hostname | Port | VLAN | MAC Address | OUI Vendor | Resolved Device Role |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
+
+def _render_blueprint_mac_mapping_section(unique_devs: dict) -> list[str]:
+    """Render Section 2.4: Port-to-Endpoint MAC Address Mapping & Access Layer Topology."""
+    lines = [
+        "",
+        "### 2.4 Port-to-Endpoint MAC Address Mapping & Access Layer Topology",
+        "Active Layer 2 MAC forwarding table entries mapped to physical switch ports and endpoint identities (exported to `port_mac_endpoint_mapping.csv`):",
+        "",
+        "| Switch Hostname | Port | VLAN | MAC Address | OUI Vendor | Resolved Device Role |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     mac_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
@@ -2770,21 +2737,22 @@ def generate_master_network_analysis_migration_blueprint(
         lines.append(
             "| *Discovered Switches* | *Access Ports* | *VLAN 1* | *Dynamic MACs Pending Traffic* | Standard OUI | Client Workstations |"
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 3. Power over Ethernet (PoE) Budget & Power Supply Sizing",
-            "",
-            "When replacing access switches, new power supplies must support the concurrent wattage demanded by APs, IP phones, and cameras:",
-            "",
-            "| Switch Hostname | Total PoE Capacity (W) | Consumed PoE Wattage (W) | Remaining Budget (W) | PoE Utilization | PSU Sizing Recommendation |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_poe_section(unique_devs: dict) -> list[str]:
+    """Render Section 3: Power over Ethernet (PoE) Budget & Power Supply Sizing."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 3. Power over Ethernet (PoE) Budget & Power Supply Sizing",
+        "",
+        "When replacing access switches, new power supplies must support the concurrent wattage demanded by APs, IP phones, and cameras:",
+        "",
+        "| Switch Hostname | Total PoE Capacity (W) | Consumed PoE Wattage (W) | Remaining Budget (W) | PoE Utilization | PSU Sizing Recommendation |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         poe = dev.get("poe", {})
@@ -2793,48 +2761,48 @@ def generate_master_network_analysis_migration_blueprint(
         rem = poe.get("available_power_watts", 0.0)
         persona = dev.get("device_persona", "")
 
-        if persona == "switch" or tot > 0 or used > 0:
-            if poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
-                lines.append(f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |")
-            elif poe.get("budget_unreported") and used > 0.0:
-                deliv_cnt = poe.get("poe_delivering_ports", 0)
-                lines.append(
-                    f"| **{hostname}** | Unreported by CLI | {used:.1f}W ({deliv_cnt} active) | Unknown | N/A | Verify Chassis PSU Budget (Draw: {used:.1f}W) |"
-                )
-            elif tot == 0.0 and used == 0.0:
-                lines.append(
-                    f"| **{hostname}** | Unknown | Unknown | Unknown | N/A | Unknown (Verify PSU / PoE Budget) |"
-                )
-            elif tot == 0.0 and used > 0.0:
-                lines.append(
-                    f"| **{hostname}** | 0.0W | {used:.1f}W | N/A | N/A | ⚠️ Conflict: 0W budget with active draw |"
-                )
-            else:
-                pct = (used / tot * 100.0) if tot > 0 else 0.0
-                req_w = max(tot, used * 1.25)
-                psu_rec = (
-                    f"Minimum {int(req_w)}W+ PSU (Supports 802.3at PoE+ expansion)"
-                    if req_w > 370
-                    else "Standard 370W PSU (Class 3/4 Sufficient)"
-                )
-                lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
+        if not (persona == "switch" or tot > 0 or used > 0):
+            continue
+        if poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
+            lines.append(f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |")
+        elif poe.get("budget_unreported") and used > 0.0:
+            deliv_cnt = poe.get("poe_delivering_ports", 0)
+            lines.append(
+                f"| **{hostname}** | Unreported by CLI | {used:.1f}W ({deliv_cnt} active) | Unknown | N/A | Verify Chassis PSU Budget (Draw: {used:.1f}W) |"
+            )
+        elif tot == 0.0 and used == 0.0:
+            lines.append(f"| **{hostname}** | Unknown | Unknown | Unknown | N/A | Unknown (Verify PSU / PoE Budget) |")
+        elif tot == 0.0 and used > 0.0:
+            lines.append(
+                f"| **{hostname}** | 0.0W | {used:.1f}W | N/A | N/A | ⚠️ Conflict: 0W budget with active draw |"
+            )
+        else:
+            pct = (used / tot * 100.0) if tot > 0 else 0.0
+            req_w = max(tot, used * 1.25)
+            psu_rec = (
+                f"Minimum {int(req_w)}W+ PSU (Supports 802.3at PoE+ expansion)"
+                if req_w > 370
+                else "Standard 370W PSU (Class 3/4 Sufficient)"
+            )
+            lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 4. Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map",
-            "",
-            "This authoritative map defines every VLAN ID, broadcast domain, gateway IP, and trunk path across the campus:",
-            "",
-            "| Site | Source Device | VLAN ID | VLAN Name | SVI / IRB | Gateway IP | Subnet / CIDR Prefix | DHCP Relays |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_vlan_and_trunk_section(unique_devs: dict) -> list[str]:
+    """Render Section 4: Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map."""
     from net_docu_crawler.correlator import build_l3_svi_table
 
+    lines = [
+        "",
+        "---",
+        "",
+        "## 4. Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map",
+        "",
+        "This authoritative map defines every VLAN ID, broadcast domain, gateway IP, and trunk path across the campus:",
+        "",
+        "| Site | Source Device | VLAN ID | VLAN Name | SVI / IRB | Gateway IP | Subnet / CIDR Prefix | DHCP Relays |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     svi_rows = build_l3_svi_table(list(unique_devs.values()))
     vlan_rows = []
     for sr in svi_rows:
@@ -2846,34 +2814,31 @@ def generate_master_network_analysis_migration_blueprint(
             f"| {site_lbl} | **{sr['source_device']}** | {vid_lbl} | {vname_lbl} | `{sr['svi_interface']}` | "
             f"`{sr['primary_ip']}` | `{sr['prefix_cidr'] or 'N/A'}` | {rel_lbl} |"
         )
-
     if not vlan_rows:
         vlan_rows.append("| - | *None* | - | *No L3 VLAN/SVI mappings parsed* | - | `N/A` | `N/A` | - |")
 
     lines.extend(vlan_rows)
     lines.extend(
-        _build_trunk_audit_markdown_section(
-            unique_devs,
-            heading="### 4.1 Trunk VLAN Mismatch & L2 Symmetry Audit",
-        )
+        _build_trunk_audit_markdown_section(unique_devs, heading="### 4.1 Trunk VLAN Mismatch & L2 Symmetry Audit")
     )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 5. DHCP Relay & IP Helper Addresses (Migration Critical)",
-            "",
-            "> [!IMPORTANT]",
-            "> **CRITICAL PRE-CUTOVER GATEWAY CHECK**: Missing `ip helper-address` / DHCP relay configurations on newly deployed SVIs "
-            "is the primary cause of post-cutover outages. Ensure every relay IP below is provisioned on target replacement gateways:",
-            "",
-            "| Source Device | Interface / VLAN | Configured DHCP Relay / Helper IP | Target DHCP Server / Scope | Audit Status |",
-            "| :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_dhcp_relay_section(unique_devs: dict) -> list[str]:
+    """Render Section 5: DHCP Relay & IP Helper Addresses (Migration Critical)."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 5. DHCP Relay & IP Helper Addresses (Migration Critical)",
+        "",
+        "> [!IMPORTANT]",
+        "> **CRITICAL PRE-CUTOVER GATEWAY CHECK**: Missing `ip helper-address` / DHCP relay configurations on newly deployed SVIs "
+        "is the primary cause of post-cutover outages. Ensure every relay IP below is provisioned on target replacement gateways:",
+        "",
+        "| Source Device | Interface / VLAN | Configured DHCP Relay / Helper IP | Target DHCP Server / Scope | Audit Status |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
     has_relays = False
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
@@ -2896,71 +2861,73 @@ def generate_master_network_analysis_migration_blueprint(
         lines.append(
             "| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | Unconfigured or Local DHCP |"
         )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 6. Spanning Tree (STP) & Loop Prevention Plan",
-            "",
-            "| Switch Hostname | STP Protocol Detected | Root Bridge Status | Bridge Priority | PortFast / Edge Ports | BPDU Guard Status | Migration Target Standard |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_stp_section(unique_devs: dict) -> list[str]:
+    """Render Section 6: Spanning Tree (STP) & Loop Prevention Plan."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 6. Spanning Tree (STP) & Loop Prevention Plan",
+        "",
+        "| Switch Hostname | STP Protocol Detected | Root Bridge Status | Bridge Priority | PortFast / Edge Ports | BPDU Guard Status | Migration Target Standard |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         stp = dev.get("stp", {}) or {}
         is_root = bool(stp.get("is_root", False))
         persona = dev.get("device_persona", "")
-        if persona == "switch" or stp.get("enabled"):
-            proto = stp.get("protocol") or "Unknown"
-            prio = stp.get("bridge_priority") or "Unknown"
-            if not stp.get("enabled"):
-                root_label = "Disabled (STP Off)"
-            elif stp.get("is_verified_campus_root"):
-                root_label = f"👑 **VERIFIED CAMPUS ROOT** ({stp.get('root_bridge', '')})"
-            elif stp.get("root_scope") == "isolated_self_root":
-                root_label = f"⚠️ Isolated Self-Root ({stp.get('root_bridge', '')})"
-            elif is_root and (stp.get("root_bridge") or stp.get("vlans")):
-                root_label = "👑 **ROOT BRIDGE**"
-            elif is_root:
-                root_label = "⚠️ Unverified Root (Missing Bridge ID)"
-            else:
-                rb = stp.get("root_bridge") or "Unknown"
-                rp = stp.get("root_port") or "N/A"
-                root_label = f"Non-Root (Root: {rb}, Port: {rp})"
+        if not (persona == "switch" or stp.get("enabled")):
+            continue
 
-            pp = dev.get("port_profiles", {}) or {}
-            edge_cnt = sum(1 for v in pp.values() if v.get("stp_edge") is True)
-            bpdu_cnt = sum(1 for v in pp.values() if v.get("bpdu_guard") is True)
-            edge_label = f"{edge_cnt} edge ports" if edge_cnt > 0 else "Unknown"
-            bpdu_label = f"{bpdu_cnt} protected ports" if bpdu_cnt > 0 else "Unknown"
+        proto = stp.get("protocol") or "Unknown"
+        prio = stp.get("bridge_priority") or "Unknown"
+        if not stp.get("enabled"):
+            root_label = "Disabled (STP Off)"
+        elif stp.get("is_verified_campus_root"):
+            root_label = f"👑 **VERIFIED CAMPUS ROOT** ({stp.get('root_bridge', '')})"
+        elif stp.get("root_scope") == "isolated_self_root":
+            root_label = f"⚠️ Isolated Self-Root ({stp.get('root_bridge', '')})"
+        elif is_root and (stp.get("root_bridge") or stp.get("vlans")):
+            root_label = "👑 **ROOT BRIDGE**"
+        elif is_root:
+            root_label = "⚠️ Unverified Root (Missing Bridge ID)"
+        else:
+            rb = stp.get("root_bridge") or "Unknown"
+            rp = stp.get("root_port") or "N/A"
+            root_label = f"Non-Root (Root: {rb}, Port: {rp})"
 
-            lines.append(
-                f"| **{hostname}** | `{proto}` | {root_label} | `{prio}` | {edge_label} | {bpdu_label} | Standard IEEE 802.1w / 802.1s |"
-            )
+        pp = dev.get("port_profiles", {}) or {}
+        edge_cnt = sum(1 for v in pp.values() if v.get("stp_edge") is True)
+        bpdu_cnt = sum(1 for v in pp.values() if v.get("bpdu_guard") is True)
+        edge_label = f"{edge_cnt} edge ports" if edge_cnt > 0 else "Unknown"
+        bpdu_label = f"{bpdu_cnt} protected ports" if bpdu_cnt > 0 else "Unknown"
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 7. First-Hop Redundancy Protocols (FHRP) & Gateway Migration",
-            "",
-        ]
-    )
+        lines.append(
+            f"| **{hostname}** | `{proto}` | {root_label} | `{prio}` | {edge_label} | {bpdu_label} | Standard IEEE 802.1w / 802.1s |"
+        )
+    return lines
 
-    fhrp_migration_rows = []
-    for ip, dev in unique_devs.items():
-        hostname = dev.get("hostname") or ip
-        for f_item in dev.get("fhrp", []) or []:
-            fhrp_migration_rows.append(
-                f"| **{hostname} ({f_item.get('interface', 'N/A')})** | `{f_item.get('protocol', 'Unknown').upper()}` | "
-                f"`{f_item.get('vip', 'Unknown')}` | `{hostname}` | {f_item.get('state', 'Unknown')} | "
-                f"{f_item.get('preempt', 'Unknown')} | Standard VRRPv3 (RFC 5798) |"
-            )
+
+def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
+    """Render Sections 7 (FHRP) and 8 (Layer 3 Subnets & Default Routes)."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 7. First-Hop Redundancy Protocols (FHRP) & Gateway Migration",
+        "",
+    ]
+    fhrp_migration_rows = [
+        f"| **{dev.get('hostname') or ip} ({f_item.get('interface', 'N/A')})** | `{f_item.get('protocol', 'Unknown').upper()}` | "
+        f"`{f_item.get('vip', 'Unknown')}` | `{dev.get('hostname') or ip}` | {f_item.get('state', 'Unknown')} | "
+        f"{f_item.get('preempt', 'Unknown')} | Standard VRRPv3 (RFC 5798) |"
+        for ip, dev in unique_devs.items()
+        for f_item in (dev.get("fhrp", []) or [])
+    ]
 
     if fhrp_migration_rows:
         lines.extend(
@@ -2985,7 +2952,6 @@ def generate_master_network_analysis_migration_blueprint(
             "| :--- | :--- | :--- | :--- | :--- |",
         ]
     )
-
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         for r in dev.get("routes", []):
@@ -2994,19 +2960,20 @@ def generate_master_network_analysis_migration_blueprint(
                 lines.append(
                     f"| **{hostname}** | `{rd.get('next_hop')}` | `{rd.get('interface')}` | `{rd.get('protocol')}` | 1 (Static) |"
                 )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 9. Security, Access Control Lists & NAT Policies",
-            "",
-            "| Device Hostname | Insecure Protocols (Telnet/HTTP) | Secure Transport (SSH/HTTPS) | Ingress/Egress Filter Rules | NAT Overload (PAT) Status |",
-            "| :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_security_and_services_section(unique_devs: dict) -> list[str]:
+    """Render Sections 9 (Security/ACLs/NAT) and 10 (Infrastructure Services)."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 9. Security, Access Control Lists & NAT Policies",
+        "",
+        "| Device Hostname | Insecure Protocols (Telnet/HTTP) | Secure Transport (SSH/HTTPS) | Ingress/Egress Filter Rules | NAT Overload (PAT) Status |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         persona = dev.get("device_persona", "")
@@ -3038,11 +3005,7 @@ def generate_master_network_analysis_migration_blueprint(
         ]
     )
 
-    # Ingest services
-    dns_all = set()
-    ntp_all = set()
-    rad_all = set()
-    sys_all = set()
+    dns_all, ntp_all, rad_all, sys_all = set(), set(), set(), set()
     for dev in unique_devs.values():
         serv = dev.get("services", {})
         dns_all.update(serv.get("dns_servers", []))
@@ -3061,19 +3024,20 @@ def generate_master_network_analysis_migration_blueprint(
     lines.append(
         f"| **AAA Authentication** | {rad_str} | RADIUS UDP 1812 / TACACS+ | ✓ Encrypted Identity Management |"
     )
+    return lines
 
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 11. Proprietary Feature De-risking & Protocol Translation",
-            "",
-            "| Source Vendor / Construct | Standard Target Feature | Technical Migration Action | Risk Level |",
-            "| :--- | :--- | :--- | :--- |",
-        ]
-    )
 
+def _render_blueprint_translation_and_runbook_section(unique_devs: dict) -> list[str]:
+    """Render Sections 11 (Protocol Translation) and 12 (Cutover Runbook & Rollback Plan)."""
+    lines = [
+        "",
+        "---",
+        "",
+        "## 11. Proprietary Feature De-risking & Protocol Translation",
+        "",
+        "| Source Vendor / Construct | Standard Target Feature | Technical Migration Action | Risk Level |",
+        "| :--- | :--- | :--- | :--- |",
+    ]
     vendors_present = {str(d.get("vendor") or "").lower() for d in unique_devs.values()}
     if any("cisco" in v for v in vendors_present):
         lines.extend(
@@ -3133,12 +3097,44 @@ def generate_master_network_analysis_migration_blueprint(
             "*Automated Migration Blueprint compiled by Net-Docu-Crawler Engine.*",
         ]
     )
+    return lines
+
+
+def generate_master_network_analysis_migration_blueprint(
+    devices: dict,
+    output_path: str = "Network_Analysis.md",
+    scope: str = "Discovered Network",
+    timestamp: str = "",
+    dns_domain: str = "",
+) -> None:
+    """
+    Generates the comprehensive, unified Master Migration Blueprint (Network_Analysis.md)
+    containing all operational, physical, logical, services, and procedural intelligence
+    required by a Senior Network Engineer to execute a flawless cutover to new network gear.
+    """
+    if not timestamp:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
+    lines = _render_blueprint_header_and_toc(scope, dns_domain, timestamp, len(unique_devs))
+    lines.extend(_render_blueprint_executive_summary_section(unique_devs))
+    lines.extend(_render_blueprint_cabling_and_mtu_section(unique_devs))
+    lines.extend(_render_blueprint_optics_section(unique_devs))
+    lines.extend(_render_blueprint_mac_mapping_section(unique_devs))
+    lines.extend(_render_blueprint_poe_section(unique_devs))
+    lines.extend(_render_blueprint_vlan_and_trunk_section(unique_devs))
+    lines.extend(_render_blueprint_dhcp_relay_section(unique_devs))
+    lines.extend(_render_blueprint_stp_section(unique_devs))
+    lines.extend(_render_blueprint_fhrp_and_routing_section(unique_devs))
+    lines.extend(_render_blueprint_security_and_services_section(unique_devs))
+    lines.extend(_render_blueprint_translation_and_runbook_section(unique_devs))
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         print(f"[+] Master Network Analysis Migration Blueprint written to: {output_path}")
     except Exception as e:
+        logger.debug("Error writing master migration blueprint to %s: %s", output_path, e, exc_info=True)
         print(f"[-] Error writing master migration blueprint: {e}")
 
 
@@ -3267,8 +3263,8 @@ def generate_cutover_validation_script(
             f.write("\n".join(lines) + "\n")
         try:
             os.chmod(output_path, 0o755)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("Could not set executable permissions on %s: %s", output_path, exc)
         print(f"[+] Cutover validation smoke test script written to: {output_path}")
 
         # Also generate cross-platform PowerShell smoke script for Windows environments
@@ -3592,30 +3588,19 @@ def generate_target_migration_configs(
         print(f"Error generating target migration configs: {e}")
 
 
-def export_layered_csvs(
-    raw_devices: list[dict],
-    registry,
-    run_output_dir: str,
-    source_logs_dir: str = "",
-    trunk_audit: dict | None = None,
-) -> None:
-    """
-    Export normalized and correlated machine-readable CSVs into the layered
-    `00_manifest/`, `01_raw/`, `02_normalized/`, and `03_correlated/` subdirectories.
-    """
-    import shutil
-
-    from net_docu_crawler.correlator import build_l3_svi_table
-
-    m_dir = os.path.join(run_output_dir, "00_manifest")
-    r_dir = os.path.join(run_output_dir, "01_raw")
-    n_dir = os.path.join(run_output_dir, "02_normalized")
-    c_dir = os.path.join(run_output_dir, "03_correlated")
-    rep_dir = os.path.join(run_output_dir, "05_reports")
-    for d in (m_dir, r_dir, n_dir, c_dir, rep_dir):
-        os.makedirs(d, exist_ok=True)
-
-    # 1. 00_manifest/failures.csv
+def _export_failures_csv(raw_devices: list[dict], manifest_dir: str) -> None:
+    """Write 00_manifest/failures.csv for unauthenticated, unsupported, or discovered hosts."""
+    fail_fields = [
+        "ip",
+        "status",
+        "record_class",
+        "vendor",
+        "device_type",
+        "mgmt_method",
+        "model",
+        "mac_address",
+        "capture_time",
+    ]
     fail_rows = [
         {
             "ip": d.get("ip", ""),
@@ -3631,27 +3616,39 @@ def export_layered_csvs(
         for d in raw_devices
         if d.get("status") in ("unauthenticated", "unsupported", "discovered")
     ]
-    with open(os.path.join(m_dir, "failures.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "ip",
-                "status",
-                "record_class",
-                "vendor",
-                "device_type",
-                "mgmt_method",
-                "model",
-                "mac_address",
-                "capture_time",
-            ],
-        )
+    with open(os.path.join(manifest_dir, "failures.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fail_fields)
         w.writeheader()
         w.writerows(fail_rows)
 
-    infra = [d for d in raw_devices if d.get("status", "success") == "success"]
 
-    # 2. 02_normalized/interfaces.csv & 03_correlated/unused_ports.csv
+def _export_interfaces_csv(infra: list[dict], norm_dir: str, corr_dir: str) -> None:
+    """Write 02_normalized/interfaces.csv and 03_correlated/unused_ports.csv."""
+    iface_fields = [
+        "hostname",
+        "interface",
+        "admin_state",
+        "oper_state",
+        "mode",
+        "access_vlan",
+        "voice_vlan",
+        "native_vlan",
+        "allowed_vlans",
+        "lag_id",
+        "lacp_mode",
+        "speed",
+        "duplex",
+        "media",
+        "neighbor_hostname",
+        "neighbor_port",
+        "stp_edge",
+        "bpdu_guard",
+        "storm_control",
+        "poe_draw_watts",
+        "edge_mac_count",
+        "hygiene_disposition",
+        "hygiene_reason",
+    ]
     iface_rows = []
     unused_rows = []
     for d in infra:
@@ -3685,100 +3682,74 @@ def export_layered_csvs(
             if row["hygiene_disposition"] in ("SHUTDOWN", "QUARANTINE", "REVIEW"):
                 unused_rows.append(row)
 
-    iface_fields = [
-        "hostname",
-        "interface",
-        "admin_state",
-        "oper_state",
-        "mode",
-        "access_vlan",
-        "voice_vlan",
-        "native_vlan",
-        "allowed_vlans",
-        "lag_id",
-        "lacp_mode",
-        "speed",
-        "duplex",
-        "media",
-        "neighbor_hostname",
-        "neighbor_port",
-        "stp_edge",
-        "bpdu_guard",
-        "storm_control",
-        "poe_draw_watts",
-        "edge_mac_count",
-        "hygiene_disposition",
-        "hygiene_reason",
-    ]
-    with open(os.path.join(n_dir, "interfaces.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(norm_dir, "interfaces.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=iface_fields)
         w.writeheader()
         w.writerows(iface_rows)
-    with open(os.path.join(c_dir, "unused_ports.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(corr_dir, "unused_ports.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=iface_fields)
         w.writeheader()
         w.writerows(unused_rows)
 
-    # 3. 02_normalized/vlans.csv
-    vlan_rows = []
-    for d in infra:
-        host = d.get("hostname") or d.get("ip", "")
-        sc = d.get("site_code", "")
-        for vid, vinfo in (d.get("vlans") or {}).items():
-            vlan_rows.append(
-                {
-                    "hostname": host,
-                    "site_code": sc,
-                    "vlan_id": vid,
-                    "vlan_name": vinfo.get("name", ""),
-                    "svi_interface": vinfo.get("svi_interface", ""),
-                    "voice": vinfo.get("voice", False),
-                }
-            )
-    with open(os.path.join(n_dir, "vlans.csv"), "w", newline="", encoding="utf-8") as f:
+
+def _export_vlans_and_svi_csvs(infra: list[dict], norm_dir: str) -> list[dict]:
+    """Write 02_normalized/vlans.csv and 02_normalized/svi_routes.csv; return correlated SVI rows."""
+    from net_docu_crawler.correlator import build_l3_svi_table
+
+    vlan_rows = [
+        {
+            "hostname": d.get("hostname") or d.get("ip", ""),
+            "site_code": d.get("site_code", ""),
+            "vlan_id": vid,
+            "vlan_name": vinfo.get("name", ""),
+            "svi_interface": vinfo.get("svi_interface", ""),
+            "voice": vinfo.get("voice", False),
+        }
+        for d in infra
+        for vid, vinfo in (d.get("vlans") or {}).items()
+    ]
+    with open(os.path.join(norm_dir, "vlans.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["hostname", "site_code", "vlan_id", "vlan_name", "svi_interface", "voice"])
         w.writeheader()
         w.writerows(vlan_rows)
 
-    # 4. 02_normalized/svi_routes.csv
     svi_rows = build_l3_svi_table(infra)
-    with open(os.path.join(n_dir, "svi_routes.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "site_code",
-                "source_device",
-                "vlan_id",
-                "vlan_name",
-                "svi_interface",
-                "primary_ip",
-                "prefix_cidr",
-                "dhcp_relays",
-                "confidence",
-            ],
-        )
+    svi_fields = [
+        "site_code",
+        "source_device",
+        "vlan_id",
+        "vlan_name",
+        "svi_interface",
+        "primary_ip",
+        "prefix_cidr",
+        "dhcp_relays",
+        "confidence",
+    ]
+    with open(os.path.join(norm_dir, "svi_routes.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=svi_fields)
         w.writeheader()
         for sr in svi_rows:
             row = dict(sr)
             row["dhcp_relays"] = ",".join(sr.get("dhcp_relays") or [])
             w.writerow(row)
+    return svi_rows
 
-    # 5. 02_normalized/poe.csv
-    with open(os.path.join(n_dir, "poe.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "hostname",
-                "ip",
-                "poe_supported",
-                "total_power_watts",
-                "used_power_watts",
-                "allocated_power_watts",
-                "poe_capable_ports",
-                "poe_delivering_ports",
-                "psu_redundancy",
-            ],
-        )
+
+def _export_poe_csv(infra: list[dict], norm_dir: str) -> None:
+    """Write 02_normalized/poe.csv with per-device PoE budget and draw."""
+    poe_fields = [
+        "hostname",
+        "ip",
+        "poe_supported",
+        "total_power_watts",
+        "used_power_watts",
+        "allocated_power_watts",
+        "poe_capable_ports",
+        "poe_delivering_ports",
+        "psu_redundancy",
+    ]
+    with open(os.path.join(norm_dir, "poe.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=poe_fields)
         w.writeheader()
         for d in infra:
             poe = d.get("poe") or {}
@@ -3796,55 +3767,24 @@ def export_layered_csvs(
                 }
             )
 
-    # 6. 03_correlated/physical_links.csv
-    with open(os.path.join(c_dir, "physical_links.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"],
-            extrasaction="ignore",
-        )
-        w.writeheader()
-        for lk in getattr(registry, "links", []) or []:
-            row = dict(lk)
-            row.setdefault("link_class", "infra_uplink")
-            w.writerow(row)
 
-    # 7. 01_raw/ per-device running_config & raw_session.log
-    for d in infra:
-        host = re.sub(r"[^A-Za-z0-9._-]+", "_", str(d.get("hostname") or d.get("ip") or "device"))
-        ip_safe = str(d.get("ip") or "").replace(":", "_")
-        prefix = f"{host}__{ip_safe}" if ip_safe else host
-        raw_cfg = d.get("raw_config") or ""
-        if raw_cfg:
-            with open(os.path.join(r_dir, f"{prefix}_running_config.txt"), "w", encoding="utf-8") as f:
-                f.write(raw_cfg)
-        if ip_safe:
-            for cand_dir in [
-                d_c for d_c in (source_logs_dir, run_output_dir, os.path.join(run_output_dir, "logs")) if d_c
-            ]:
-                src_log = os.path.join(cand_dir, f"{ip_safe}_raw_session.log")
-                if os.path.isfile(src_log):
-                    shutil.copy2(src_log, os.path.join(r_dir, f"{prefix}_raw_session.log"))
-                    break
-
-    # 8. 02_normalized/neighbors.csv
-    with open(os.path.join(n_dir, "neighbors.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "source_device",
-                "site_code",
-                "local_port",
-                "remote_device",
-                "remote_port",
-                "remote_ip",
-                "remote_mac",
-                "platform",
-                "device_type",
-                "link_confidence",
-                "capture_time",
-            ],
-        )
+def _export_neighbors_csv(infra: list[dict], norm_dir: str) -> None:
+    """Write 02_normalized/neighbors.csv with normalized LLDP/CDP adjacencies."""
+    nbr_fields = [
+        "source_device",
+        "site_code",
+        "local_port",
+        "remote_device",
+        "remote_port",
+        "remote_ip",
+        "remote_mac",
+        "platform",
+        "device_type",
+        "link_confidence",
+        "capture_time",
+    ]
+    with open(os.path.join(norm_dir, "neighbors.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=nbr_fields)
         w.writeheader()
         for d in infra:
             host = d.get("hostname") or d.get("ip", "")
@@ -3867,10 +3807,48 @@ def export_layered_csvs(
                     }
                 )
 
-    # 9. 03_correlated/vlan_propagation.csv
-    svi_by_site_vid: dict[tuple[str, str], dict] = {}
-    for sr in svi_rows:
-        svi_by_site_vid[(sr.get("site_code", ""), str(sr.get("vlan_id", "")))] = sr
+
+def _export_raw_device_artifacts(infra: list[dict], raw_dir: str, run_output_dir: str, source_logs_dir: str) -> None:
+    """Write 01_raw/*_running_config.txt and copy raw session logs if present."""
+    cand_dirs = [d_c for d_c in (source_logs_dir, run_output_dir, os.path.join(run_output_dir, "logs")) if d_c]
+    for d in infra:
+        host = re.sub(r"[^A-Za-z0-9._-]+", "_", str(d.get("hostname") or d.get("ip") or "device"))
+        ip_safe = str(d.get("ip") or "").replace(":", "_")
+        prefix = f"{host}__{ip_safe}" if ip_safe else host
+        raw_cfg = d.get("raw_config") or ""
+        if raw_cfg:
+            with open(os.path.join(raw_dir, f"{prefix}_running_config.txt"), "w", encoding="utf-8") as f:
+                f.write(raw_cfg)
+        if ip_safe:
+            for cand_dir in cand_dirs:
+                src_log = os.path.join(cand_dir, f"{ip_safe}_raw_session.log")
+                if os.path.isfile(src_log):
+                    shutil.copy2(src_log, os.path.join(raw_dir, f"{prefix}_raw_session.log"))
+                    break
+
+
+def _export_physical_links_and_endpoints_csvs(registry, corr_dir: str, run_output_dir: str) -> None:
+    """Write 03_correlated/physical_links.csv and copy endpoint_bindings.csv if present."""
+    with open(os.path.join(corr_dir, "physical_links.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"],
+            extrasaction="ignore",
+        )
+        w.writeheader()
+        for lk in getattr(registry, "links", []) or []:
+            row = dict(lk)
+            row.setdefault("link_class", "infra_uplink")
+            w.writerow(row)
+
+    ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
+    if os.path.isfile(ep_src):
+        shutil.copy2(ep_src, os.path.join(corr_dir, "endpoint_bindings.csv"))
+
+
+def _export_vlan_propagation_csv(infra: list[dict], svi_rows: list[dict], corr_dir: str) -> None:
+    """Write 03_correlated/vlan_propagation.csv summarizing campus VLAN/trunk reach."""
+    svi_by_site_vid = {(sr.get("site_code", ""), str(sr.get("vlan_id", ""))): sr for sr in svi_rows}
     vlan_prop: dict[tuple[str, str], dict] = {}
     for d in infra:
         host = d.get("hostname") or d.get("ip", "")
@@ -3894,21 +3872,20 @@ def export_layered_csvs(
                     key = (sc, str(vid))
                     if key in vlan_prop:
                         vlan_prop[key]["trunk_ports"].add(f"{host}:{p_rec.get('interface', '')}")
-    with open(os.path.join(c_dir, "vlan_propagation.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "site_code",
-                "vlan_id",
-                "vlan_name",
-                "svi_device",
-                "gateway_ip",
-                "subnet",
-                "switch_count",
-                "trunk_port_count",
-                "trunk_ports",
-            ],
-        )
+
+    prop_fields = [
+        "site_code",
+        "vlan_id",
+        "vlan_name",
+        "svi_device",
+        "gateway_ip",
+        "subnet",
+        "switch_count",
+        "trunk_port_count",
+        "trunk_ports",
+    ]
+    with open(os.path.join(corr_dir, "vlan_propagation.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=prop_fields)
         w.writeheader()
         for key in sorted(vlan_prop.keys(), key=lambda x: (x[0], int(x[1]) if x[1].isdigit() else 99999)):
             vp = vlan_prop[key]
@@ -3928,18 +3905,17 @@ def export_layered_csvs(
                 }
             )
 
-    # 10. 03_correlated/endpoint_bindings.csv
-    ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
-    if os.path.isfile(ep_src):
-        shutil.copy2(ep_src, os.path.join(c_dir, "endpoint_bindings.csv"))
 
-    # 11. 03_correlated/trunk_audit.json, 03_correlated/trunk_mismatches.csv & 05_reports/trunk_vlan_audit.md
+def _export_trunk_audit_artifacts(
+    raw_devices: list[dict], trunk_audit: dict | None, corr_dir: str, rep_dir: str
+) -> None:
+    """Write trunk_audit.json, trunk_mismatches.csv, and 05_reports/trunk_vlan_audit.md."""
     resolved_audit = trunk_audit if trunk_audit is not None else _resolve_trunk_audit(raw_devices)
-    with open(os.path.join(c_dir, "trunk_audit.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(corr_dir, "trunk_audit.json"), "w", encoding="utf-8") as f:
         json.dump(resolved_audit, f, indent=2, default=list)
 
     trunk_csv_rows = _normalize_trunk_csv_rows(resolved_audit)
-    with open(os.path.join(c_dir, "trunk_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(corr_dir, "trunk_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=TRUNK_MISMATCH_CSV_FIELDS)
         w.writeheader()
         w.writerows(trunk_csv_rows)
@@ -3947,6 +3923,37 @@ def export_layered_csvs(
     layered_trunk_md = os.path.join(rep_dir, "trunk_vlan_audit.md")
     if not os.path.isfile(layered_trunk_md):
         generate_trunk_audit_report(resolved_audit, output_path=layered_trunk_md)
+
+
+def export_layered_csvs(
+    raw_devices: list[dict],
+    registry,
+    run_output_dir: str,
+    source_logs_dir: str = "",
+    trunk_audit: dict | None = None,
+) -> None:
+    """
+    Export normalized and correlated machine-readable CSVs into the layered
+    `00_manifest/`, `01_raw/`, `02_normalized/`, and `03_correlated/` subdirectories.
+    """
+    m_dir = os.path.join(run_output_dir, "00_manifest")
+    r_dir = os.path.join(run_output_dir, "01_raw")
+    n_dir = os.path.join(run_output_dir, "02_normalized")
+    c_dir = os.path.join(run_output_dir, "03_correlated")
+    rep_dir = os.path.join(run_output_dir, "05_reports")
+    for d in (m_dir, r_dir, n_dir, c_dir, rep_dir):
+        os.makedirs(d, exist_ok=True)
+
+    _export_failures_csv(raw_devices, m_dir)
+    infra = [d for d in raw_devices if d.get("status", "success") == "success"]
+    _export_interfaces_csv(infra, n_dir, c_dir)
+    svi_rows = _export_vlans_and_svi_csvs(infra, n_dir)
+    _export_poe_csv(infra, n_dir)
+    _export_physical_links_and_endpoints_csvs(registry, c_dir, run_output_dir)
+    _export_raw_device_artifacts(infra, r_dir, run_output_dir, source_logs_dir)
+    _export_neighbors_csv(infra, n_dir)
+    _export_vlan_propagation_csv(infra, svi_rows, c_dir)
+    _export_trunk_audit_artifacts(raw_devices, trunk_audit, c_dir, rep_dir)
 
 
 TRUNK_MISMATCH_CSV_FIELDS = [
