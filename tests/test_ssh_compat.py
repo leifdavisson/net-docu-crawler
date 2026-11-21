@@ -302,11 +302,27 @@ def test_per_connection_legacy_transport_does_not_pollute_global_transport_table
     srv_key = _ServerDSSKey(key=priv)
     s_sock, c_sock = socket.socketpair()
     server_t = Transport(s_sock)
+    legacy_kex = next(
+        (
+            k
+            for k in ("diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1", "diffie-hellman-group-exchange-sha1")
+            if k in Transport._kex_info
+        ),
+        Transport._preferred_kex[0],
+    )
+    legacy_cipher = next(
+        (c for c in ("aes128-cbc", "aes192-cbc", "aes256-cbc", "3des-cbc") if c in Transport._cipher_info),
+        Transport._preferred_ciphers[0],
+    )
+    legacy_mac = next(
+        (m for m in ("hmac-md5", "hmac-sha1", "hmac-md5-96", "hmac-sha1-96") if m in Transport._mac_info),
+        Transport._preferred_macs[0],
+    )
     server_t._key_info = {**Transport._key_info, "ssh-dss": _ServerDSSKey}
     server_t._preferred_keys = ("ssh-dss",)
-    server_t._preferred_ciphers = ("aes128-cbc",)
-    server_t._preferred_macs = ("hmac-md5",)
-    server_t._preferred_kex = ("diffie-hellman-group1-sha1",)
+    server_t._preferred_ciphers = (legacy_cipher,)
+    server_t._preferred_macs = (legacy_mac,)
+    server_t._preferred_kex = (legacy_kex,)
     server_t.add_server_key(srv_key)
 
     client_t = build_legacy_transport(c_sock)
