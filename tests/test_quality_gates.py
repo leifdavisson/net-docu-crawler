@@ -46,3 +46,33 @@ def test_quality_gates_pass_and_fail(tmp_path):
     assert statuses["GATE_CABLING_VLAN_EMPTY"] == "FAIL"
     assert statuses["GATE_POE_CONTRADICTION"] == "FAIL"
     assert statuses["GATE_STP_ROOT_EVIDENCE"] == "FAIL"
+
+
+def test_quality_gates_gathers_unauthenticated_and_command_mismatches(tmp_path):
+    from net_docu_crawler.quality_gates import write_quality_report
+
+    devs = [
+        {
+            "ip": "10.0.0.5",
+            "hostname": "10.0.0.5",
+            "status": "unauthenticated",
+            "vendor": "openwrt",
+            "mac_address": "00:d0:5f:0a:a4:60",
+        },
+        {
+            "ip": "10.0.0.6",
+            "hostname": "10.0.0.6",
+            "status": "success",
+            "vendor": "Cisco",
+            "interfaces_detail": {},
+            "raw_config": "% Invalid input detected",
+        },
+    ]
+    rep = evaluate_quality_gates(devs)
+    assert len(rep["unauthenticated_devices"]) == 1
+    assert len(rep["command_header_mismatches"]) == 1
+    write_quality_report(rep, str(tmp_path))
+    txt = (tmp_path / "data_quality_report.md").read_text(encoding="utf-8")
+    assert "## Unauthenticated Devices & Command/Header Mismatches" in txt
+    assert "`10.0.0.5`" in txt
+    assert "`10.0.0.6`" in txt

@@ -1778,17 +1778,45 @@ def parse_target_vendor_spec(raw_spec: str) -> dict[str, str]:
 
 def _stitch_dataset_topology(raw_devices: list[dict], registry: DeviceRegistry) -> None:
     """Cross-resolve neighbor IPs/personas from crawled devices and Global ARP, then stitch topology edges."""
-    crawled_by_ip = {d["ip"]: d for d in raw_devices if d.get("ip")}
+    try:
+        from net_docu_crawler.topology_renderer import classify_neighbor_node
+    except ImportError:
+        classify_neighbor_node = None
+
+    crawled_devs = [d for d in raw_devices if isinstance(d, dict) and d.get("status", "success") == "success"]
+    crawled_by_ip = {d["ip"]: d for d in crawled_devs if d.get("ip")}
     crawled_by_host: dict[str, dict] = {}
-    for d in raw_devices:
+    crawled_hosts_lc: set[str] = set()
+    crawled_ips: set[str] = set()
+    crawled_macs: set[str] = set()
+    for d in crawled_devs:
+        if d.get("ip"):
+            crawled_ips.add(str(d["ip"]).strip())
+        for l3 in d.get("l3_interfaces") or []:
+            ip_tok = str((l3 or {}).get("ip_address") or "").split("/")[0].split()[0].strip()
+            if ip_tok and ip_tok not in ("N/A", "unassigned", "0.0.0.0") and not ip_tok.startswith(("127.", "128.0.")):
+                crawled_ips.add(ip_tok)
+        b_mac = oui_lookup.normalize_mac(str(d.get("mac_address") or "")).lower().strip()
+        if b_mac and b_mac != "00:00:00:00:00:00":
+            crawled_macs.add(b_mac)
+        for pinfo in (d.get("interfaces_detail") or {}).values():
+            pmac = oui_lookup.normalize_mac(str((pinfo or {}).get("mac_address") or "")).lower().strip()
+            if pmac and pmac != "00:00:00:00:00:00":
+                crawled_macs.add(pmac)
         for h_key in (d.get("hostname", ""), d.get("canonical_hostname", "")):
             if h_key:
-                crawled_by_host[h_key.lower()] = d
-                crawled_by_host[h_key.split(".")[0].lower()] = d
+                hl = h_key.lower()
+                hs = h_key.split(".")[0].lower()
+                crawled_by_host[hl] = d
+                crawled_by_host[hs] = d
+                crawled_hosts_lc.add(hl)
+                crawled_hosts_lc.add(hs)
 
     def _populate_links() -> None:
         registry.links.clear()
         for device_data in raw_devices:
+            if not isinstance(device_data, dict):
+                continue
             local_host = device_data.get("hostname") or device_data.get("ip", "")
             for nbr in device_data.get("neighbors", []):
                 if not nbr.get("remote_ip"):
@@ -1799,13 +1827,14 @@ def _stitch_dataset_topology(raw_devices: list[dict], registry: DeviceRegistry) 
                     if resolved_ip:
                         nbr["remote_ip"] = resolved_ip
 
-                canon_r = registry.resolve_canonical_hostname(
-                    nbr.get("remote_device", ""),
-                    remote_mac=nbr.get("remote_mac", ""),
-                    remote_ip=nbr.get("remote_ip", ""),
-                )
-                if canon_r:
-                    nbr["remote_device"] = canon_r
+                if nbr.get("l2_accuracy") != "l3_next_hop_egress":
+                    canon_r = registry.resolve_canonical_hostname(
+                        nbr.get("remote_device", ""),
+                        remote_mac=nbr.get("remote_mac", ""),
+                        remote_ip=nbr.get("remote_ip", ""),
+                    )
+                    if canon_r:
+                        nbr["remote_device"] = canon_r
 
                 matched_dev = crawled_by_ip.get(nbr.get("remote_ip", ""))
                 if not matched_dev and nbr.get("remote_device"):
@@ -1821,22 +1850,75 @@ def _stitch_dataset_topology(raw_devices: list[dict], registry: DeviceRegistry) 
                         nbr["remote_platform"] = plat_label
 
                 n_type = (nbr.get("device_type") or "").lower()
-                l_class = (
-                    "infra_uplink"
-                    if (matched_dev or n_type in ("switch", "router", "firewall", "wlc", "bridge"))
-                    else "edge_endpoint"
+                if classify_neighbor_node is not None:
+                    cls_role = classify_neighbor_node(
+                        nbr.get("remote_device", ""),
+                        nbr,
+                        crawled_hosts_lc=crawled_hosts_lc,
+                        crawled_ips=crawled_ips,
+                        crawled_macs=crawled_macs,
+                    )
+                elif matched_dev or nbr.get("l2_accuracy") in ("wan_carrier_arp_route", "l3_next_hop_egress"):
+                    cls_role = n_type if n_type in ("firewall", "router", "isp", "ap") else "crawled_infra"
+                elif n_type == "ap":
+                    cls_role = "ap"
+                elif n_type in ("switch", "router", "firewall", "wlc", "bridge", "isp"):
+                    cls_role = n_type if n_type in ("firewall", "router", "isp") else "uncrawled_switch"
+                else:
+                    cls_role = "endpoint"
+
+                local_is_ap = (
+                    device_data.get("device_type") or device_data.get("device_persona") or ""
+                ).lower() == "ap"
+                remote_is_ap = cls_role == "ap" or (
+                    matched_dev is not None
+                    and (matched_dev.get("device_type") or matched_dev.get("device_persona") or "").lower() == "ap"
                 )
+                if local_is_ap or remote_is_ap:
+                    l_class = "wireless_ap"
+                elif cls_role in ("crawled_infra", "uncrawled_switch", "firewall", "router", "isp"):
+                    l_class = "infra_uplink"
+                else:
+                    l_class = "edge_endpoint"
+
+                l2_acc = str(nbr.get("l2_accuracy") or "").strip().lower()
+                conf = str(nbr.get("link_confidence") or "").strip()
+                if l2_acc == "wan_carrier_arp_route":
+                    link_type = "wan_carrier"
+                    transport_type = str(nbr.get("transport_type") or "metro_ethernet")
+                    evidence = "wan_carrier_arp_route"
+                elif l2_acc == "l3_next_hop_egress":
+                    link_type = "l3_egress"
+                    transport_type = str(nbr.get("transport_type") or "l3_egress")
+                    evidence = "l3_next_hop_egress"
+                elif l2_acc == "mac_inferred":
+                    link_type = "mac_inferred"
+                    transport_type = str(nbr.get("transport_type") or "mac_inferred")
+                    evidence = "mac_inferred"
+                elif l2_acc in ("virtual_passthrough", "multi_neighbor_port"):
+                    link_type = "virtual_passthrough"
+                    transport_type = str(nbr.get("transport_type") or "virtual_passthrough")
+                    evidence = "passthrough"
+                else:
+                    link_type = "physical"
+                    transport_type = str(nbr.get("transport_type") or "direct_l2_uplink")
+                    evidence = "confirmed_lldp" if conf == "two-way" else "unidirectional_lldp"
+
                 registry.add_bidirectional_link(
                     local_node=local_host,
                     local_port=nbr.get("local_port", ""),
                     remote_node=nbr.get("remote_device", ""),
                     remote_port=nbr.get("remote_port", ""),
+                    link_type=link_type,
                     link_class=l_class,
+                    transport_type=transport_type,
+                    evidence=evidence,
                 )
 
     _populate_links()
     registry.reconcile_reciprocal_neighbors(raw_devices)
     registry.infer_mac_table_links(raw_devices)
+    registry.infer_wan_and_gateway_links(raw_devices)
     registry.detect_l2_anomalies(raw_devices)
     _populate_links()
 
@@ -1940,9 +2022,25 @@ def _write_standard_deliverables(
 
     trunk_rep_path = os.path.join(run_output_dir, "trunk_vlan_audit.md")
     report_generator.generate_trunk_audit_report(
-        trunk_audit if trunk_audit is not None else raw_devices, output_path=trunk_rep_path
+        trunk_audit if trunk_audit is not None else raw_devices, output_path=trunk_rep_path, devices=devices_dict
     )
     print(f"[+] Generated trunk VLAN audit report: {trunk_rep_path}")
+
+    followup_path = os.path.join(run_output_dir, "manual_followup_report.md")
+    report_generator.generate_manual_followup_report(
+        devices_dict,
+        output_path=followup_path,
+        trunk_audit=trunk_audit,
+    )
+    print(f"[+] Generated manual follow-up report: {followup_path}")
+
+    topo_html_path = os.path.join(run_output_dir, "topology_interactive.html")
+    report_generator.generate_interactive_topology_html(
+        devices_dict,
+        output_path=topo_html_path,
+        trunk_audit=trunk_audit,
+    )
+    print(f"[+] Generated interactive topology viewer: {topo_html_path}")
 
     bom_path = os.path.join(run_output_dir, "bom_hardware_sizing.csv")
     report_generator.generate_bom_hardware_sizing(
@@ -1962,6 +2060,8 @@ def _write_standard_deliverables(
         (l3_path, os.path.join(rep_dir, "L3_network_diagrams.md")),
         (trans_path, os.path.join(rep_dir, "protocol_translation_matrix.md")),
         (trunk_rep_path, os.path.join(rep_dir, "trunk_vlan_audit.md")),
+        (followup_path, os.path.join(rep_dir, "manual_followup_report.md")),
+        (topo_html_path, os.path.join(rep_dir, "topology_interactive.html")),
     ]
     for src_p, dst_p in _layer_copies:
         if os.path.isfile(src_p):
@@ -2395,7 +2495,7 @@ def _infer_vendor_from_log(log_text: str, existing_vendor: str = "") -> str:
         "cisco_ios": "cisco",
         "cisco_xe": "cisco",
         "cisco_nxos": "cisco",
-        "cisco_xr": "cisco",
+        "cisco_xr": "cisco_xr",
         "cisco": "cisco",
         "arista_eos": "arista",
         "arista": "arista",
@@ -2746,6 +2846,33 @@ def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
         "--validate-credentials",
         action="store_true",
         help="Validate --credentials JSON file(s) and exit without running a crawl",
+    )
+    parser.add_argument(
+        "--netconf",
+        action="store_true",
+        help="Enable opt-in read-only NETCONF enrichment for supported platforms (requires ncclient)",
+    )
+    parser.add_argument(
+        "--netconf-port",
+        type=int,
+        default=830,
+        help="NETCONF SSH port when --netconf is enabled (default: 830)",
+    )
+    parser.add_argument(
+        "--gnmi",
+        action="store_true",
+        help="Enable opt-in read-only gNMI Get() enrichment for supported platforms (requires pygnmi)",
+    )
+    parser.add_argument(
+        "--gnmi-port",
+        type=int,
+        default=57400,
+        help="gNMI gRPC port when --gnmi is enabled (default: 57400)",
+    )
+    parser.add_argument(
+        "--gnmi-insecure",
+        action="store_true",
+        help="Skip TLS verification for gNMI connections (lab/self-signed certs only)",
     )
 
 

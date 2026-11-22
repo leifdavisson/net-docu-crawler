@@ -144,11 +144,58 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
         }
     )
 
+    unauthenticated_devices: list[dict] = []
+    command_header_mismatches: list[dict] = []
+    for dev in raw_devices:
+        if not isinstance(dev, dict):
+            continue
+        ip = str(dev.get("ip") or "")
+        st = str(dev.get("status") or "").strip().lower()
+        hn = str(dev.get("hostname") or ip).strip()
+        if st == "unauthenticated":
+            unauthenticated_devices.append(
+                {
+                    "ip": ip,
+                    "hostname": hn,
+                    "vendor": str(dev.get("vendor") or "Unknown"),
+                    "mac_address": str(dev.get("mac_address") or ""),
+                    "model": str(dev.get("model") or ""),
+                }
+            )
+        elif st == "success":
+            reasons: list[str] = []
+            if not hn or hn == ip or hn.lower() == "unknown":
+                reasons.append("hostname unresolved (header/version parse mismatch)")
+            if not (dev.get("interfaces_detail") or {}):
+                reasons.append("0 interfaces parsed (command/driver mismatch)")
+            cfg_l = str(dev.get("raw_config") or "").lower()
+            for marker in (
+                "% invalid input",
+                "privileged mode required",
+                "syntax error",
+                "command not found",
+                "unknown command",
+            ):
+                if marker in cfg_l:
+                    reasons.append(f"CLI error in config output (`{marker}`)")
+                    break
+            if reasons:
+                command_header_mismatches.append(
+                    {
+                        "ip": ip,
+                        "hostname": hn or ip,
+                        "vendor": str(dev.get("vendor") or "Unknown"),
+                        "reasons": "; ".join(reasons),
+                    }
+                )
+
     p0_failed = any(g["severity"] == "P0" and g["status"] == "FAIL" for g in gates)
     return {
         "passed": not p0_failed,
         "gates": gates,
         "trunk_audit_summary": trunk_summary,
+        "unauthenticated_devices": unauthenticated_devices,
+        "command_header_mismatches": command_header_mismatches,
         "funnel": {
             "total_records": len(raw_devices),
             "crawled_infra": funnel.get("crawled_infra", 0),
@@ -211,5 +258,35 @@ def write_quality_report(report: dict, manifest_dir: str) -> None:
             f"- Known Trunk Native VLAN: **{pc['known_trunk_native_pct']}%**",
         ]
     )
+
+    unauth = report.get("unauthenticated_devices") or []
+    mismatches = report.get("command_header_mismatches") or []
+    if unauth or mismatches:
+        lines.extend(["", "## Unauthenticated Devices & Command/Header Mismatches"])
+    if unauth:
+        lines.extend(
+            [
+                "",
+                f"### Unauthenticated Devices ({len(unauth)})",
+                "| IP Address | Hostname | Vendor / OUI | MAC Address | Banner / Model |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for u in unauth:
+            lines.append(
+                f"| `{u['ip']}` | **{u['hostname']}** | {u['vendor']} | `{u['mac_address'] or 'N/A'}` | `{u['model'] or 'N/A'}` |"
+            )
+    if mismatches:
+        lines.extend(
+            [
+                "",
+                f"### Crawled Command / Header Mismatches ({len(mismatches)})",
+                "| IP Address | Hostname | Vendor | Mismatch Detail |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for m in mismatches:
+            lines.append(f"| `{m['ip']}` | **{m['hostname']}** | {m['vendor']} | {m['reasons']} |")
+
     with open(os.path.join(manifest_dir, "data_quality_report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

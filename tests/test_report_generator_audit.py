@@ -188,3 +188,72 @@ def test_physical_links_link_class_export(tmp_path):
     classes = {r["node_b"] if r["node_a"] == "SW1" else r["node_a"]: r["link_class"] for r in rows}
     assert classes["SW2"] == "infra_uplink"
     assert classes["cam-01"] == "edge_endpoint"
+
+
+def test_live_report_collapses_access_internal_host_routes_and_physical_links_transport_csv(tmp_path):
+    import csv
+
+    import report_generator
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    routes = [
+        {"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "10.250.5.1", "interface": "irb.1050"},
+        *[
+            {
+                "subnet": f"10.5.192.{i}/32",
+                "protocol": "Access-internal",
+                "next_hop": "10.5.192.1",
+                "interface": "irb.2052",
+            }
+            for i in range(10, 40)
+        ],
+        *[
+            {
+                "subnet": f"10.5.128.{i}/32",
+                "protocol": "Access-internal",
+                "next_hop": "10.5.128.1",
+                "interface": "irb.10",
+            }
+            for i in range(10, 30)
+        ],
+    ]
+    devices = {
+        "10.250.5.2": {
+            "hostname": "VES_MDF_CORE_BLDG_A",
+            "ip": "10.250.5.2",
+            "status": "success",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "interfaces_detail": {"xe-0/0/22": {"status": "up"}},
+            "l3_interfaces": [{"interface": "irb.1050", "ip_address": "10.250.5.2/30", "status": "up"}],
+            "routes": routes,
+        }
+    }
+    live_md = tmp_path / "live_report.md"
+    report_generator.generate_network_analysis_report(devices, output_path=str(live_md))
+    live_txt = live_md.read_text(encoding="utf-8")
+    assert "`0.0.0.0/0`" in live_txt
+    assert (
+        "*(30 `/32` Access-internal subscriber/host routes summarized)* | Access-internal | - | irb.2052 |" in live_txt
+    )
+    assert "*(20 `/32` Access-internal subscriber/host routes summarized)* | Access-internal | - | irb.10 |" in live_txt
+    assert "10.5.192.15/32" not in live_txt
+
+    reg = DeviceRegistry()
+    reg.add_bidirectional_link(
+        "DO-Main-BLDG",
+        "C1",
+        "VES_MDF_CORE_BLDG_A",
+        "xe-0/0/22",
+        link_type="wan_carrier",
+        link_class="infra_uplink",
+        transport_type="metro_ethernet",
+        evidence="wan_carrier_arp_route",
+    )
+    reg.links[0]["extra_ignored_field"] = "should_not_crash"
+    report_generator.export_layered_csvs([devices["10.250.5.2"]], reg, str(tmp_path))
+    with open(tmp_path / "03_correlated" / "physical_links.csv", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["transport_type"] == "metro_ethernet"
+    assert rows[0]["evidence"] == "wan_carrier_arp_route"

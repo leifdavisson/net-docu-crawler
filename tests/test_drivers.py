@@ -2756,3 +2756,510 @@ def test_prune_empty_session_logs_removes_only_zero_byte_files(tmp_path):
 
     assert not empty_log.exists()
     assert non_empty_log.read_text(encoding="utf-8") == "SW# show version\n"
+
+
+def test_juniper_driver_includes_mge_multigig_ports():
+    import json
+
+    mock_conn = MagicMock()
+    mock_conn.send_command.return_value = json.dumps(
+        {
+            "interface-information": [
+                {
+                    "physical-interface": [
+                        {
+                            "name": [{"data": "mge-0/0/0"}],
+                            "admin-status": [{"data": "up"}],
+                            "oper-status": [{"data": "up"}],
+                            "logical-interface": [],
+                        },
+                        {
+                            "name": [{"data": "ge-0/0/16"}],
+                            "admin-status": [{"data": "up"}],
+                            "oper-status": [{"data": "down"}],
+                            "logical-interface": [],
+                        },
+                    ]
+                }
+            ]
+        }
+    )
+    drv = JuniperDriver(ip="10.2.40.2")
+    _l3, detail = drv.get_interfaces(mock_conn)
+    assert "mge-0/0/0" in detail
+    assert detail["mge-0/0/0"]["speed"] == "2.5Gb/s"
+    assert "ge-0/0/16" in detail
+
+
+def test_extract_vlans_junos_descriptions_and_svi_join():
+    from net_docu_crawler.correlator import build_l3_svi_table
+    from net_docu_crawler.migration_parsers import extract_vlans
+
+    junos_set_cfg = (
+        'set vlans VLAN_3057 description "CLOCKS_BELLS_AV"\n'
+        "set vlans VLAN_3057 vlan-id 3057\n"
+        "set vlans VLAN_3057 l3-interface irb.3057\n"
+        "set vlans Vlan_1050 description 'WAN_UPLINK'\n"
+        "set vlans Vlan_1050 vlan-id 1050\n"
+        "set vlans Vlan_1050 l3-interface irb.1050\n"
+        "set vlans default vlan-id 1\n"
+        "set vlans default l3-interface irb.0\n"
+    )
+    vlans_set = extract_vlans(junos_set_cfg, vendor="Juniper Networks")
+    assert vlans_set["3057"] == {
+        "id": "3057",
+        "name": "VLAN_3057",
+        "svi_interface": "irb.3057",
+        "voice": False,
+        "description": "CLOCKS_BELLS_AV",
+    }
+    assert vlans_set["1050"]["description"] == "WAN_UPLINK"
+    assert vlans_set["1"]["description"] == ""
+
+    junos_brace_cfg = (
+        "vlans {\n"
+        "    STUDENT_WIFI {\n"
+        '        description "Student Chromebooks & WiFi";\n'
+        "        vlan-id 2051;\n"
+        "        l3-interface irb.2051;\n"
+        "    }\n"
+        "    VOIP {\n"
+        "        vlan-id 2058;\n"
+        "        description 'Campus Phones';\n"
+        "    }\n"
+        "}\n"
+    )
+    vlans_brace = extract_vlans(junos_brace_cfg, vendor="Juniper Networks")
+    assert vlans_brace["2051"]["description"] == "Student Chromebooks & WiFi"
+    assert vlans_brace["2051"]["svi_interface"] == "irb.2051"
+    assert vlans_brace["2058"]["description"] == "Campus Phones"
+
+    cisco_vlans = extract_vlans("vlan 10\n name DATA\n!\n", vendor="Cisco")
+    assert cisco_vlans["10"]["description"] == ""
+
+    svi_rows = build_l3_svi_table(
+        [
+            {
+                "ip": "10.250.5.2",
+                "hostname": "VES_MDF_CORE_BLDG_A",
+                "status": "success",
+                "site_code": "VES",
+                "vlans": vlans_set,
+                "l3_interfaces": [
+                    {"interface": "irb.3057", "ip_address": "10.5.120.1/24", "status": "up"},
+                    {"interface": "irb.0", "ip_address": "10.5.0.1/24", "status": "up"},
+                ],
+            }
+        ]
+    )
+    by_svi = {r["svi_interface"]: r for r in svi_rows}
+    assert by_svi["irb.3057"]["vlan_description"] == "CLOCKS_BELLS_AV"
+    assert by_svi["irb.0"]["vlan_id"] == "1"
+    assert by_svi["irb.0"]["vlan_description"] == ""
+
+
+def test_hpprocurve_routing_table_multiword_vlans_and_neighbors():
+    drv = HPProCurveDriver(ip="10.1.0.1")
+    mock_conn = MagicMock()
+    mock_conn.send_command.side_effect = lambda cmd: {
+        "show ip route": (
+            "IP Route Entries\n\n"
+            "  Destination        Gateway         VLAN Type      Sub-Type   Metric     Dist.\n"
+            "  ------------------ --------------- ---- --------- ---------- ---------- -----\n"
+            "  0.0.0.0/0          172.31.254.2    FW Internal R... static               1          1\n"
+            "  10.1.0.0/24        DEFAULT_VLAN    VLAN 101 connected            0          1\n"
+            "  10.250.6.0/24      Route to NMS    1052 connected            1          0\n"
+            "  172.31.0.0/24      Dist Switches   3009 connected            1          0\n"
+            "  172.31.254.0/30    FW Internal Route 4009 connected          1          0\n"
+            "  127.0.0.0/8        reject               static               0          0\n"
+        ),
+        "show lldp info remote-device": (
+            " LLDP Remote Devices Information\n\n"
+            "  LocalPort | ChassisId          PortId             PortDescr            SysName\n"
+            "  --------- + ------------------ ------------------ -------------------- ------------------\n"
+            "  B14       | ac cc 8e a3 f2 13  eth0               Port description...  Axis Camera\n"
+            "  C2        | c0 03 80 0f cf 00  556                xe-0/0/22            NMS_MDF_CORE_BLDG_B\n"
+            "  D5        | 00 11 22 33 44 55  49                 Uplink to IDF        DIST-SW-01\n"
+        ),
+    }.get(cmd, "")
+
+    routes = drv.get_routing_table(mock_conn)
+    by_sub = {r["subnet"]: r for r in routes}
+    assert "127.0.0.0/8" not in by_sub
+    assert by_sub["0.0.0.0/0"] == {
+        "subnet": "0.0.0.0/0",
+        "protocol": "static",
+        "next_hop": "172.31.254.2",
+        "interface": "FW Internal R...",
+    }
+    assert by_sub["10.1.0.0/24"] == {
+        "subnet": "10.1.0.0/24",
+        "protocol": "connected",
+        "next_hop": "Directly Connected",
+        "interface": "VLAN 101",
+    }
+    assert by_sub["10.250.6.0/24"] == {
+        "subnet": "10.250.6.0/24",
+        "protocol": "connected",
+        "next_hop": "Directly Connected",
+        "interface": "1052",
+    }
+    assert by_sub["172.31.0.0/24"]["protocol"] == "connected"
+    assert by_sub["172.31.0.0/24"]["next_hop"] == "Directly Connected"
+    assert by_sub["172.31.254.0/30"]["protocol"] == "connected"
+    assert by_sub["172.31.254.0/30"]["interface"] == "4009"
+
+    nbrs = drv.get_neighbors(mock_conn)
+    by_lp = {n["local_port"]: n for n in nbrs}
+    assert by_lp["B14"]["remote_port"] == "eth0"
+    assert by_lp["B14"]["remote_port_description"] == "Port description..."
+    assert by_lp["C2"]["remote_port"] == "xe-0/0/22"
+    assert by_lp["D5"]["remote_port"] == "49"
+    assert by_lp["D5"]["remote_port_description"] == "Uplink to IDF"
+
+
+def test_juniper_neighbors_port_priority_and_text_classification():
+    import json
+
+    from net_docu_crawler.drivers.juniper import _pick_clean_remote_port
+
+    assert _pick_clean_remote_port("584", "ge-0/0/47.0", "Uplink to BLDG J") == (
+        "ge-0/0/47",
+        "Uplink to BLDG J",
+    )
+    assert _pick_clean_remote_port("40:e3:d6:c1:2d:a4", "", "eth0") == ("eth0", "")
+    assert _pick_clean_remote_port("584", "", "Uplink to BLDG J Switch - Rooms 24-28, Music") == (
+        "Uplink to BLDG J Switch - Rooms 24-28, Music",
+        "Uplink to BLDG J Switch - Rooms 24-28, Music",
+    )
+
+    # 1. Detail JSON path: MAC/ifIndex port-id overridden by clean port-info
+    drv = JuniperDriver(ip="10.250.4.2")
+    conn_det = MagicMock()
+    conn_det.send_command.side_effect = lambda cmd: (
+        json.dumps(
+            {
+                "lldp-neighbors-information": [
+                    {
+                        "lldp-neighbor-information": [
+                            {
+                                "lldp-local-interface": [{"data": "ge-0/0/8.0"}],
+                                "lldp-remote-system-name": [{"data": "ODE_BLDG_J"}],
+                                "lldp-remote-chassis-id": [{"data": "20:d8:0b:92:e0:62"}],
+                                "lldp-remote-port-id": [{"data": "584"}],
+                                "lldp-remote-port-info": [{"data": "ge-0/0/47.0"}],
+                                "lldp-remote-port-description": [{"data": "Uplink to BLDG J Switch"}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+        if cmd == "show lldp neighbors detail | display json"
+        else ""
+    )
+    nbrs_det = drv.get_neighbors(conn_det)
+    assert len(nbrs_det) == 1
+    assert nbrs_det[0]["remote_port"] == "ge-0/0/47"
+    assert nbrs_det[0]["remote_port_description"] == "Uplink to BLDG J Switch"
+
+    # 2. Summary JSON fallback (`show lldp neighbors | display json`)
+    conn_sum = MagicMock()
+    conn_sum.send_command.side_effect = lambda cmd: (
+        json.dumps(
+            {
+                "lldp-neighbors-information": [
+                    {
+                        "lldp-neighbor-information": [
+                            {
+                                "lldp-local-port-id": [{"data": "ge-0/0/1"}],
+                                "lldp-remote-chassis-id": [{"data": "60:d0:2c:10:4f:70"}],
+                                "lldp-remote-port-id": [{"data": "584"}],
+                                "lldp-remote-port-info": [{"data": "49"}],
+                                "lldp-remote-port-description": [{"data": "Ruckus AP Uplink"}],
+                                "lldp-remote-system-name": [{"data": "RM-101-AP"}],
+                            },
+                            {
+                                "lldp-local-port-id": [{"data": "ge-0/2/0"}],
+                                "lldp-remote-chassis-id": [{"data": "c0:03:80:0f:89:00"}],
+                                "lldp-remote-port-description": [
+                                    {"data": "Uplink to BLDG J Switch - Rooms 24-28, Music"}
+                                ],
+                                "lldp-remote-system-name": [{"data": "ODE_MDF_CORE_BLDG_A"}],
+                            },
+                        ]
+                    }
+                ]
+            }
+        )
+        if cmd == "show lldp neighbors | display json"
+        else ""
+    )
+    nbrs_sum = drv.get_neighbors(conn_sum)
+    assert nbrs_sum[0]["remote_port"] == "49"
+    assert nbrs_sum[0]["remote_port_description"] == "Ruckus AP Uplink"
+    assert nbrs_sum[0]["device_type"] == "ap"
+    assert nbrs_sum[1]["remote_port"] == "Uplink to BLDG J Switch - Rooms 24-28, Music"
+    assert nbrs_sum[1]["remote_port_description"] == "Uplink to BLDG J Switch - Rooms 24-28, Music"
+
+    # 3. Text fallback (`show lldp neighbors`) classifies AP, phone, camera, workstation accurately
+    conn_txt = MagicMock()
+    conn_txt.send_command.side_effect = lambda cmd: (
+        (
+            "Local Interface    Parent Interface    Chassis Id          Port info          System Name\n"
+            "ge-0/0/1.0         -                   60:d0:2c:10:4f:70   eth0               RM-102-AP\n"
+            "ge-0/0/2.0         -                   00:0f:d3:0a:ae:38   eth0               d65-000FD30AAE38\n"
+            "ge-0/0/3.0         -                   ac:cc:8e:9c:d2:d8   eth0               axis-cam01\n"
+            "ge-0/0/4.0         -                   50:9a:4c:41:d8:c8   eth0               DESKTOP-WORK01\n"
+            "ge-0/0/5.0         -                   20:d8:0b:92:e0:62   xe-0/2/0           IDF-SW-01\n"
+        )
+        if cmd == "show lldp neighbors"
+        else ""
+    )
+    nbrs_txt = drv.get_neighbors(conn_txt)
+    by_lp = {n["local_port"]: n for n in nbrs_txt}
+    assert by_lp["ge-0/0/1"]["device_type"] == "ap"
+    assert by_lp["ge-0/0/2"]["device_type"] == "phone"
+    assert by_lp["ge-0/0/3"]["device_type"] == "camera"
+    assert by_lp["ge-0/0/4"]["device_type"] == "endpoint"
+    assert by_lp["ge-0/0/5"]["device_type"] == "switch"
+
+
+def test_wan_gateway_synthesis_and_reciprocal_port_resolution():
+    from net_docu_crawler.crawler import _stitch_dataset_topology
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    hub = {
+        "ip": "10.1.0.1",
+        "hostname": "DO-Main-BLDG",
+        "status": "success",
+        "vendor": "HP ProCurve",
+        "model": "HP 5412zl",
+        "device_type": "switch",
+        "mac_address": "88:51:fb:79:89:00",
+        "interfaces_detail": {
+            "A1": {"status": "up", "description": "Spectrum Internet", "speed": "1Gb/s"},
+            "A2": {"status": "up", "description": "Internal port on Firewall", "speed": "1Gb/s"},
+            "A3": {"status": "up", "description": "External port on Firewall", "speed": "1Gb/s"},
+            "C1": {"status": "up", "description": "Spectrum Metro Ethernet to Elem", "speed": "10Gb/s"},
+        },
+        "vlans": {
+            "2": {"id": "2", "name": "ISP", "svi_interface": "", "voice": False, "description": ""},
+            "1050": {"id": "1050", "name": "Spectrun-VES", "svi_interface": "", "voice": False, "description": ""},
+            "1051": {"id": "1051", "name": "Spectrun-WBE", "svi_interface": "", "voice": False, "description": ""},
+            "4009": {"id": "4009", "name": "FW Internal Route", "svi_interface": "", "voice": False, "description": ""},
+        },
+        "l3_interfaces": [
+            {"interface": "Spectrun-VES", "ip_address": "10.250.5.1/24", "status": "up"},
+            {"interface": "Spectrun-WBE", "ip_address": "10.250.8.1/30", "status": "up"},
+            {"interface": "FW Internal Route", "ip_address": "172.31.254.1/30", "status": "up"},
+        ],
+        "routes": [
+            {"subnet": "0.0.0.0/0", "protocol": "static", "next_hop": "172.31.254.2", "interface": "4009"},
+            {"subnet": "10.5.0.0/16", "protocol": "static", "next_hop": "10.250.5.2", "interface": "1050"},
+        ],
+        "arp_table": [
+            {"ip": "172.31.254.2", "mac": "8c:36:7a:7b:3d:52", "interface": "4009"},
+            {"ip": "10.250.5.2", "mac": "c0:03:80:0f:75:00", "interface": "1050"},
+            {"ip": "10.250.8.2", "mac": "c0:03:80:0e:62:00", "interface": "1051"},
+        ],
+        "mac_table": [
+            {"mac": "44:aa:50:6a:60:23", "interface": "A1", "vlan": "2"},
+            {"mac": "8c:36:7a:7b:3d:53", "interface": "A2", "vlan": "2"},
+            {"mac": "8c:36:7a:7b:3d:52", "interface": "A3", "vlan": "4009"},
+            {"mac": "c0:03:80:0f:75:00", "interface": "C1", "vlan": "1050"},
+            {"mac": "c0:03:80:0e:62:00", "interface": "C1", "vlan": "1051"},
+        ],
+        "neighbors": [],
+    }
+    ves_core = {
+        "ip": "10.250.5.2",
+        "hostname": "VES_MDF_CORE_BLDG_A",
+        "status": "success",
+        "vendor": "Juniper Networks",
+        "model": "ex4600-40f",
+        "device_type": "switch",
+        "mac_address": "c0:03:80:0f:75:00",
+        "interfaces_detail": {
+            "xe-0/0/22": {"status": "up", "description": "WAN to DO", "speed": "10Gb/s"},
+            "ge-0/0/1": {
+                "status": "up",
+                "description": "Uplink to BLDG J Switch - Rooms 24-28, Music",
+                "speed": "1Gb/s",
+            },
+        },
+        "l3_interfaces": [{"interface": "irb.1050", "ip_address": "10.250.5.2/30", "status": "up"}],
+        "routes": [{"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "10.250.5.1", "interface": "irb.1050"}],
+        "arp_table": [],
+        "mac_table": [{"mac": "88:51:fb:79:89:00", "interface": "xe-0/0/22", "vlan": "Vlan_1050"}],
+        "neighbors": [
+            {
+                "local_port": "ge-0/0/1",
+                "remote_device": "VES_BLDG_J",
+                "remote_port": "584",
+                "remote_ip": "10.5.99.10",
+                "device_type": "switch",
+            }
+        ],
+    }
+    wbe_core = {
+        "ip": "10.250.8.2",
+        "hostname": "WBE_MDF_CORE_BLDG_A",
+        "status": "success",
+        "vendor": "Juniper Networks",
+        "model": "ex4600-40f",
+        "device_type": "switch",
+        "mac_address": "c0:03:80:0e:62:00",
+        "interfaces_detail": {"ge-0/0/23": {"status": "up", "description": "WAN to DO", "speed": "1Gb/s"}},
+        "l3_interfaces": [{"interface": "irb.1051", "ip_address": "10.250.8.2/30", "status": "up"}],
+        "routes": [{"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "10.250.8.1", "interface": "irb.1051"}],
+        "arp_table": [],
+        "mac_table": [{"mac": "88:51:fb:79:89:00", "interface": "ge-0/0/23", "vlan": "Vlan_1051"}],
+        "neighbors": [],
+    }
+    ves_bldg_j = {
+        "ip": "10.5.99.10",
+        "hostname": "VES_BLDG_J",
+        "status": "success",
+        "vendor": "Juniper Networks",
+        "model": "ex3400-48p",
+        "device_type": "switch",
+        "mac_address": "20:d8:0b:92:e0:62",
+        "interfaces_detail": {"ge-0/2/0": {"status": "up", "description": "Uplink to MDF", "speed": "1Gb/s"}},
+        "neighbors": [
+            {
+                "local_port": "ge-0/2/0",
+                "remote_device": "VES_MDF_CORE_BLDG_A",
+                "remote_port": "Uplink to BLDG J Switch - Rooms 24-28, Music",
+                "remote_port_description": "Uplink to BLDG J Switch - Rooms 24-28, Music",
+                "remote_ip": "10.250.5.2",
+                "device_type": "switch",
+            }
+        ],
+    }
+
+    raw_devices = [hub, ves_core, wbe_core, ves_bldg_j]
+    reg = DeviceRegistry()
+    for d in raw_devices:
+        reg.register_device(d)
+
+    _stitch_dataset_topology(raw_devices, reg)
+
+    # 1. Metro-E neighbors synthesized with carrier cloud, transit CIDR & mask mismatch
+    hub_ves = [n for n in hub["neighbors"] if n["remote_device"] == "VES_MDF_CORE_BLDG_A"][0]
+    assert hub_ves["l2_accuracy"] == "wan_carrier_arp_route"
+    assert hub_ves["transport_type"] == "metro_ethernet"
+    assert hub_ves["carrier_cloud"] == "Spectrum Metro Ethernet"
+    assert hub_ves["remote_port"] == "xe-0/0/22"
+    assert hub_ves["transit_cidr"] == "10.250.5.0/30"
+    assert hub_ves["mask_mismatch"] == "/24 vs /30"
+
+    hub_wbe = [n for n in hub["neighbors"] if n["remote_device"] == "WBE_MDF_CORE_BLDG_A"][0]
+    assert hub_wbe["l2_accuracy"] == "wan_carrier_arp_route"
+    assert hub_wbe["mask_mismatch"] == ""
+
+    # 2. Perimeter Firewall L3 egress synthesized with ISP handoff metadata
+    fw_nbr = [n for n in hub["neighbors"] if n.get("l2_accuracy") == "l3_next_hop_egress"][0]
+    assert fw_nbr["local_port"] == "A3"
+    assert fw_nbr["remote_ip"] == "172.31.254.2"
+    assert fw_nbr["device_type"] == "firewall"
+    assert fw_nbr["transport_type"] == "l3_egress"
+    assert fw_nbr["isp_handoff"] == {
+        "isp_port": "A1",
+        "isp_label": "Spectrum Internet",
+        "isp_mac": "44:aa:50:6a:60:23",
+        "isp_vendor": "Juniper Networks",
+        "fw_untrust_port": "A2",
+        "vlan_id": "2",
+    }
+
+    # 3. Reciprocal port resolution fixed both prose & numeric ifIndex, and links got transport_type/evidence
+    assert ves_bldg_j["neighbors"][0]["remote_port"] == "ge-0/0/1"
+    assert ves_bldg_j["neighbors"][0]["link_confidence"] == "two-way"
+    assert ves_core["neighbors"][0]["remote_port"] == "ge-0/2/0"
+
+    link_map = {(lk["node_a"], lk["node_b"]): lk for lk in reg.links}
+    metro_lk = link_map[("DO-Main-BLDG", "VES_MDF_CORE_BLDG_A")]
+    assert metro_lk["transport_type"] == "metro_ethernet"
+    assert metro_lk["evidence"] == "wan_carrier_arp_route"
+    assert metro_lk["link_class"] == "infra_uplink"
+    egress_lk = link_map[("DO-Main-BLDG", "Perimeter-Firewall")]
+    assert egress_lk["transport_type"] == "l3_egress"
+    assert egress_lk["evidence"] == "l3_next_hop_egress"
+    assert egress_lk["link_class"] == "infra_uplink"
+
+
+def test_mac_and_wan_inference_skips_non_infra_servers():
+    from net_docu_crawler.topology_resolver import DeviceRegistry
+
+    sw = {
+        "ip": "192.168.1.3",
+        "hostname": "desktop-switch",
+        "status": "success",
+        "device_type": "switch",
+        "device_persona": "switch",
+        "mac_address": "fc:33:42:e6:b5:99",
+        "interfaces_detail": {"ge-0/0/0": {"status": "up"}},
+        "l3_interfaces": [{"interface": "irb.0", "ip_address": "192.168.1.3/24", "status": "up"}],
+        "mac_table": [
+            {"mac": "a8:b8:e0:04:46:af", "interface": "ge-0/0/0", "vlan": "default"},
+            {"mac": "bc:24:11:90:0b:88", "interface": "ge-0/0/0", "vlan": "default"},
+            {"mac": "bc:24:11:4a:78:63", "interface": "ge-0/0/0", "vlan": "default"},
+        ],
+        "neighbors": [],
+    }
+    pve = {
+        "ip": "192.168.1.12",
+        "hostname": "pve",
+        "status": "success",
+        "vendor": "FRRouting",
+        "model": "Linux Host (Debian GNU/Linux 13)",
+        "device_type": "server",
+        "device_persona": "host",
+        "mac_address": "a8:b8:e0:04:46:af",
+        "interfaces_detail": {"enp5s0": {"status": "up", "mac_address": "a8:b8:e0:04:46:af"}},
+        "l3_interfaces": [{"interface": "vmbr0", "ip_address": "192.168.1.12/24", "status": "up"}],
+        "routes": [{"subnet": "0.0.0.0/0", "protocol": "static", "next_hop": "192.168.1.1", "interface": "vmbr0"}],
+        "arp_table": [{"ip": "192.168.1.1", "mac": "bc:24:11:b4:a9:82", "interface": "vmbr0"}],
+        "neighbors": [],
+    }
+    librenms = {
+        "ip": "192.168.1.166",
+        "hostname": "librenms",
+        "status": "success",
+        "vendor": "FRRouting",
+        "model": "Linux Host (Debian GNU/Linux 13)",
+        "device_type": "",
+        "device_persona": "host",
+        "mac_address": "bc:24:11:90:0b:88",
+        "interfaces_detail": {"eth0": {"status": "up", "mac_address": "bc:24:11:90:0b:88"}},
+        "l3_interfaces": [{"interface": "eth0", "ip_address": "192.168.1.166/24", "status": "up"}],
+        "neighbors": [],
+    }
+    frr = {
+        "ip": "192.168.1.254",
+        "hostname": "FRR-Router-01",
+        "status": "success",
+        "vendor": "FRRouting",
+        "model": "FRRouting Linux Daemon",
+        "device_type": "router",
+        "device_persona": "router",
+        "mac_address": "bc:24:11:4a:78:63",
+        "interfaces_detail": {"eth0": {"status": "up", "mac_address": "bc:24:11:4a:78:63"}},
+        "l3_interfaces": [{"interface": "eth0", "ip_address": "192.168.1.254/24", "status": "up"}],
+        "neighbors": [],
+    }
+
+    raw_devices = [sw, pve, librenms, frr]
+    reg = DeviceRegistry()
+    for d in raw_devices:
+        reg.register_device(d)
+
+    reg.infer_mac_table_links(raw_devices)
+    reg.infer_wan_and_gateway_links(raw_devices)
+
+    assert pve["neighbors"] == []
+    assert librenms["neighbors"] == []
+    assert [n["remote_device"] for n in sw["neighbors"]] == ["FRR-Router-01"]
+    assert len(reg.links) == 1
+    assert reg.links[0]["node_a"] == "FRR-Router-01" or reg.links[0]["node_b"] == "FRR-Router-01"

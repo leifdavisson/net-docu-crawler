@@ -350,7 +350,7 @@ def canonicalize_interface_full(intf: str) -> str:
 
     name = re.sub(r"\.0$", "", name)
 
-    m_junos = re.match(r"^(ge-|xe-|et-|fe-|ae(?=\d)|reth(?=\d))(.*)$", name, flags=re.IGNORECASE)
+    m_junos = re.match(r"^(ge-|mge-|xe-|et-|fe-|ae(?=\d)|reth(?=\d))(.*)$", name, flags=re.IGNORECASE)
     if m_junos:
         return f"{m_junos.group(1).lower()}{m_junos.group(2)}"
 

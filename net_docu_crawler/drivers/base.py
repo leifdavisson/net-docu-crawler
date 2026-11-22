@@ -459,6 +459,14 @@ class BaseDriver(ABC):
         """Optional hook to collect live operational L2 trunk, LACP, STP port, and 802.1X state."""
         return {}
 
+    def get_vrfs(self, conn) -> list[dict]:
+        """Optional hook for routers/L3 switches to gather live VRF/routing-instance tables."""
+        return []
+
+    def get_mpls_ldp(self, conn) -> dict:
+        """Optional hook for core routers to gather read-only MPLS/LDP neighbor, interface, and label state."""
+        return {}
+
     def get_discovery_protocols(
         self, conn, raw_config: str = "", neighbors: list[dict] | None = None
     ) -> dict[str, str]:
@@ -513,6 +521,8 @@ class BaseDriver(ABC):
             "optics": [],
             "routes": [],
             "routing_peers": [],
+            "vrfs": [],
+            "mpls": {"ldp_neighbors": [], "ldp_interfaces": [], "forwarding": []},
             "fhrp": [],
             "port_profiles": {},
             "dhcp": {"pools": [], "reservations": [], "relays": []},
@@ -582,7 +592,15 @@ class BaseDriver(ABC):
             device_data["raw_config"], vendor=self.vendor_name, poe=device_data["poe"]
         )
         vrfs, acls_by_port = extract_vrfs_and_acls(device_data["raw_config"], vendor=self.vendor_name)
-        device_data["vrfs"] = vrfs
+        live_vrfs = self.get_vrfs(conn)
+        device_data["vrfs"] = live_vrfs if live_vrfs else vrfs
+        live_mpls = self.get_mpls_ldp(conn)
+        if isinstance(live_mpls, dict) and live_mpls:
+            device_data["mpls"] = {
+                "ldp_neighbors": live_mpls.get("ldp_neighbors", []),
+                "ldp_interfaces": live_mpls.get("ldp_interfaces", []),
+                "forwarding": live_mpls.get("forwarding", []),
+            }
         for acl_port, acl_vals in acls_by_port.items():
             prof = device_data["port_profiles"].setdefault(acl_port, {})
             if acl_vals.get("acl_in"):

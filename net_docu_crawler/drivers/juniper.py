@@ -25,8 +25,60 @@ import re
 
 import oui_lookup
 from net_docu_crawler.drivers.base import BaseDriver
+from net_docu_crawler.topology_resolver import pick_clean_remote_port as _pick_clean_remote_port
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_junos_neighbor_type(remote_sys: str, remote_caps: str, mac_vendor: str, remote_dev: str = "") -> str:
+    """Classify a Junos LLDP neighbor without falsely labeling APs, phones, cameras, or hosts as switches."""
+    sys_low = (remote_sys or "").lower()
+    caps_low = (remote_caps or "").lower()
+    vend_low = (mac_vendor or "").lower() if mac_vendor and mac_vendor != "Unknown" else ""
+    dev_low = (remote_dev or "").lower()
+    blob = f"{sys_low} {vend_low} {dev_low}"
+
+    if (
+        "phone" in caps_low
+        or "telephone" in caps_low
+        or re.search(
+            r"\b(?:digium|yealink|polycom|mitel|avaya|grandstream|snom|sangoma|voip|ip phone|telephone)\b",
+            blob,
+        )
+        or re.match(r"^(?:d40|d60|d62|d65|d70|p315)-", dev_low)
+    ):
+        return "phone"
+
+    if re.search(r"\b(?:axis|verkada|hikvision|valcom|hanwha|camera)\b", blob):
+        return "camera"
+
+    if (
+        re.search(r"(?:\bap\b|access point|aruba|unifi|instant|\bwlan\b|ruckus|meraki)", sys_low)
+        or any(k in caps_low for k in ("wlan", "access point"))
+        or (
+            any(v in vend_low for v in ("aruba", "ubiquiti", "ruckus", "meraki"))
+            and not re.search(r"\b(?:switch|router|icx|procurve)\b", f"{sys_low} {dev_low}")
+        )
+    ):
+        return "ap"
+
+    if any(k in f"{sys_low} {vend_low}" for k in ("firewall", "srx", "palo", "forti", "opnsense", "pfsense")):
+        return "firewall"
+
+    if any(k in sys_low for k in ("router", "ios software", "routeros", "frrouting")) or (
+        "router" in caps_low and "bridge" not in caps_low
+    ):
+        return "router"
+
+    if (
+        re.search(r"\b(?:apple|dell|lenovo|intel|microsoft|realtek|workstation|desktop|laptop)\b", blob)
+        and "bridge" not in caps_low
+        and not re.search(r"\b(?:switch|powerconnect)\b", sys_low)
+    ) or re.match(r"^(?:desktop|laptop)-", dev_low):
+        return "endpoint"
+
+    return "switch"
+
 
 # Internal Junos control-plane, PFE fabric, and tunnel pseudo-devices excluded from physical port counts
 JUNOS_INTERNAL_INTERFACES = (
@@ -164,13 +216,19 @@ class JuniperDriver(BaseDriver):
                 admin_status = intf.get("admin-status", [{}])[0].get("data", "down").lower()
                 oper_status = intf.get("oper-status", [{}])[0].get("data", "down").lower()
 
-                # Only include physical switch/router interfaces (ge-*, xe-*, et-*, ae*) in physical port detail
-                if re.match(r"^(?:ge-|xe-|et-|fe-|ae\d|irb)", name):
+                # Only include physical switch/router interfaces (ge-*, mge-*, xe-*, et-*, ae*) in physical port detail
+                if re.match(r"^(?:ge-|mge-|xe-|et-|fe-|ae\d|irb)", name):
                     default_speed = (
                         "10Gb/s"
                         if name.startswith("xe-")
                         else (
-                            "40Gb/s" if name.startswith("et-") else ("100Mb/s" if name.startswith("fe-") else "1Gb/s")
+                            "40Gb/s"
+                            if name.startswith("et-")
+                            else (
+                                "2.5Gb/s"
+                                if name.startswith("mge-")
+                                else ("100Mb/s" if name.startswith("fe-") else "1Gb/s")
+                            )
                         )
                     )
                     interfaces_detail[name] = {
@@ -224,7 +282,7 @@ class JuniperDriver(BaseDriver):
                         continue
                     admin = parts[1].lower()
                     oper = parts[2].lower()
-                    if "." not in name and re.match(r"^(?:ge-|xe-|et-|fe-|ae\d)", name):
+                    if "." not in name and re.match(r"^(?:ge-|mge-|xe-|et-|fe-|ae\d)", name):
                         interfaces_detail[name] = {
                             "status": oper,
                             "protocol": oper,
@@ -286,7 +344,10 @@ class JuniperDriver(BaseDriver):
                 remote_dev = n.get("lldp-remote-system-name", [{}])[0].get("data", "")
                 if not remote_dev:
                     remote_dev = n.get("lldp-remote-chassis-id", [{}])[0].get("data", "Unknown")
-                remote_port = n.get("lldp-remote-port-id", [{}])[0].get("data", "")
+                raw_port_id = n.get("lldp-remote-port-id", [{}])[0].get("data", "")
+                raw_port_info = n.get("lldp-remote-port-info", [{}])[0].get("data", "")
+                raw_port_desc = n.get("lldp-remote-port-description", [{}])[0].get("data", "")
+                remote_port, remote_port_desc = _pick_clean_remote_port(raw_port_id, raw_port_info, raw_port_desc)
                 remote_ip = n.get("lldp-remote-management-address", [{}])[0].get("data", "")
                 remote_sys = n.get("lldp-remote-system-description", [{}])[0].get("data", "")
                 remote_caps = n.get("lldp-remote-system-capabilities-enabled", [{}])[0].get("data", "") or n.get(
@@ -294,26 +355,9 @@ class JuniperDriver(BaseDriver):
                 )[0].get("data", "")
                 remote_mac = n.get("lldp-remote-chassis-id", [{}])[0].get("data", "")
 
-                norm_mac = oui_lookup.normalize_mac(remote_mac or remote_port)
+                norm_mac = oui_lookup.normalize_mac(remote_mac or raw_port_id or remote_port)
                 mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
-
-                sys_low = remote_sys.lower()
-                caps_low = remote_caps.lower()
-                vendor_low = mac_vendor.lower() if mac_vendor != "Unknown" else ""
-
-                dev_type = "switch"
-                if (
-                    any(k in sys_low for k in ["ap", "access point", "aruba", "unifi", "instant", "wlan"])
-                    or any(k in caps_low for k in ["wlan", "access point"])
-                    or (not sys_low and any(v in vendor_low for v in ["aruba", "ubiquiti", "ruckus", "meraki"]))
-                ):
-                    dev_type = "ap"
-                elif any(k in sys_low for k in ["firewall", "srx", "palo", "forti", "opnsense"]):
-                    dev_type = "firewall"
-                elif any(k in sys_low for k in ["router", "ios software", "routeros", "frrouting"]) or (
-                    "router" in caps_low and "bridge" not in caps_low
-                ):
-                    dev_type = "router"
+                dev_type = _classify_junos_neighbor_type(remote_sys, remote_caps, mac_vendor, remote_dev)
 
                 plat_short = remote_sys[:60].strip()
                 if not plat_short and mac_vendor != "Unknown":
@@ -323,7 +367,8 @@ class JuniperDriver(BaseDriver):
                     {
                         "local_port": local_port,
                         "remote_device": remote_dev,
-                        "remote_port": remote_port,
+                        "remote_port": remote_port or "Unknown",
+                        "remote_port_description": remote_port_desc,
                         "remote_ip": remote_ip,
                         "remote_mac": remote_mac,
                         "platform": plat_short,
@@ -342,7 +387,9 @@ class JuniperDriver(BaseDriver):
                 m_sys = re.search(r"System name\s*:\s*(\S+)", b)
                 m_chassis = re.search(r"Chassis\s+(?:id|ID)\s*:\s*(\S+)", b)
                 m_ip = re.search(r"Management address\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", b)
-                m_rem_port = re.search(r"Port id\s*:\s*(\S+)", b, re.IGNORECASE)
+                m_rem_port = re.search(r"Port id\s*:\s*(.+)", b, re.IGNORECASE)
+                m_rem_info = re.search(r"Port info\s*:\s*(.+)", b, re.IGNORECASE)
+                m_rem_desc = re.search(r"Port description\s*:\s*(.+)", b, re.IGNORECASE)
                 m_desc = re.search(r"System description\s*:\s*(.+)", b)
                 m_caps = re.search(r"System capabilities\s*:\s*(.+)", b)
                 if m_port and (m_sys or m_chassis):
@@ -351,27 +398,26 @@ class JuniperDriver(BaseDriver):
                     remote_dev = m_sys.group(1) if m_sys else remote_mac
                     norm_mac = oui_lookup.normalize_mac(remote_mac) if remote_mac else ""
                     mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
-                    plat = m_desc.group(1).strip()[:60] if m_desc else ""
-                    caps_low = m_caps.group(1).lower() if m_caps else ""
-                    vendor_low = mac_vendor.lower() if mac_vendor != "Unknown" else ""
-
-                    dev_type = "switch"
-                    if (
-                        any(k in plat.lower() for k in ["ap", "aruba", "unifi", "instant", "wlan", "access point"])
-                        or any(k in caps_low for k in ["wlan", "access point"])
-                        or (not plat and any(v in vendor_low for v in ["aruba", "ubiquiti", "ruckus", "meraki"]))
-                    ):
-                        dev_type = "ap"
+                    plat_raw = m_desc.group(1).strip()[:60] if m_desc else ""
+                    caps_raw = m_caps.group(1) if m_caps else ""
+                    dev_type = _classify_junos_neighbor_type(plat_raw, caps_raw, mac_vendor, remote_dev)
+                    plat = plat_raw
                     if not plat and mac_vendor != "Unknown":
                         plat = f"{mac_vendor} AP" if dev_type == "ap" else mac_vendor
                     elif not plat:
                         plat = "JunOS-Discovered"
 
+                    remote_port, remote_port_desc = _pick_clean_remote_port(
+                        m_rem_port.group(1).strip() if m_rem_port else "",
+                        m_rem_info.group(1).strip() if m_rem_info else "",
+                        m_rem_desc.group(1).strip() if m_rem_desc else "",
+                    )
                     neighbors.append(
                         {
                             "local_port": local_port,
                             "remote_device": remote_dev,
-                            "remote_port": m_rem_port.group(1) if m_rem_port else "Unknown",
+                            "remote_port": remote_port or "Unknown",
+                            "remote_port_description": remote_port_desc,
                             "remote_ip": m_ip.group(1) if m_ip else "",
                             "remote_mac": remote_mac,
                             "platform": plat,
@@ -393,18 +439,13 @@ class JuniperDriver(BaseDriver):
                     local_port = re.sub(r"\.0$", "", local_intf.strip())
                     remote_mac = n.get("lldp-remote-chassis-id", [{}])[0].get("data", "")
                     remote_dev = n.get("lldp-remote-system-name", [{}])[0].get("data", "") or remote_mac or "Unknown"
-                    remote_port = (
-                        n.get("lldp-remote-port-description", [{}])[0].get("data", "")
-                        or n.get("lldp-remote-port-info", [{}])[0].get("data", "")
-                        or n.get("lldp-remote-port-id", [{}])[0].get("data", "")
-                    )
-                    norm_mac = oui_lookup.normalize_mac(remote_mac or remote_port)
+                    raw_port_id = n.get("lldp-remote-port-id", [{}])[0].get("data", "")
+                    raw_port_info = n.get("lldp-remote-port-info", [{}])[0].get("data", "")
+                    raw_port_desc = n.get("lldp-remote-port-description", [{}])[0].get("data", "")
+                    remote_port, remote_port_desc = _pick_clean_remote_port(raw_port_id, raw_port_info, raw_port_desc)
+                    norm_mac = oui_lookup.normalize_mac(remote_mac or raw_port_id or remote_port)
                     mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
-                    dev_type = (
-                        "ap"
-                        if any(v in mac_vendor.lower() for v in ["aruba", "ubiquiti", "ruckus", "meraki"])
-                        else "switch"
-                    )
+                    dev_type = _classify_junos_neighbor_type("", "", mac_vendor, remote_dev)
                     plat = (
                         f"{mac_vendor} AP"
                         if (dev_type == "ap" and mac_vendor != "Unknown")
@@ -416,6 +457,7 @@ class JuniperDriver(BaseDriver):
                                 "local_port": local_port,
                                 "remote_device": remote_dev,
                                 "remote_port": remote_port or "Unknown",
+                                "remote_port_description": remote_port_desc,
                                 "remote_ip": "",
                                 "remote_mac": remote_mac,
                                 "platform": plat,
@@ -429,25 +471,43 @@ class JuniperDriver(BaseDriver):
                 )
                 try:
                     raw_sum_txt = conn.send_command("show lldp neighbors")
+                    idx_pinfo = -1
+                    idx_sys = -1
                     for line in raw_sum_txt.splitlines():
+                        if "Port info" in line and "System Name" in line:
+                            idx_pinfo = line.find("Port info")
+                            idx_sys = line.find("System Name")
+                            continue
                         parts = line.split()
-                        if len(parts) >= 5 and re.match(r"^(?:ge-|xe-|et-|fe-|ae\d)", parts[0]):
+                        if len(parts) >= 5 and re.match(r"^(?:ge-|mge-|xe-|et-|fe-|ae\d)", parts[0]):
                             local_port = re.sub(r"\.0$", "", parts[0])
                             remote_mac = parts[2]
-                            remote_port = parts[3]
-                            remote_dev = parts[4]
+                            if idx_pinfo != -1 and idx_sys != -1 and len(line) > idx_sys:
+                                raw_pinfo = line[idx_pinfo:idx_sys].strip()
+                                remote_dev = line[idx_sys:].strip() or parts[-1]
+                            else:
+                                raw_pinfo = parts[3]
+                                remote_dev = parts[4]
+                            remote_port, remote_port_desc = _pick_clean_remote_port(raw_pinfo, "", "")
                             norm_mac = oui_lookup.normalize_mac(remote_mac)
                             mac_vendor = oui_lookup.lookup_oui(norm_mac) if norm_mac else "Unknown"
+                            dev_type = _classify_junos_neighbor_type("", "", mac_vendor, remote_dev)
+                            plat = (
+                                f"{mac_vendor} AP"
+                                if (dev_type == "ap" and mac_vendor != "Unknown")
+                                else (mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered")
+                            )
                             neighbors.append(
                                 {
                                     "local_port": local_port,
                                     "remote_device": remote_dev,
-                                    "remote_port": remote_port,
+                                    "remote_port": remote_port or "Unknown",
+                                    "remote_port_description": remote_port_desc,
                                     "remote_ip": "",
                                     "remote_mac": remote_mac,
-                                    "platform": mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered",
-                                    "remote_platform": mac_vendor if mac_vendor != "Unknown" else "JunOS-Discovered",
-                                    "device_type": "switch",
+                                    "platform": plat,
+                                    "remote_platform": plat,
+                                    "device_type": dev_type,
                                 }
                             )
                 except Exception as txt_exc:

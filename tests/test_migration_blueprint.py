@@ -405,3 +405,193 @@ def test_blueprint_manual_verification_section_flags_unmanaged_switches_and_fail
     assert "`192.168.1.50` | **sw-edge-unauth**" in txt
     assert "Probable Switch / Network Appliance" in txt
     assert "**pve** (`192.168.1.12`, `server`): Hypervisor / Linux L2 bridge host" in txt
+    assert "### 6.1 Loop Protection & BPDU Guard Best-Practice Matrix (By Link Type)" in txt
+    assert "| **VoIP Phone + PC Daisy-Chain** |" in txt
+
+
+def test_blueprint_gate_filtering_section15_filtering_section82_and_runbook_tables(tmp_path):
+    """Verify Section 1.1 failed_hosts filtering, Section 1.5 endpoint/Metro-E filtering, Section 8.2 L3 summary, and runbook tables."""
+    import json
+
+    devices = {
+        "10.1.0.1": {
+            "ip": "10.1.0.1",
+            "hostname": "DO-Main-BLDG",
+            "site_code": "DO",
+            "vendor": "HP ProCurve",
+            "model": "HP 5412zl",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "status": "success",
+            "stp": {
+                "enabled": True,
+                "is_root": True,
+                "root_bridge": "32768.00:11:22:33:44:01",
+                "is_verified_campus_root": True,
+            },
+            "interfaces_detail": {
+                "C1": {"status": "up", "speed": "10Gb/s"},
+                "F16": {"status": "up", "speed": "1Gb/s"},
+            },
+            "neighbors": [
+                {
+                    "local_port": "C1",
+                    "remote_device": "VES_MDF_CORE_BLDG_A",
+                    "remote_port": "xe-0/0/22",
+                    "remote_ip": "10.250.5.2",
+                    "device_type": "switch",
+                    "l2_accuracy": "wan_carrier_arp_route",
+                    "transport_type": "metro_ethernet",
+                    "carrier_cloud": "Spectrum Metro Ethernet",
+                    "transit_vlan": "1050",
+                    "transit_cidr": "10.250.5.0/30",
+                    "mask_mismatch": "/24 vs /30",
+                },
+                {
+                    "local_port": "B1",
+                    "remote_device": "DO-Main-Bldg-2",
+                    "remote_port": "50",
+                    "platform": "Hewlett Packard Enterprise",
+                    "device_type": "switch",
+                },
+                {
+                    "local_port": "E1",
+                    "remote_device": "d65-000FD30AAE38",
+                    "remote_port": "eth0",
+                    "platform": "Digium",
+                    "device_type": "switch",
+                },
+            ],
+            "mac_table": [
+                {"interface": "C1", "mac": "14:3f:c3:bf:44:01", "vlan": "1050"},
+                {"interface": "C1", "mac": "14:3f:c3:bf:44:02", "vlan": "1051"},
+                {"interface": "C1", "mac": "14:3f:c3:bf:44:03", "vlan": "1053"},
+                {"interface": "F16", "mac": "aa:bb:cc:11:22:01", "vlan": "100"},
+                {"interface": "F16", "mac": "aa:bb:cc:11:22:02", "vlan": "100"},
+            ],
+            "l3_interfaces": [{"interface": "Spectrun-VES", "ip_address": "10.250.5.1/24", "status": "up"}],
+            "routes": [{"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "172.31.254.2", "interface": "4009"}],
+            "dhcp": {"relays": [{"interface": f"VLAN {100 + i}", "helper_ip": f"10.0.0.{10 + i}"} for i in range(6)]},
+            "discovery_protocols": {"lldp": "enabled", "cdp": "disabled"},
+        },
+        "10.250.5.2": {
+            "ip": "10.250.5.2",
+            "hostname": "VES_MDF_CORE_BLDG_A",
+            "site_code": "VES",
+            "vendor": "Juniper Networks",
+            "model": "ex4600-40f",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "status": "success",
+            "stp": {
+                "enabled": True,
+                "is_root": True,
+                "root_bridge": "32768.00:11:22:33:44:01",
+                "is_verified_campus_root": True,
+            },
+            "l3_interfaces": [
+                {"interface": "irb.1050", "ip_address": "10.250.5.2/30", "status": "up"},
+                {"interface": "irb.4051", "ip_address": "172.23.2.1/24", "status": "up"},
+            ],
+            "routes": [
+                {"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "10.250.5.1", "interface": "irb.1050"}
+            ],
+            "neighbors": [],
+            "discovery_protocols": {"lldp": "enabled", "cdp": "unsupported"},
+        },
+    }
+    # Add 4 more default-gateway switches to test >4 collapsible runbook tables + isolated_self_root count
+    for idx in range(1, 5):
+        devices[f"10.2.0.{idx}"] = {
+            "ip": f"10.2.0.{idx}",
+            "hostname": f"NES-SW-{idx}",
+            "site_code": "NES",
+            "vendor": "Juniper Networks",
+            "model": "ex3400",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "status": "success",
+            "stp": {
+                "enabled": True,
+                "is_root": True,
+                "root_bridge": f"32768.00:aa:bb:cc:dd:0{idx}",
+                "is_isolated_self_root": True,
+            },
+            "l3_interfaces": [
+                {"interface": "irb.4021", "ip_address": "172.23.2.1/24", "status": "up"}
+                if idx == 1
+                else {"interface": "irb.1", "ip_address": f"10.2.0.{idx}/24", "status": "up"}
+            ],
+            "routes": [{"subnet": "0.0.0.0/0", "protocol": "Static", "next_hop": "10.2.0.254", "interface": "irb.1"}],
+            "neighbors": [],
+            "discovery_protocols": {"lldp": "enabled", "cdp": "unsupported"},
+        }
+
+    # Case 1: failed_hosts.json has ONLY non-infra unsupported appliances -> Gate must NOT be BLOCKED
+    failed_path = tmp_path / "failed_hosts.json"
+    failed_path.write_text(
+        json.dumps(
+            [
+                {
+                    "ip": "172.31.1.200",
+                    "status": "unsupported",
+                    "vendor": "Unknown",
+                    "device_type": "unknown",
+                    "model": "SSH-2.0-OpenSSH_7.9",
+                },
+                {"ip": "172.31.1.201", "status": "discovered", "record_class": "passive_endpoint", "vendor": "Axis"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    bp_path = tmp_path / "Network_Analysis.md"
+    generate_master_network_analysis_migration_blueprint(devices, output_path=str(bp_path))
+    bp_txt = bp_path.read_text(encoding="utf-8")
+
+    assert "`0` infra failed (`2` passive/unsupported non-infra hosts)" in bp_txt
+    assert "❌ **BLOCKED**" not in bp_txt
+
+    # Section 1.5 filters out Digium phone and skips Metro-E C1 multi-MAC false alarm, keeping F16 & DO-Main-Bldg-2
+    sec15 = bp_txt.split("### 1.5")[1].split("## 2. Physical Layer")[0]
+    assert "d65-000FD30AAE38" not in sec15
+    assert "**DO-Main-BLDG** | `C1` | `3 MACs`" not in sec15
+    assert "**DO-Main-BLDG** | `F16` | `2 MACs` (no direct LLDP/CDP)" in sec15
+    assert "DO-Main-Bldg-2" in sec15
+
+    # Section 8.2 summarizes L3 Backbone, Mask Mismatch, and Duplicate Gateway IP conflict
+    assert "### 8.2 L3 Backbone, WAN Egress & Conflict Summary" in bp_txt
+    assert "Metro-E (ARP+L3)" in bp_txt
+    assert "MASK MISMATCH" in bp_txt
+    assert "Duplicate Gateway Ip" in bp_txt
+
+    # Case 2: failed_hosts.json includes an unauthenticated infra entry -> Gate IS BLOCKED
+    failed_path.write_text(
+        json.dumps(
+            [
+                {
+                    "ip": "172.31.1.200",
+                    "status": "unsupported",
+                    "vendor": "Unknown",
+                    "device_type": "unknown",
+                    "model": "SSH-2.0-OpenSSH_7.9",
+                },
+                {"ip": "10.0.0.42", "status": "unauthenticated", "vendor": "paloalto", "device_type": "unknown"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    generate_master_network_analysis_migration_blueprint(devices, output_path=str(bp_path))
+    bp_txt2 = bp_path.read_text(encoding="utf-8")
+    assert "❌ **BLOCKED**" in bp_txt2
+    assert "`1` infra failed (`1` passive/unsupported non-infra hosts)" in bp_txt2
+
+    # Runbook collapsible >4 tables and separate campus_root vs isolated_self_root summary
+    rb_path = tmp_path / "cutover_runbook.md"
+    generate_cutover_runbook(devices, output_path=str(rb_path))
+    rb_txt = rb_path.read_text(encoding="utf-8")
+    assert "**6** default gateways verified (expand reference table below)." in rb_txt
+    assert "<details><summary><strong>Default Gateways (6)</strong></summary>" in rb_txt
+    assert "<details><summary><strong>DHCP Relay Bindings (6)</strong></summary>" in rb_txt
+    assert "Verified campus root(s): `DO-Main-BLDG`" in rb_txt
+    assert "isolated self-root island(s) also detected" in rb_txt
+    assert "STP Root Scope Breakdown (2 verified campus root(s), 4 isolated self-root(s))" in rb_txt

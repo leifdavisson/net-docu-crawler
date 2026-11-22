@@ -22,6 +22,7 @@ from net_docu_crawler.drivers.arista import AristaDriver
 from net_docu_crawler.drivers.aruba import ArubaDriver
 from net_docu_crawler.drivers.base import BaseDriver
 from net_docu_crawler.drivers.cisco import CiscoDriver
+from net_docu_crawler.drivers.cisco_xr import CiscoXRDriver
 from net_docu_crawler.drivers.ciscosmb import CiscoSMBDriver
 from net_docu_crawler.drivers.detector import detect_vendor_range
 from net_docu_crawler.drivers.fortinet import FortinetDriver
@@ -36,6 +37,9 @@ from net_docu_crawler.drivers.paloalto import PaloAltoDriver
 # Registry mapping vendor string to driver class (single source of truth)
 DRIVER_REGISTRY: dict[str, type[BaseDriver]] = {
     "cisco": CiscoDriver,
+    "cisco_xr": CiscoXRDriver,
+    "iosxr": CiscoXRDriver,
+    "xr": CiscoXRDriver,
     "ciscosmb": CiscoSMBDriver,
     "cisco_s300": CiscoSMBDriver,
     "cbs": CiscoSMBDriver,
@@ -62,6 +66,7 @@ VENDOR_DRIVER_MAP: dict[str, type[BaseDriver]] = DRIVER_REGISTRY
 # Reverse mapping from driver class to canonical vendor key
 DRIVER_VENDOR_MAP: dict[type[BaseDriver], str] = {
     CiscoDriver: "cisco",
+    CiscoXRDriver: "cisco_xr",
     CiscoSMBDriver: "ciscosmb",
     AristaDriver: "arista",
     JuniperDriver: "juniper",

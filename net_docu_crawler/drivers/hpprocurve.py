@@ -25,8 +25,19 @@ import re
 import oui_lookup
 import parser as cli_parser
 from net_docu_crawler.drivers.base import BaseDriver
+from net_docu_crawler.topology_resolver import (
+    is_clean_interface_token as _is_clean_interface_token,
+)
+from net_docu_crawler.topology_resolver import (
+    pick_clean_remote_port as _pick_clean_remote_port,
+)
 
 logger = logging.getLogger(__name__)
+
+_PROCURVE_ROUTE_RE = re.compile(
+    r"^\s*(\d+\.\d+\.\d+\.\d+/\d+)\s+(.+?)\s+(connected|static|ospf|rip|bgp|local|reject)\b(?:\s+\S+)?\s+\d+\s+\d+\s*$",
+    re.IGNORECASE,
+)
 
 _BARE_VT100_RE = re.compile(r"\[(?:\?[0-9;]*[hl]|[0-9;]*[HJKr])")
 
@@ -294,32 +305,45 @@ class HPProCurveDriver(BaseDriver):
                             clean_chassis = chassis_raw.replace(" ", ":").replace("-", ":")
                             if re.match(r"^[0-9a-fA-F:]{17}$", clean_chassis):
                                 remote_mac = oui_lookup.normalize_mac(clean_chassis).lower()
+                            elif port_id:
+                                clean_pid_mac = port_id.replace(" ", ":").replace("-", ":")
+                                if re.match(r"^[0-9a-fA-F:]{17}$", clean_pid_mac):
+                                    remote_mac = oui_lookup.normalize_mac(clean_pid_mac).lower()
 
-                            rem_port = port_descr or port_id
+                            rem_port, rem_port_desc = _pick_clean_remote_port(port_id, "", port_descr)
                             rem_host = sys_name or (f"MAC-{remote_mac.replace(':', '')}" if remote_mac else chassis_raw)
                             rem_host = rem_host.split(".")[0]
 
                             plat = oui_lookup.lookup_oui(remote_mac) if remote_mac else chassis_raw
                             plat_low = plat.lower()
                             host_low = rem_host.lower()
+                            blob = f"{plat_low} {host_low}"
                             dev_type = "switch"
                             if any(
-                                w in plat_low or w in host_low
-                                for w in ["ap", "access point", "aruba", "ruckus", "ubiquiti", "unifi"]
-                            ):
-                                dev_type = "ap"
-                            elif any(w in plat_low or w in host_low for w in ["axis", "hikvision", "camera", "hanwha"]):
-                                dev_type = "camera"
-                            elif any(
-                                w in plat_low or w in host_low
-                                for w in ["polycom", "yealink", "mitel", "avaya", "grandstream"]
-                            ):
+                                w in blob
+                                for w in [
+                                    "polycom",
+                                    "yealink",
+                                    "mitel",
+                                    "avaya",
+                                    "grandstream",
+                                    "digium",
+                                    "snom",
+                                    "sangoma",
+                                ]
+                            ) or re.match(r"^(?:d40|d60|d62|d65|d70|p315)-", host_low):
                                 dev_type = "phone"
-                            elif any(w in plat_low or w in host_low for w in ["crestron", "extron", "biamp"]):
+                            elif any(w in blob for w in ["axis", "hikvision", "camera", "hanwha", "verkada", "valcom"]):
+                                dev_type = "camera"
+                            elif re.search(r"(?:\bap\b|access point|aruba|ruckus|ubiquiti|unifi)", blob):
+                                dev_type = "ap"
+                            elif any(w in blob for w in ["crestron", "extron", "biamp"]):
                                 dev_type = "av_control"
                             elif any(w in plat_low for w in ["router", "mikrotik"]):
                                 dev_type = "router"
-                            elif any(w in plat_low for w in ["apple", "dell", "lenovo", "intel", "microsoft"]):
+                            elif any(
+                                w in plat_low for w in ["apple", "dell", "lenovo", "intel", "microsoft"]
+                            ) or re.match(r"^(?:desktop|laptop|do-fisc|do-katye)-?", host_low):
                                 dev_type = "endpoint"
 
                             neighbors.append(
@@ -327,6 +351,7 @@ class HPProCurveDriver(BaseDriver):
                                     "local_port": local_port,
                                     "remote_device": rem_host,
                                     "remote_port": rem_port,
+                                    "remote_port_description": rem_port_desc,
                                     "remote_ip": "",
                                     "remote_mac": remote_mac,
                                     "platform": plat,
@@ -358,13 +383,30 @@ class HPProCurveDriver(BaseDriver):
                             m_pid = re.match(r"^\s*PortId\s*:\s*(.+)$", ln)
                             if m_pid:
                                 detail_map[cur_lp]["port_id"] = m_pid.group(1).strip()
+                            m_pd = re.match(r"^\s*PortDescr\s*:\s*(.+)$", ln)
+                            if m_pd:
+                                detail_map[cur_lp]["port_descr"] = m_pd.group(1).strip()
                     for n in neighbors:
                         d_info = detail_map.get(n.get("local_port", ""))
                         if d_info:
                             if d_info.get("sys_name"):
                                 n["remote_device"] = d_info["sys_name"]
-                            if d_info.get("port_id") and not n.get("remote_port"):
-                                n["remote_port"] = d_info["port_id"]
+                            if d_info.get("port_id") or d_info.get("port_descr"):
+                                clean_dp, clean_dd = _pick_clean_remote_port(
+                                    d_info.get("port_id", ""),
+                                    "",
+                                    d_info.get("port_descr", ""),
+                                )
+                                if clean_dp and (
+                                    not n.get("remote_port")
+                                    or (
+                                        _is_clean_interface_token(clean_dp)
+                                        and not _is_clean_interface_token(str(n.get("remote_port") or ""))
+                                    )
+                                ):
+                                    n["remote_port"] = clean_dp
+                                if clean_dd and not n.get("remote_port_description"):
+                                    n["remote_port_description"] = clean_dd
             except Exception as exc:
                 logger.debug("[%s] HP ProCurve show lldp info remote-device detail failed: %s", self.ip, exc)
 
@@ -434,22 +476,38 @@ class HPProCurveDriver(BaseDriver):
                 line_s = line.strip()
                 if not line_s or line_s.startswith("Destination") or line_s.startswith("---") or "IP Route" in line_s:
                     continue
-                parts = line_s.split()
-                if len(parts) >= 4:
-                    dest, gw = parts[0], parts[1]
-                    # Filter rejects and local host loopbacks
-                    if "reject" in gw.lower() or dest.startswith("127."):
-                        continue
-                    intf = parts[2] if len(parts) >= 3 else ""
-                    proto = parts[3] if len(parts) >= 4 else "connected"
-                    routes.append(
-                        {
-                            "subnet": dest,
-                            "protocol": proto,
-                            "next_hop": gw if gw != "DEFAULT_VLAN" else "Directly Connected",
-                            "interface": intf,
-                        }
-                    )
+                m = _PROCURVE_ROUTE_RE.match(line_s)
+                if not m:
+                    continue
+                dest = m.group(1)
+                middle = m.group(2).strip()
+                proto = m.group(3).lower()
+                if proto == "reject" or "reject" in middle.lower() or dest.startswith("127."):
+                    continue
+
+                m_ip_gw = re.match(r"^(\d+\.\d+\.\d+\.\d+)(?:\s+(.*))?$", middle)
+                if m_ip_gw:
+                    next_hop = m_ip_gw.group(1)
+                    intf = (m_ip_gw.group(2) or "").strip()
+                else:
+                    next_hop = "Directly Connected"
+                    m_dv = re.match(r"^DEFAULT_VLAN\s+(.+)$", middle, re.IGNORECASE)
+                    if m_dv:
+                        intf = m_dv.group(1).strip()
+                    elif re.match(r"^VLAN\s+\d+$", middle, re.IGNORECASE):
+                        intf = middle
+                    else:
+                        m_tail = re.search(r"\s+(VLAN\s+\d+|\d+)$", middle, re.IGNORECASE)
+                        intf = m_tail.group(1).strip() if m_tail else middle
+
+                routes.append(
+                    {
+                        "subnet": dest,
+                        "protocol": proto,
+                        "next_hop": next_hop,
+                        "interface": intf,
+                    }
+                )
         except Exception as exc:
             logger.debug("[%s] HP ProCurve show ip route failed: %s", self.ip, exc)
         return routes

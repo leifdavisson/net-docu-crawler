@@ -233,12 +233,20 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
         vlans_map = dev.get("vlans", {}) or {}
         relays = (dev.get("dhcp") or {}).get("relays", []) or []
         by_svi = {
-            v.get("svi_interface", "").lower(): (vid, str(v.get("name", "")).strip('"'))
+            v.get("svi_interface", "").lower(): (
+                vid,
+                str(v.get("name", "")).strip('"'),
+                str(v.get("description", "")).strip('"'),
+            )
             for vid, v in vlans_map.items()
             if v.get("svi_interface")
         }
         by_name = {
-            str(v.get("name", "")).strip('"').lower(): (vid, str(v.get("name", "")).strip('"'))
+            str(v.get("name", "")).strip('"').lower(): (
+                vid,
+                str(v.get("name", "")).strip('"'),
+                str(v.get("description", "")).strip('"'),
+            )
             for vid, v in vlans_map.items()
             if v.get("name")
         }
@@ -255,18 +263,22 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
                 prefix_cidr = ""
 
             m_vid = re.match(r"^(?:vlan\.?|vl|irb\.)0*(\d+)$", iname, re.IGNORECASE)
-            if m_vid:
+            if m_vid and (m_vid.group(1) in vlans_map or iname.lower() not in by_svi):
                 vid = m_vid.group(1)
-                vname = str(vlans_map.get(vid, {}).get("name", "")).strip('"')
+                vinfo = vlans_map.get(vid, {}) or {}
+                vname = str(vinfo.get("name", "")).strip('"')
+                vdesc = str(vinfo.get("description", "")).strip('"')
             elif iname.lower() in by_svi:
-                vid, vname = by_svi[iname.lower()]
+                vid, vname, vdesc = by_svi[iname.lower()]
             elif iname.lower() in by_name:
-                vid, vname = by_name[iname.lower()]
+                vid, vname, vdesc = by_name[iname.lower()]
             elif iname.upper() == "DEFAULT_VLAN" and "1" in vlans_map:
                 vid = "1"
-                vname = str(vlans_map["1"].get("name", "DEFAULT_VLAN")).strip('"')
+                vinfo = vlans_map["1"] or {}
+                vname = str(vinfo.get("name", "DEFAULT_VLAN")).strip('"')
+                vdesc = str(vinfo.get("description", "")).strip('"')
             else:
-                vid, vname = "", ""
+                vid, vname, vdesc = "", "", ""
 
             matched_relays = sorted(
                 {
@@ -286,6 +298,7 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
                     "source_device": hostname,
                     "vlan_id": vid,
                     "vlan_name": vname,
+                    "vlan_description": vdesc,
                     "svi_interface": iname,
                     "primary_ip": ip_str,
                     "prefix_cidr": prefix_cidr,

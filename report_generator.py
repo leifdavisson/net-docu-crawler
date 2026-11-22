@@ -387,417 +387,745 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv", infra_o
         print(f"Error generating asset inventory CSV: {e}")
 
 
-def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
-    """
-    Generates the L2/Physical Network Diagram using Mermaid.js.
-    Shows switch stacks, APs, uplinks, fiber paths, and STP states.
-    """
-    devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
-    lines = [
-        "# Layer 2 & Physical Network Diagrams",
-        "",
-        "This file contains physical topologies, switch-to-switch uplinks, and wireless AP connections discovered via CDP/LLDP and local port statuses.",
-        "",
-        "## Physical Connectivity Diagram",
-        "```mermaid",
-        "flowchart LR",
+_PHONE_OUI_HINTS = (
+    "polycom",
+    "yealink",
+    "grandstream",
+    "digium",
+    "sangoma",
+    "snom",
+    "mitel",
+    "avaya",
+    "cisco-linksys",
+    "audiocodes",
+)
+_AP_OUI_HINTS = ("ruckus", "aruba", "ubiquiti", "unifi", "aerohive", "meraki", "cambium", "mist")
+
+
+def _is_non_infra_neighbor(remote_host: str, nbr: dict) -> bool:
+    """Return True if an uncrawled LLDP/CDP neighbor is an endpoint (phone, camera, PC, printer) rather than network infra."""
+    from net_docu_crawler.topology_renderer import classify_neighbor_node
+
+    return classify_neighbor_node(remote_host, nbr) == "endpoint"
+
+
+def _mermaid_safe_text(val: str) -> str:
+    """Sanitize arbitrary text for Mermaid 11 labels (never emit ``\\"`` or unsupported HTML tags)."""
+    cleaned = str(val or "").replace('"', "'").replace("\r", " ").replace("\n", " ")
+    # Temporarily preserve <br/> / <br> breaks while neutralizing stray angle brackets
+    token = "__BR_TAG__"
+    cleaned = re.sub(r"<br\s*/?>", token, cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("<", "(").replace(">", ")")
+    return cleaned.replace(token, "<br/>").strip()
+
+
+def _mermaid_slug(val: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(val or "").lower()).strip("_") or "node"
+
+
+def _mermaid_l2_classdefs() -> list[str]:
+    """Return canonical Mermaid class definitions for all L2 topology node roles."""
+    return [
         "  %% Style configurations",
         "  classDef core fill:#3399ff,stroke:#0066cc,stroke-width:2px,color:#fff;",
-        "  classDef dist fill:#85c1e9,stroke:#2e86c1,stroke-width:2px;",
-        "  classDef router fill:#aed6f1,stroke:#1b4f72,stroke-width:2px;",
-        "  classDef access fill:#d5dbdb,stroke:#7f8c8d,stroke-width:1px;",
+        "  classDef dist fill:#85c1e9,stroke:#2e86c1,stroke-width:2px,color:#0f172a;",
+        "  classDef router fill:#aed6f1,stroke:#1b4f72,stroke-width:2px,color:#0f172a;",
+        "  classDef access fill:#d5dbdb,stroke:#7f8c8d,stroke-width:1px,color:#0f172a;",
         "  classDef ap fill:#f9e79f,stroke:#f1c40f,stroke-width:1px,color:#000;",
         "  classDef firewall fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff;",
         "  classDef root fill:#2ecc71,stroke:#27ae60,stroke-width:3px,color:#fff;",
+        "  classDef isolated_root fill:#f59e0b,stroke:#b45309,stroke-width:2px,color:#000;",
+        "  classDef uncrawled fill:#f8fafc,stroke:#64748b,stroke-width:1.5px,stroke-dasharray: 5 5,color:#1e293b;",
+        "  classDef wan_cloud fill:#ccfbf1,stroke:#0d9488,stroke-width:2px,color:#134e4a;",
+        "  classDef isp fill:#e2e8f0,stroke:#475569,stroke-width:2px,color:#0f172a;",
+    ]
+
+
+def _mermaid_l3_classdefs() -> list[str]:
+    """Return canonical Mermaid class definitions for L3 logical routing diagrams."""
+    return [
+        "  %% Style configurations",
+        "  classDef isp fill:#e2e8f0,stroke:#475569,stroke-width:2px,color:#0f172a;",
+        "  classDef firewall fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#991b1b;",
+        "  classDef router fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#1e3a8a;",
+        "  classDef core fill:#3399ff,stroke:#0066cc,stroke-width:2px,color:#fff;",
+        "  classDef wan_cloud fill:#ccfbf1,stroke:#0d9488,stroke-width:2px,color:#134e4a;",
+        "  classDef external_nexthop fill:#f1f5f9,stroke:#64748b,stroke-width:1.5px,stroke-dasharray: 5 5,color:#334155;",
+        "  classDef device fill:#f5f5f5,stroke:#333,stroke-width:2px,color:#0f172a;",
+        "  classDef subnet fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#0c4a6e;",
+        "  classDef conflict fill:#fee2e2,stroke:#dc2626,stroke-width:2.5px,color:#991b1b;",
+    ]
+
+
+def _speed_thickness(speed_mbps: int) -> str:
+    if speed_mbps >= 100000:
+        return "11px"
+    if speed_mbps >= 40000:
+        return "9px"
+    if speed_mbps >= 10000:
+        return "7.5px"
+    if speed_mbps >= 5000:
+        return "6px"
+    if speed_mbps >= 2500:
+        return "5px"
+    if speed_mbps >= 1000:
+        return "3.5px"
+    if speed_mbps >= 100:
+        return "2px"
+    return "1px"
+
+
+def _format_l2_edge_mermaid(src_mid: str, dst_mid: str, edge: dict, link_idx: int) -> tuple[str, str]:
+    """Format a canonical L2 graph edge and its distinct Mermaid ``linkStyle`` by transport type."""
+    tt = str(edge.get("transport_type") or "direct_l2_uplink").lower()
+    is_blk = bool(edge.get("is_blocked"))
+    speed_mbps = int(edge.get("speed_mbps") or 1000)
+    thickness = _speed_thickness(speed_mbps)
+    raw_pairs = [re.sub(r"^\s*↔\s*", "", str(p)).strip() for p in (edge.get("port_pairs") or []) if p]
+    ports = ", ".join(raw_pairs)
+    if not ports:
+        if edge.get("transit_cidr"):
+            ports = str(edge["transit_cidr"])
+        elif edge.get("transit_vlan"):
+            ports = f"VLAN {edge['transit_vlan']}"
+        else:
+            ports = str(edge.get("speed_label") or "")
+
+    badge = str(edge.get("display_badge") or "").strip()
+    mm = str(edge.get("mask_mismatch") or "").strip()
+
+    if is_blk:
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#dc2626,stroke-width:{thickness},stroke-dasharray: 5 5;"
+        suffix = "[Passthrough/Transit] [STP BLK]" if tt == "virtual_passthrough" else "[STP BLK]"
+        label = f"{ports} {suffix}".strip()
+    elif tt in ("metro_ethernet", "wan_carrier"):
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#0d9488,stroke-width:{thickness},stroke-dasharray: 5 5;"
+        badge_txt = badge or ("Metro-E" if tt == "metro_ethernet" else "WAN")
+        if mm:
+            badge_txt = f"{badge_txt} - MASK MISMATCH {mm}"
+        label = f"{ports} [{badge_txt}]".strip()
+    elif tt in ("l3_egress", "l3_routed"):
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#6366f1,stroke-width:{thickness},stroke-dasharray: 2 4;"
+        badge_txt = badge or ("L3 Egress" if tt == "l3_egress" else "L3 Route")
+        label = f"{ports} [{badge_txt}]".strip()
+    elif tt == "mac_inferred":
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#d97706,stroke-width:{thickness},stroke-dasharray: 5 5;"
+        label = f"{ports} [MAC Inferred]".strip()
+    elif tt == "virtual_passthrough":
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#9333ea,stroke-width:{thickness},stroke-dasharray: 5 5;"
+        label = f"{ports} [Passthrough/Transit]".strip()
+    else:
+        arrow = "==>" if edge.get("evidence") == "confirmed_lldp" else "-->"
+        style = f"  linkStyle {link_idx} stroke:#333,stroke-width:{thickness};"
+        label = f"{ports} [{badge}]".strip() if badge else ports
+
+    safe_lbl = _mermaid_safe_text(label or badge or tt)
+    return f'  {src_mid} {arrow}|"{safe_lbl}"| {dst_mid}', style
+
+
+def _l2_node_def_and_class(node: dict, mid: str, include_ap_rollup: bool = True) -> tuple[str, str]:
+    """Return ``(node_definition_line, css_class)`` for a canonical topology graph node."""
+    host = _mermaid_safe_text(node.get("hostname") or node.get("id") or "Unknown")
+    model_s = _mermaid_safe_text(node.get("model") or "")
+    role = str(node.get("role") or "switch").lower()
+    scope = str(node.get("stp_root_scope") or "not_applicable").lower()
+    ap_cnt = int(node.get("attached_ap_count") or 0)
+
+    if role == "wan_cloud":
+        cmode = str(node.get("cloud_mode") or "hub-and-spoke").lower()
+        mode_tag = f" · {cmode}" if cmode in ("dual-hub", "full-mesh") else ""
+        return f'  {mid}(["{host}<br/>(Carrier WAN / Metro-E{mode_tag})"])', "wan_cloud"
+    if role == "isp":
+        sub = f"<br/>({model_s})" if model_s and model_s.lower() != host.lower() else ""
+        return f'  {mid}(["{host}{sub}"])', "isp"
+
+    ap_tag = f"<br/>+{ap_cnt} APs" if (include_ap_rollup and ap_cnt > 0 and role != "ap") else ""
+    if node.get("is_crawled"):
+        mod_line = f"<br/>({model_s})" if model_s else ""
+    else:
+        if model_s and "uncrawled" not in model_s.lower():
+            mod_line = f"<br/>({model_s} · Uncrawled)"
+        elif model_s:
+            mod_line = f"<br/>({model_s})"
+        else:
+            mod_line = "<br/>(Uncrawled)"
+
+    if scope == "campus_root":
+        css_cls = "root"
+    elif scope == "isolated_self_root":
+        css_cls = "isolated_root"
+    elif role == "ap":
+        css_cls = "ap"
+    elif role == "firewall":
+        css_cls = "firewall"
+    elif role == "router":
+        css_cls = "router"
+    elif role == "core":
+        css_cls = "core"
+    elif role == "dist":
+        css_cls = "dist"
+    elif not node.get("is_crawled"):
+        css_cls = "uncrawled"
+    else:
+        css_cls = "access"
+
+    return f'  {mid}["{host}{mod_line}{ap_tag}"]', css_cls
+
+
+def _compact_mermaid_block_if_oversized(mermaid_lines: list[str], max_chars: int = 38000) -> list[str]:
+    """
+    Compact a Mermaid ``flowchart`` block when it exceeds ``max_chars`` (Mermaid's
+    default ``maxTextSize`` is 50,000 chars) by omitting ``ext_*`` leaf nodes/edges
+    and dropping ``linkStyle`` lines whose indices shift.
+    """
+    if len("\n".join(mermaid_lines)) <= max_chars:
+        return mermaid_lines
+
+    filtered: list[str] = []
+    omitted_ext = 0
+    for ln in mermaid_lines:
+        if re.match(r"^\s+ext_[a-z0-9_]+\[", ln):
+            omitted_ext += 1
+            continue
+        if re.match(r"^\s+class\s+ext_[a-z0-9_]+\s+", ln):
+            continue
+        if re.match(r"^\s+\S+\s+[-=.]+>.*?\bext_[a-z0-9_]+\b", ln) or re.match(r"^\s+ext_[a-z0-9_]+\s+[-=.]+>", ln):
+            continue
+        if re.match(r"^\s+linkStyle\s+\d+", ln):
+            continue
+        filtered.append(ln)
+
+    if omitted_ext > 0:
+        for i, ln in enumerate(filtered):
+            if ln.strip() == "```" and i > 0:
+                filtered.insert(
+                    i,
+                    f'  ext_summary["+{omitted_ext} Uncrawled Leaf / Endpoint Nodes<br/>(See Site Topologies & Hierarchy Tree below)"]',
+                )
+                break
+    return filtered
+
+
+def _render_l2_collapsible_hierarchy_tree(
+    model: dict,
+) -> list[str]:
+    """Render an expandable/collapsible Markdown hierarchy tree (Site -> Core -> Hop-1 -> Hop-2 -> Hop-3) from ``model``."""
+    nodes_by_id = {n["id"]: n for n in model.get("nodes") or []}
+    edges = [e for e in (model.get("edges") or []) if e.get("link_scope") != "wireless_ap"]
+    edges_by_node: dict[str, list[dict]] = {}
+    for e in edges:
+        edges_by_node.setdefault(e["source"], []).append(e)
+        edges_by_node.setdefault(e["target"], []).append(e)
+
+    sites = model.get("sites") or []
+    if not sites:
+        return []
+
+    lines: list[str] = [
+        "## Collapsible Layer 2 Hierarchy Tree",
+        "Expand a site or switch below to inspect hierarchical hop depth, sub-campus membership, and transport-tagged links without Mermaid diagram size limits:",
         "",
     ]
 
-    link_idx = 0
-    link_styles = []
-
-    # Safe alphanumeric IDs mapping for L2 graph to avoid syntax errors with special characters
-    # Key crawled devices by IP (not hostname) so colliding hostnames never overwrite/duplicate IDs.
-    node_ids = {}
-    hostname_to_node_id = {}
-    defined_nodes = set()
-    sw_counter = 0
-
-    # Pre-populate IDs for all scanned devices
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
+    for sc in sites:
+        site_nodes = [n for n in (model.get("nodes") or []) if n.get("site") == sc and n.get("role") != "ap"]
+        if not site_nodes:
             continue
-        hostname = dev.get("hostname") or ip
-        nid = f"sw_{sw_counter}"
-        node_ids[ip] = nid
-        if hostname not in hostname_to_node_id:
-            hostname_to_node_id[hostname] = nid
-        defined_nodes.add(hostname)
-        sw_counter += 1
+        site_node_ids = {n["id"] for n in site_nodes}
 
-    # 1. Define nodes and their styles (omit 0-link standalone devices when topology has >=10 devices)
-    linked_ips = {ip for ip, dev in devices.items() if dev.get("neighbors")}
-    standalone_devs = []
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
-        if len(devices) >= 10 and ip not in linked_ips:
-            standalone_devs.append((dev.get("hostname") or ip, ip, dev.get("model") or "Unknown"))
-            continue
-        hostname = dev.get("hostname") or ip
-        model = dev.get("model") or "Unknown"
-        is_root = bool(dev.get("stp", {}).get("is_verified_campus_root", False))
-
-        node_id = node_ids[ip]
-        # Node label with Model
-        safe_hostname = hostname.replace('"', '\\"')
-        safe_model = model.replace('"', '\\"')
-        label = f'["{safe_hostname}<br/>({safe_model})"]'
-        lines.append(f"  {node_id}{label}")
-
-        # Apply classes
-        model_lower = model.lower()
-        hn_lower = hostname.lower()
-        dev_type = dev.get("device_type", "").lower()
-        if is_root:
-            lines.append(f"  class {node_id} root;")
-        elif dev_type == "ap" or "ap-" in model_lower or "air-" in model_lower:
-            lines.append(f"  class {node_id} ap;")
-        elif dev_type == "firewall":
-            lines.append(f"  class {node_id} firewall;")
-        elif dev_type == "router":
-            lines.append(f"  class {node_id} router;")
-        elif (
-            "core" in hn_lower
-            or "c9500" in model_lower
-            or "5412" in model_lower
-            or "5406" in model_lower
-            or "ex4600" in model_lower
-            or len(dev.get("l3_interfaces", [])) >= 5
+        # Build parent -> children tree within this site using hop_depth
+        children_of: dict[str, list[str]] = {nid: [] for nid in site_node_ids}
+        has_parent: set[str] = set()
+        for n in sorted(
+            site_nodes, key=lambda x: (int(x.get("hop_depth") or 0), x.get("layer", 4), x["hostname"].lower())
         ):
-            lines.append(f"  class {node_id} core;")
-        elif "dist" in hn_lower or "c3850" in model_lower or "c9300" in model_lower:
-            lines.append(f"  class {node_id} dist;")
-        else:
-            lines.append(f"  class {node_id} access;")
-
-    lines.append("")
-    lines.append("  %% Topology links")
-
-    # 2. Draw connections from neighbors
-    connections = {}
-    external_nodes_defined = set()
-    from net_docu_crawler.schema import infer_site_code
-
-    node_site = {}
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
-        hostname = dev.get("hostname") or ip
-        nid = node_ids[ip]
-        node_site[nid] = dev.get("site_code") or infer_site_code(hostname)
-        neighbors = dev.get("neighbors", [])
-        dev_ports = dev.get("ports") or {}
-        ports_ci = {str(k).lower(): v for k, v in dev_ports.items()}
-
-        for n in neighbors:
-            remote_host = (n.get("remote_device") or "").strip().strip('"').strip("'")
-            if not remote_host:
+            nid = n["id"]
+            my_depth = int(n.get("hop_depth") or 0)
+            if my_depth <= 0:
                 continue
-            remote_host = remote_host.split(".")[0]
+            cand_parents = []
+            for e in edges_by_node.get(nid, []):
+                pid = e["target"] if e["source"] == nid else e["source"]
+                if pid in site_node_ids and pid != nid:
+                    pnode = nodes_by_id[pid]
+                    if int(pnode.get("hop_depth") or 0) < my_depth:
+                        cand_parents.append(pnode)
+            if cand_parents:
+                best_parent = min(
+                    cand_parents,
+                    key=lambda p: (int(p.get("hop_depth") or 0), int(p.get("layer") or 4), p["hostname"].lower()),
+                )
+                children_of[best_parent["id"]].append(nid)
+                has_parent.add(nid)
 
-            matched_remote = None
-            for _rip, rdev in devices.items():
-                rhn = rdev.get("hostname", "")
-                if rhn and rhn.split(".")[0].lower() == remote_host.lower():
-                    matched_remote = rhn
-                    break
+        roots = sorted(
+            [n for n in site_nodes if n["id"] not in has_parent],
+            key=lambda x: (int(x.get("hop_depth") or 0), int(x.get("layer") or 4), x["hostname"].lower()),
+        )
 
-            node_b = matched_remote or remote_host
-            n_type = (n.get("device_type") or "").lower()
-            if node_b not in defined_nodes and n_type not in ("switch", "router", "firewall", "wlc", "bridge"):
-                continue
-
-            # Ensure safe ID exists for node_b
-            if node_b in hostname_to_node_id:
-                node_b_id = hostname_to_node_id[node_b]
-            else:
-                if node_b not in node_ids:
-                    node_ids[node_b] = f"ext_{len(node_ids) + sw_counter}"
-                node_b_id = node_ids[node_b]
-
-            node_a_id = node_ids[ip]
-
-            # If external (not a crawled device) and not defined yet, define it
-            if node_b not in defined_nodes and node_b not in external_nodes_defined:
-                safe_nb = node_b.replace('"', '\\"')
-                lines.append(f'  {node_b_id}["{safe_nb}"]')
-                n_type = n.get("device_type", "").lower()
-                n_plat = (n.get("platform") or n.get("remote_platform") or "").lower()
-                if (
-                    n_type == "ap"
-                    or "ap-" in n_plat
-                    or "air-" in n_plat
-                    or "access point" in n_plat
-                    or "aruba" in n_plat
-                ):
-                    lines.append(f"  class {node_b_id} ap;")
-                elif n_type == "firewall":
-                    lines.append(f"  class {node_b_id} firewall;")
-                elif n_type == "router":
-                    lines.append(f"  class {node_b_id} router;")
-                else:
-                    lines.append(f"  class {node_b_id} access;")
-                external_nodes_defined.add(node_b)
-
-            # Sort names for link key to prevent duplicates
-            if node_a_id < node_b_id:
-                key = (node_a_id, node_b_id)
-            else:
-                key = (node_b_id, node_a_id)
-
-            if key not in connections:
-                connections[key] = []
-
-            local_port = n.get("local_port", "")
-            remote_port = n.get("remote_port", "")
-
-            is_blocked = False
-            stp_vlans = dev.get("stp", {}).get("vlans", {})
-            for _vlan_id, ports in stp_vlans.items():
-                if local_port in ports and ports[local_port].get("state") == "BLK":
-                    is_blocked = True
-                    break
-
-            speed_val = get_link_speed(local_port, dev.get("interfaces_detail", {}))
-            cport = dev_ports.get(local_port) or ports_ci.get(local_port.lower()) or {}
-            lag_val = str(cport.get("lag_id") or "").strip()
-            po_name = lag_val if lag_val.lower() not in ("", "none", "unknown") else ""
-
-            connections[key].append(
-                {
-                    "local_port": local_port,
-                    "remote_port": remote_port,
-                    "is_blocked": is_blocked,
-                    "speed": speed_val,
-                    "port_channel": po_name,
-                    "l2_accuracy": n.get("l2_accuracy", ""),
-                }
-            )
-
-    for (id_a, id_b), links in connections.items():
-        # Determine stp status: blocked if any link in bundle is blocked
-        is_blocked = any(lk["is_blocked"] for lk in links)
-        accuracies = {lk.get("l2_accuracy", "") for lk in links if lk.get("l2_accuracy")}
-        is_mac_inferred = "mac_inferred" in accuracies
-        is_passthrough = bool(accuracies & {"virtual_passthrough", "multi_neighbor_port"})
-
-        # Sort and select speeds
-        def speed_key(s):
-            return {"100G": 8, "40G": 7, "10G": 6, "5G": 5, "2.5G": 4, "1G": 3, "100M": 2, "10M": 1}.get(s, 0)
-
-        speeds = [lk["speed"] for lk in links]
-        max_speed = max(speeds, key=speed_key) if speeds else "1G"
-
-        thickness = {
-            "10M": "1px",
-            "100M": "2px",
-            "1G": "3.5px",
-            "2.5G": "5px",
-            "5G": "6px",
-            "10G": "7.5px",
-            "40G": "9px",
-            "100G": "11px",
-        }.get(max_speed, "3.5px")
-
-        # Build logical label for the connection
-        pos = sorted(list(set([lk["port_channel"] for lk in links if lk["port_channel"]])))
-        if pos:
-            # Combined under port channel
-            local_ports_str = ", ".join(sorted(list(set([lk["local_port"] for lk in links]))))
-            label = f"{pos[0]} ({local_ports_str})"
-        else:
-            # Physical ports only
-            port_pairs = []
-            for lk in links:
-                lp = lk["local_port"]
-                rp = lk["remote_port"]
-                if rp and rp.lower() not in ("unknown", "n/a", "-"):
-                    port_pairs.append(f"{lp} ↔ {rp}")
-                else:
-                    port_pairs.append(lp)
-            label = ", ".join(sorted(set(port_pairs)))
-
-        if is_mac_inferred:
-            label = f"{label} [MAC Inferred]"
-        elif is_passthrough:
-            label = f"{label} [Passthrough/Transit]"
-
-        clean_label = label.replace('"', '\\"')
-
-        if is_blocked:
-            # Dotted red line for blocked paths
-            lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
-            link_styles.append(f"  linkStyle {link_idx} stroke:#ff3333,stroke-width:{thickness},stroke-dasharray: 5 5;")
-        elif is_mac_inferred:
-            lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
-            link_styles.append(f"  linkStyle {link_idx} stroke:#e67e22,stroke-width:{thickness},stroke-dasharray: 5 5;")
-        elif is_passthrough:
-            lines.append(f'  {id_a} -.->|"{clean_label}"| {id_b}')
-            link_styles.append(f"  linkStyle {link_idx} stroke:#8e44ad,stroke-width:{thickness},stroke-dasharray: 5 5;")
-        else:
-            # Thick line with port labels
-            lines.append(f'  {id_a} ==>|"{clean_label}"| {id_b}')
-            link_styles.append(f"  linkStyle {link_idx} stroke:#333,stroke-width:{thickness};")
-
-        link_idx += 1
-
-    # 3. Add link styles
-    if link_styles:
+        lines.append(
+            f"<details><summary><strong>Site: {sc}</strong> ({len(site_nodes)} infrastructure node(s))</summary>"
+        )
         lines.append("")
-        lines.append("  %% Link Styles (thickness based on link speed)")
-        lines.extend(link_styles)
 
+        def _format_node_badge(n: dict) -> str:
+            ip_s = f" ({n['ip']})" if n.get("ip") else ""
+            mod_s = f" [{n['model']}]" if n.get("model") else ""
+            sub_s = f" `[Sub-site: {n['sub_site']}]`" if n.get("sub_site") else ""
+            scope = n.get("stp_root_scope") or ""
+            stp_s = (
+                " `[STP Campus Root]`"
+                if scope == "campus_root"
+                else (" `[Isolated Self-Root]`" if scope == "isolated_self_root" else "")
+            )
+            ap_cnt = int(n.get("attached_ap_count") or 0)
+            ap_s = f" (+{ap_cnt} APs)" if ap_cnt > 0 else ""
+            uncr_s = " *(Uncrawled)*" if not n.get("is_crawled") else ""
+            return f"**{n['hostname']}**{ip_s}{mod_s}{sub_s}{stp_s}{ap_s}{uncr_s}"
+
+        def _emit_subtree(nid: str, indent_lvl: int, _children_of=children_of, _edges_by_node=edges_by_node) -> None:
+            n = nodes_by_id[nid]
+            n_edges = sorted(
+                _edges_by_node.get(nid, []),
+                key=lambda e: (
+                    nodes_by_id.get(e["target"] if e["source"] == nid else e["source"], {}).get("hostname", "").lower()
+                ),
+            )
+            kids = sorted(
+                _children_of.get(nid, []),
+                key=lambda cid: (int(nodes_by_id[cid].get("layer") or 4), nodes_by_id[cid]["hostname"].lower()),
+            )
+            pad = "  " * indent_lvl
+            badge_lbl = _format_node_badge(n)
+            hop_lbl = f"Hop-{int(n.get('hop_depth') or 0)}"
+            if not n_edges and not kids:
+                lines.append(f"{pad}- {badge_lbl} *({hop_lbl}, no infra uplinks)*")
+                return
+
+            lines.append(f"{pad}- {badge_lbl} *({hop_lbl}, {len(n_edges)} link(s))*")
+            for e in n_edges:
+                peer_id = e["target"] if e["source"] == nid else e["source"]
+                peer = nodes_by_id.get(peer_id, {"hostname": peer_id})
+                ports_s = ", ".join(re.sub(r"^\s*↔\s*", "", str(p)) for p in (e.get("port_pairs") or []) if p)
+                if not ports_s:
+                    ports_s = e.get("transit_cidr") or e.get("speed_label") or "uplink"
+                dbadge = e.get("display_badge") or e.get("transport_type") or "LLDP"
+                mm = f" ⚠️ MASK MISMATCH {e['mask_mismatch']}" if e.get("mask_mismatch") else ""
+                lines.append(f"{pad}  - `{ports_s}` ↔ **{peer['hostname']}** `[{dbadge}]`{mm}")
+            for cid in kids:
+                _emit_subtree(cid, indent_lvl + 1, _children_of=_children_of, _edges_by_node=_edges_by_node)
+
+        for rnode in roots:
+            _emit_subtree(rnode["id"], 0)
+
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
+    return lines
+
+
+def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
+    """
+    Generates the L2/Physical Network Diagram using Mermaid.js.
+    Consumes the canonical ``build_topology_graph_model(devices)`` graph so
+    Markdown diagrams, Interactive HTML, Wireless Overlay, and STP scopes agree 100%.
+    """
+    from net_docu_crawler.diagram_validator import validate_mermaid_block
+    from net_docu_crawler.topology_renderer import build_topology_graph_model
+
+    infra_devices = {ip: dev for ip, dev in (devices or {}).items() if _is_network_infra(dev)}
+    model = build_topology_graph_model(infra_devices)
+
+    lines: list[str] = [
+        "# Layer 2 & Physical Network Diagrams",
+        "",
+        "This file contains physical topologies, switch-to-switch uplinks, carrier WAN / Metro-E paths, L3 egress links, and wireless AP connections discovered via LLDP/CDP, ARP/routing, and MAC-table correlation.",
+        "",
+    ]
+
+    nodes = model.get("nodes") or []
+    edges = model.get("edges") or []
+    sites = model.get("sites") or []
+    non_ap_nodes = [n for n in nodes if n.get("role") != "ap"]
+    is_small_single_site = len(sites) <= 1 and len(non_ap_nodes) <= 12
+
+    def _emit_mermaid_graph(
+        target_nodes: list[dict],
+        target_edges: list[dict],
+        id_map: dict[str, str],
+        include_ap_rollup: bool = True,
+        group_subsites: bool = False,
+        empty_label: str = "No L2 Physical Links Discovered",
+    ) -> list[str]:
+        m_lines = ["```mermaid", "flowchart LR", *_mermaid_l2_classdefs(), ""]
+        if not target_nodes:
+            m_lines.append(f'  empty_node["{_mermaid_safe_text(empty_label)}"]')
+            m_lines.append("```")
+            return m_lines
+
+        subsite_groups: dict[str, list[dict]] = {}
+        plain_nodes: list[dict] = []
+        for n in sorted(
+            target_nodes,
+            key=lambda x: (int(x.get("hop_depth") or 0), int(x.get("layer") or 4), x["hostname"].lower(), x["id"]),
+        ):
+            sub = str(n.get("sub_site") or "").strip()
+            if group_subsites and sub:
+                subsite_groups.setdefault(sub, []).append(n)
+            else:
+                plain_nodes.append(n)
+
+        class_lines: list[str] = []
+        for n in plain_nodes:
+            mid = id_map[n["id"]]
+            defn, css_cls = _l2_node_def_and_class(n, mid, include_ap_rollup=include_ap_rollup)
+            m_lines.append(defn)
+            class_lines.append(f"  class {mid} {css_cls};")
+
+        for sub in sorted(subsite_groups.keys()):
+            sub_id = f"{_mermaid_slug(sub).upper()}_SUB"
+            m_lines.append(f'  subgraph {sub_id} ["{_mermaid_safe_text(sub)} Sub-Campus"]')
+            for n in subsite_groups[sub]:
+                mid = id_map[n["id"]]
+                defn, css_cls = _l2_node_def_and_class(n, mid, include_ap_rollup=include_ap_rollup)
+                m_lines.append(f"  {defn}")
+                class_lines.append(f"  class {mid} {css_cls};")
+            m_lines.append("  end")
+
+        m_lines.extend(class_lines)
+        m_lines.append("")
+        m_lines.append("  %% Topology links")
+
+        link_styles: list[str] = []
+        link_idx = 0
+        for e in target_edges:
+            if e["source"] not in id_map or e["target"] not in id_map:
+                continue
+            eline, sln = _format_l2_edge_mermaid(id_map[e["source"]], id_map[e["target"]], e, link_idx)
+            m_lines.append(eline)
+            link_styles.append(sln)
+            link_idx += 1
+
+        if link_styles:
+            m_lines.append("")
+            m_lines.append("  %% Link Styles (transport type & link speed)")
+            m_lines.extend(link_styles)
+        m_lines.append("```")
+        return _compact_mermaid_block_if_oversized(m_lines)
+
+    def _semantic_mid(n: dict, used_ids: set[str]) -> str:
+        role = str(n.get("role") or "").lower()
+        slug = _mermaid_slug(n["id"])
+        if role == "wan_cloud":
+            cand = f"cloud_{slug}"
+        elif role == "isp":
+            cand = f"isp_{slug}"
+        elif role == "firewall" and not n.get("is_crawled"):
+            cand = f"fw_{slug}"
+        elif role == "router" and not n.get("is_crawled"):
+            cand = f"rtr_{slug}"
+        elif not n.get("is_crawled"):
+            cand = f"ext_{slug}"
+        else:
+            cand = f"sw_{slug}"
+        base = cand
+        seq = 1
+        while cand in used_ids:
+            seq += 1
+            cand = f"{base}_{seq}"
+        used_ids.add(cand)
+        return cand
+
+    standalone_nodes: list[dict] = []
+
+    if is_small_single_site:
+        # Small / Single-Site Mode: deterministic sw_0, sw_1, ... in infra_devices order
+        id_map: dict[str, str] = {}
+        used_ids: set[str] = set()
+        crawled_by_ip = {n["ip"]: n for n in nodes if n.get("is_crawled") and n.get("ip")}
+        crawled_by_host = {n["hostname"].lower(): n for n in nodes if n.get("is_crawled") and n.get("hostname")}
+        sw_idx = 0
+        for ip, dev in infra_devices.items():
+            dev_ip = str(dev.get("ip") or ip).strip()
+            hn = str(dev.get("hostname") or dev_ip).strip().lower()
+            mnode = crawled_by_ip.get(dev_ip) or crawled_by_host.get(hn)
+            if mnode and mnode["id"] not in id_map:
+                mid = f"sw_{sw_idx}"
+                id_map[mnode["id"]] = mid
+                used_ids.add(mid)
+                sw_idx += 1
+
+        for n in nodes:
+            if n["id"] not in id_map:
+                if n.get("is_crawled"):
+                    mid = f"sw_{sw_idx}"
+                    id_map[n["id"]] = mid
+                    used_ids.add(mid)
+                    sw_idx += 1
+                else:
+                    id_map[n["id"]] = _semantic_mid(n, used_ids)
+
+        uncrawled_aps = [ap for ap in (model.get("ap_nodes") or []) if not ap.get("is_crawled")]
+        small_nodes = list(nodes)
+        small_edges = list(edges)
+        rollup_aps = len(uncrawled_aps) > 12
+
+        if not rollup_aps and uncrawled_aps:
+            for ap in uncrawled_aps:
+                if ap["attached_to"] not in id_map:
+                    continue
+                ap_mid = f"ap_{len(used_ids)}_{_mermaid_slug(ap['hostname'])}"
+                used_ids.add(ap_mid)
+                id_map[ap["id"]] = ap_mid
+                small_nodes.append(
+                    {
+                        "id": ap["id"],
+                        "hostname": ap["hostname"],
+                        "model": ap.get("model") or "Wireless AP",
+                        "role": "ap",
+                        "hop_depth": 5,
+                        "layer": 5,
+                        "stp_root_scope": "not_applicable",
+                        "attached_ap_count": 0,
+                        "is_crawled": False,
+                    }
+                )
+                small_edges.append(
+                    {
+                        "source": ap["attached_to"],
+                        "target": ap["id"],
+                        "port_pairs": [
+                            f"{ap['local_port']} ↔ {ap.get('remote_port') or 'eth0'}"
+                            if ap.get("local_port")
+                            else (ap.get("remote_port") or "eth0")
+                        ],
+                        "speed_label": ap.get("speed") or "1G",
+                        "speed_mbps": 1000,
+                        "transport_type": "direct_l2_uplink",
+                        "evidence": "unidirectional_lldp",
+                        "display_badge": f"LLDP {ap.get('speed') or '1G'}",
+                        "is_blocked": False,
+                    }
+                )
+
+        lines.append("## Physical Connectivity Diagram")
+        lines.extend(
+            _emit_mermaid_graph(
+                small_nodes,
+                small_edges,
+                id_map,
+                include_ap_rollup=rollup_aps,
+                group_subsites=False,
+            )
+        )
+        lines.append("")
+    else:
+        # Multi-Site / Campus Mode
+        nodes_by_id = {n["id"]: n for n in nodes}
+        non_ap_edges = [e for e in edges if e.get("link_scope") != "wireless_ap"]
+        touched_any = {e["source"] for e in non_ap_edges} | {e["target"] for e in non_ap_edges}
+        standalone_nodes = [n for n in non_ap_nodes if n.get("is_crawled") and n["id"] not in touched_any]
+
+        # Section 1: Backbone, Perimeter & Inter-Site Physical Overview
+        backbone_edges = [e for e in non_ap_edges if e.get("link_scope") == "backbone"]
+        bb_node_ids = {e["source"] for e in backbone_edges} | {e["target"] for e in backbone_edges}
+        if not bb_node_ids:
+            bb_node_ids = {n["id"] for n in non_ap_nodes if int(n.get("layer") or 4) <= 2}
+        bb_nodes = [nodes_by_id[nid] for nid in bb_node_ids if nid in nodes_by_id]
+        bb_id_map: dict[str, str] = {}
+        bb_used: set[str] = set()
+        for n in sorted(bb_nodes, key=lambda x: (int(x.get("layer") or 4), x["site"], x["hostname"].lower())):
+            bb_id_map[n["id"]] = _semantic_mid(n, bb_used)
+
+        lines.append("## Backbone, Perimeter & Inter-Site Physical Overview")
+        lines.extend(
+            _emit_mermaid_graph(
+                bb_nodes,
+                backbone_edges,
+                bb_id_map,
+                include_ap_rollup=False,
+                group_subsites=False,
+                empty_label="No Backbone or Inter-Site Uplinks Discovered",
+            )
+        )
+        lines.append("")
+
+        # Section 2: Site-Scoped Layer 2 Topologies
+        lines.append("## Site-Scoped Layer 2 Topologies")
+        for sc in sites:
+            sc_nodes_base = [n for n in non_ap_nodes if n.get("site") == sc]
+            if not sc_nodes_base:
+                continue
+            sc_edges: list[dict] = []
+            for e in non_ap_edges:
+                src_n = nodes_by_id.get(e["source"])
+                dst_n = nodes_by_id.get(e["target"])
+                if not src_n or not dst_n:
+                    continue
+                s_in = src_n.get("site") == sc
+                d_in = dst_n.get("site") == sc
+                if s_in and d_in:
+                    sc_edges.append(e)
+                elif e.get("link_scope") == "backbone" and (s_in ^ d_in):
+                    local_n = src_n if s_in else dst_n
+                    if local_n.get("role") != "wan_cloud":
+                        sc_edges.append(e)
+
+            sc_node_ids = {n["id"] for n in sc_nodes_base}
+            for e in sc_edges:
+                sc_node_ids.add(e["source"])
+                sc_node_ids.add(e["target"])
+            sc_nodes = [nodes_by_id[nid] for nid in sc_node_ids if nid in nodes_by_id]
+
+            sc_id_map: dict[str, str] = {}
+            sc_used: set[str] = set()
+            for n in sorted(sc_nodes, key=lambda x: (int(x.get("hop_depth") or 0), x["hostname"].lower(), x["id"])):
+                sc_id_map[n["id"]] = _semantic_mid(n, sc_used)
+
+            lines.append(f"### Site `{sc}` Layer 2 Topology")
+            lines.extend(
+                _emit_mermaid_graph(
+                    sc_nodes,
+                    sc_edges,
+                    sc_id_map,
+                    include_ap_rollup=True,
+                    group_subsites=True,
+                )
+            )
+            lines.append("")
+
+    # Legend
     lines.extend(
         [
-            "```",
-            "",
             "### Legend",
-            "* **Green Highlighted Node**: STP Root Bridge.",
-            "* **Blue Node**: Core / Distribution switches.",
-            "* **Grey Node**: Access switches.",
-            "* **Dashed Red Lines**: STP Blocking (`BLK`) links.",
-            "* **Dashed Orange Lines**: MAC-table inferred links (LLDP/CDP unavailable on peer).",
-            "* **Dashed Purple Lines**: Virtual/bridge passthrough or multi-neighbor transit links.",
-            "* **Double Solid Lines**: Active forwarding links (line thickness indicates speed).",
+            "* **STP Campus Root (Green)**: Multi-switch corroborated Spanning Tree root bridge (`campus_root`).",
+            "* **Isolated Self-Root (Amber)**: Switch claiming root with zero peer corroboration (`isolated_self_root` / island).",
+            "* **Core / Distribution Switch (Blue)**: Campus/Site MDF or distribution switch.",
+            "* **Access Switch (Grey)**: Edge access switch.",
+            "* **Uncrawled Infra (Dashed)**: Uncrawled switch/infra peer discovered via LLDP/CDP/ARP.",
+            "* **Metro-E Cloud (Teal)**: Carrier WAN / Metro-Ethernet multi-site transit cloud.",
+            "* **Firewall (Red) / Router (Light Blue) / ISP NID (Slate)**: L3 perimeter gateways and carrier handoffs.",
+            "* **Solid Dark Lines (`==>` / `-->`)**: Direct LLDP/CDP uplink (`==>` confirmed two-way, `-->` unidirectional; thickness scales by speed).",
+            "* **Dashed Teal Lines**: Metro-E / Carrier WAN (`wan_carrier_arp_route`).",
+            "* **Dotted Indigo Lines**: L3 Egress / Route (`0.0.0.0/0` or routed next-hop).",
+            "* **Dashed Orange Lines**: MAC-table inferred link (LLDP/CDP unavailable on peer).",
+            "* **Dashed Purple Lines**: Virtual / bridge passthrough or multi-neighbor transit link.",
+            "* **Dashed Red Lines**: STP Blocking (`BLK`) link.",
             "",
         ]
     )
 
-    if len(defined_nodes) > 20 and connections:
-        # Group edges by site_code for readable per-site Mermaid diagrams
-        site_edges: dict[str, list[tuple[tuple[str, str], list[dict]]]] = {}
-        for edge_key, edge_links in connections.items():
-            s_a = node_site.get(edge_key[0])
-            s_b = node_site.get(edge_key[1])
-            for sc in sorted({s for s in (s_a, s_b) if s}):
-                site_edges.setdefault(sc, []).append((edge_key, edge_links))
-        if len(site_edges) >= 2:
-            # Capture node definitions/classes from the main diagram lines
-            def_map: dict[str, list[str]] = {}
-            for ln in lines:
-                m_def = re.match(r"^\s+((?:sw|ext)_\d+)\[", ln)
-                if m_def:
-                    def_map.setdefault(m_def.group(1), []).append(ln)
-                m_cls = re.match(r"^\s+class\s+((?:sw|ext)_\d+)\s+", ln)
-                if m_cls:
-                    def_map.setdefault(m_cls.group(1), []).append(ln)
-            lines.append("## Site-Scoped Layer 2 Topologies")
-            for sc in sorted(site_edges.keys()):
-                edges_for_site = site_edges[sc]
-                touched = sorted({n for ek, _ in edges_for_site for n in ek})
-                lines.extend([f"### Site `{sc}` Layer 2 Topology", "```mermaid", "flowchart LR"])
-                for ln in lines[6:14]:
-                    lines.append(ln)
-                for nid in touched:
-                    lines.extend(def_map.get(nid, [f'  {nid}["{nid}"]']))
-                for (id_a, id_b), e_links in edges_for_site:
-                    port_pairs = []
-                    for lk in e_links:
-                        lp, rp = lk["local_port"], lk["remote_port"]
-                        if rp and rp.lower() not in ("unknown", "n/a", "-"):
-                            port_pairs.append(f"{lp} ↔ {rp}")
-                        else:
-                            port_pairs.append(lp)
-                    lbl = ", ".join(sorted(set(port_pairs))).replace('"', '\\"')
-                    lines.append(f'  {id_a} ==>|"{lbl}"| {id_b}')
-                lines.extend(["```", ""])
+    lines.extend(_render_l2_collapsible_hierarchy_tree(model))
 
+    # Wireless Overlay Layout
+    wireless_aps = model.get("wireless_aps") or []
+    ap_count = len(wireless_aps)
     lines.extend(
         [
             "## Wireless Overlay Layout",
             "Discovered Wireless Access Points connected to switches:",
         ]
     )
-
-    # Extract AP neighbors
-    ap_count = 0
-    ap_table = [
-        "| Switch Hostname | Local Port | AP Hostname/MAC | AP IP | AP Model |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-
-    crawled_host_types = {}
-    for _cip, cdev in devices.items():
-        chost = (cdev.get("hostname") or "").split(".")[0].lower()
-        if chost:
-            crawled_host_types[chost] = (cdev.get("device_type") or cdev.get("device_persona") or "").lower()
-
-    for ip, dev in devices.items():
-        if (dev.get("device_type") or dev.get("device_persona") or "").lower() == "ap":
-            continue
-        hostname = dev.get("hostname") or ip
-        for n in dev.get("neighbors", []):
-            raw_plat = n.get("platform") or n.get("remote_platform") or ""
-            platform = raw_plat.lower()
-            n_type = n.get("device_type", "").lower()
-            r_host = (n.get("remote_device") or "").split(".")[0].lower()
-            if not n_type and r_host in crawled_host_types:
-                n_type = crawled_host_types[r_host]
-            if n_type and n_type != "ap":
-                continue
-            if (
-                n_type == "ap"
-                or re.search(r"\bap\b", platform)
-                or "air-" in platform
-                or "access point" in platform
-                or ("aruba" in platform and "arubaos" not in platform)
-            ):
-                ap_count += 1
-                ap_table.append(
-                    f"| {hostname} | {n.get('local_port')} | {n.get('remote_device')} "
-                    f"| {n.get('remote_ip') or 'N/A'} | {raw_plat or 'Wireless AP'} |"
-                )
-
     if ap_count > 0:
         lines.append(f"\nTotal Discovered Access Points: **{ap_count}**\n")
-        lines.extend(ap_table)
+        if ap_count > 15:
+            by_site_aps: dict[str, list[dict]] = {}
+            for ap in wireless_aps:
+                by_site_aps.setdefault(ap.get("site") or "CORE", []).append(ap)
+            lines.extend(
+                [
+                    "### Per-Site Wireless Summary",
+                    "| Site | Access Points | Serving Switch(es) |",
+                    "| :--- | :---: | :--- |",
+                ]
+            )
+            for sc in sorted(by_site_aps.keys()):
+                s_aps = by_site_aps[sc]
+                sw_names = sorted({a.get("switch_hostname") or "Standalone" for a in s_aps})
+                sw_preview = ", ".join(sw_names[:6]) + (f" (+{len(sw_names) - 6} more)" if len(sw_names) > 6 else "")
+                lines.append(f"| **{sc}** | **{len(s_aps)}** | {sw_preview} |")
+            lines.append("")
+
+        lines.extend(
+            [
+                "| Switch Hostname | Local Port | AP Hostname/MAC | AP IP | AP Model |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for ap in wireless_aps:
+            sw_hn = ap.get("switch_hostname") or "(Standalone / Crawled AP)"
+            lp = ap.get("local_port") or "N/A"
+            ap_id_lbl = ap.get("hostname") or ap.get("mac") or "Unknown AP"
+            ap_ip = ap.get("ip") or "N/A"
+            ap_mod = ap.get("model") or "Wireless AP"
+            lines.append(f"| {sw_hn} | {lp} | {ap_id_lbl} | {ap_ip} | {ap_mod} |")
     else:
         lines.append("\nNo wireless access points were directly discovered via LLDP/CDP neighbor tables.")
 
-    if standalone_devs:
+    if standalone_nodes:
         lines.extend(
             [
                 "",
                 "## Standalone / Unlinked Infrastructure Switches",
-                "Switches with no discovered CDP/LLDP neighbor links (omitted from the Mermaid graph above for readability):",
+                "Crawled switches with zero discovered infrastructure neighbor links:",
                 "",
-                "| Hostname | Management IP | Model |",
-                "| :--- | :--- | :--- |",
+                "| Hostname | Management IP | Site | Model |",
+                "| :--- | :--- | :--- | :--- |",
             ]
         )
-        for shost, sip, smodel in standalone_devs:
-            lines.append(f"| **{shost}** | `{sip}` | `{smodel}` |")
+        for sn in standalone_nodes:
+            lines.append(
+                f"| **{sn['hostname']}** | `{sn['ip']}` | `{sn.get('site', '')}` | `{sn.get('model', 'Unknown')}` |"
+            )
+
+    scope_labels = {
+        "campus_root": "Campus Root",
+        "isolated_self_root": "Isolated Self-Root",
+        "non_root": "Non-Root",
+        "disabled": "Disabled",
+        "not_applicable": "N/A",
+    }
+    node_scope_by_ip = {
+        n["ip"]: scope_labels.get(n.get("stp_root_scope", "not_applicable"), "N/A")
+        for n in nodes
+        if n.get("is_crawled")
+    }
+    node_scope_by_hn = {
+        n["hostname"].lower(): scope_labels.get(n.get("stp_root_scope", "not_applicable"), "N/A")
+        for n in nodes
+        if n.get("is_crawled")
+    }
 
     lines.extend(
         [
             "",
             "## L2 Discovery Coverage & Accuracy Audit",
-            "Per-device LLDP/CDP operational status and topology caveats (explains unlinked, MAC-inferred, or passthrough edges):",
+            "Per-device LLDP/CDP operational status, STP root scope, and topology caveats (explains unlinked, MAC-inferred, Metro-E, or passthrough edges):",
             "",
-            "| Hostname | IP | Persona | LLDP | CDP | Neighbors | Notes / Accuracy Caveats |",
-            "| :--- | :--- | :--- | :--- | :--- | :---: | :--- |",
+            "| Hostname | IP | Persona | STP Scope | LLDP | CDP | Neighbors | Notes / Accuracy Caveats |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :---: | :--- |",
         ]
     )
-    for ip, dev in devices.items():
+    for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
         persona = dev.get("device_persona") or dev.get("device_type") or "unknown"
         dp = dev.get("discovery_protocols") or {}
         lldp_st = dp.get("lldp", "unknown")
         cdp_st = dp.get("cdp", "unsupported")
         nbrs = dev.get("neighbors") or []
+        stp_scope = node_scope_by_ip.get(str(dev.get("ip") or ip)) or node_scope_by_hn.get(hostname.lower(), "N/A")
         note_parts = [dp["notes"]] if dp.get("notes") else []
         acc_notes = sorted({n.get("l2_accuracy_note", "") for n in nbrs if n.get("l2_accuracy_note")})
         note_parts.extend(acc_notes)
+        if any(n.get("l2_accuracy") == "wan_carrier_arp_route" for n in nbrs) and not any(
+            "metro" in p.lower() or "carrier" in p.lower() or "lldp" in p.lower() for p in note_parts
+        ):
+            note_parts.append("Carrier Metro-E strips LLDP frames; uplink corroborated via ARP + L3 transit")
         if not nbrs and not note_parts:
             if persona == "router":
                 note_parts.append("L3 router with no L2 LLDP/CDP neighbors learned")
@@ -805,12 +1133,10 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                 note_parts.append("No LLDP/CDP neighbors learned")
         notes_str = "; ".join(note_parts) if note_parts else "Direct LLDP/CDP visibility"
         lines.append(
-            f"| **{hostname}** | `{ip}` | `{persona}` | `{lldp_st}` | `{cdp_st}` | {len(nbrs)} | {notes_str} |"
+            f"| **{hostname}** | `{ip}` | `{persona}` | {stp_scope} | `{lldp_st}` | `{cdp_st}` | {len(nbrs)} | {notes_str} |"
         )
 
     try:
-        from net_docu_crawler.diagram_validator import validate_mermaid_block
-
         full_md = "\n".join(lines)
         for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
             errs = validate_mermaid_block(m_blk)
@@ -823,148 +1149,539 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         print(f"Error generating L2 diagram file: {e}")
 
 
+def _format_l3_link_mermaid(src_mid: str, dst_mid: str, lk: dict, link_idx: int) -> tuple[str, str]:
+    """Format an L3 routed/transit edge and its distinct Mermaid ``linkStyle``."""
+    tt = str(lk.get("transport_type") or "l3_routed").lower()
+    cidr = str(lk.get("transit_cidr") or "").strip()
+    vid = str(lk.get("vlan_id") or "").strip()
+    mm = bool(lk.get("mask_mismatch"))
+    mm_detail = str(lk.get("mask_mismatch_detail") or "").strip()
+    rpfxs = lk.get("routed_prefixes") or []
+
+    if tt == "metro_ethernet":
+        t_badge = "Metro-E"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#0d9488,stroke-width:2.5px,stroke-dasharray: 5 5;"
+    elif tt == "wan_carrier":
+        t_badge = "WAN Carrier"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#0d9488,stroke-width:2.5px,stroke-dasharray: 5 5;"
+    elif tt == "direct_l2_uplink":
+        t_badge = "Direct Fiber LLDP"
+        arrow = "-->"
+        style = f"  linkStyle {link_idx} stroke:#333,stroke-width:2.5px;"
+    elif tt == "l3_egress":
+        t_badge = "L3 Egress"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#6366f1,stroke-width:2.5px,stroke-dasharray: 2 4;"
+    elif tt == "overlay_tunnel":
+        otype = str(lk.get("overlay_type") or "tunnel").upper()
+        t_badge = f"Overlay {otype}"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#7c3aed,stroke-width:2.5px,stroke-dasharray: 6 3;"
+    elif tt == "l3_unnumbered_p2p":
+        t_badge = "Unnumbered P2P"
+        arrow = "-->"
+        style = f"  linkStyle {link_idx} stroke:#0284c7,stroke-width:2.5px;"
+    elif tt == "vrf_leak":
+        t_badge = "VRF Leak"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#d97706,stroke-width:2.5px,stroke-dasharray: 4 4;"
+    else:
+        t_badge = "L3 Route"
+        arrow = "-.->"
+        style = f"  linkStyle {link_idx} stroke:#6366f1,stroke-width:2.5px,stroke-dasharray: 2 4;"
+
+    badge_parts = [
+        f"{t_badge} VLAN {vid}" if (vid and tt in ("metro_ethernet", "wan_carrier", "direct_l2_uplink")) else t_badge
+    ]
+    if mm:
+        badge_parts.append(f"MASK MISMATCH {mm_detail}".strip())
+    if tt == "l3_egress" and "0.0.0.0/0" in rpfxs:
+        badge_txt = f"{t_badge} 0.0.0.0/0"
+    else:
+        badge_txt = " / ".join(badge_parts)
+
+    pfx_note = ""
+    non_def = [p for p in rpfxs if p != "0.0.0.0/0"]
+    if len(non_def) > 3:
+        pfx_note = f"<br/>+{len(non_def)} routed prefixes"
+    elif non_def:
+        pfx_note = f"<br/>{', '.join(non_def)}"
+
+    hdr = f"{cidr} " if cidr else ""
+    safe_lbl = _mermaid_safe_text(f"{hdr}[{badge_txt}]{pfx_note}".strip())
+    return f'  {src_mid} {arrow}|"{safe_lbl}"| {dst_mid}', style
+
+
+def _l3_node_def_and_class(l3n: dict, mid: str) -> tuple[str, str]:
+    """Return ``(node_definition_line, css_class)`` for an ``l3_graph`` node."""
+    host = _mermaid_safe_text(l3n.get("hostname") or l3n.get("id") or "Unknown")
+    role = str(l3n.get("role") or "device").lower()
+    sub_cnt = len(l3n.get("l3_subnets") or [])
+    ip_s = str(l3n.get("ip") or "").strip()
+
+    if role == "isp":
+        return f'  {mid}(["{host}"])', "isp"
+    if role == "wan_cloud":
+        return f'  {mid}(["{host}<br/>(Carrier WAN)"])', "wan_cloud"
+    if role == "external_nexthop":
+        return f'  {mid}["{host}"]', "external_nexthop"
+
+    meta = f"<br/>({sub_cnt} SVIs)" if sub_cnt > 1 else (f"<br/>({ip_s})" if ip_s else "")
+    vrf = str(l3n.get("vrf") or "default").strip()
+    vrf_tag = f"<br/>[VRF: {_mermaid_safe_text(vrf)}]" if vrf and vrf != "default" else ""
+    css_cls = role if role in ("firewall", "router", "core") else "device"
+    return f'  {mid}["{host}{vrf_tag}{meta}"]', css_cls
+
+
 def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
     """
     Generates L3 logical and routing topologies using Mermaid.js.
-    Consumes `correlator.build_l3_svi_table()` for authoritative VLAN/SVI/subnet joins.
+    Consumes ``build_topology_graph_model(devices)["l3_graph"]`` and
+    ``correlator.build_l3_svi_table()`` for authoritative routing boundaries,
+    functional VLAN groups, conflict detection, and SVI/VLAN joins.
     """
     from net_docu_crawler.correlator import build_l3_svi_table
+    from net_docu_crawler.diagram_validator import validate_mermaid_block
+    from net_docu_crawler.topology_renderer import build_topology_graph_model
 
-    devices = {ip: dev for ip, dev in devices.items() if _is_network_infra(dev)}
-    svi_rows = build_l3_svi_table(list(devices.values()))
+    infra_devices = {ip: dev for ip, dev in (devices or {}).items() if _is_network_infra(dev)}
+    model = build_topology_graph_model(infra_devices)
+    l3_graph = model.get("l3_graph") or {}
+    l3_nodes = l3_graph.get("l3_nodes") or []
+    l3_links = l3_graph.get("l3_links") or []
+    l3_conflicts = l3_graph.get("l3_conflicts") or []
+    site_vlan_groups = l3_graph.get("site_vlan_groups") or {}
+    dhcp_relay_targets = l3_graph.get("dhcp_relay_targets") or {}
+
+    svi_rows = build_l3_svi_table(list(infra_devices.values()))
     svi_lookup: dict[tuple[str, str], dict] = {}
-    subnet_vlan_names: dict[str, set[str]] = {}
     for row in svi_rows:
         hn = row.get("source_device") or row.get("hostname", "")
         iname = str(row.get("svi_interface") or "").lower()
         svi_lookup[(hn, iname)] = row
-        sub = row.get("prefix_cidr") or row.get("subnet") or ""
-        vid = row.get("vlan_id") or ""
-        vname = row.get("vlan_name") or ""
-        if sub and (vid or vname):
-            lbl = f"VLAN {vid}: {vname}".strip(": ") if vid else vname
-            subnet_vlan_names.setdefault(sub, set()).add(lbl)
 
-    # Identify L3 routing gateways vs single-SVI L2 management switches when >20 infra devices exist
-    l3_gateway_hosts: set[str] = set()
-    mgmt_only_count = 0
-    for ip, dev in devices.items():
-        hn = dev.get("hostname") or ip
-        l3_ints = dev.get("l3_interfaces", []) or []
-        has_dyn_or_static = any(
-            str(r.get("protocol") or "").lower() not in ("connected", "local", "direct", "access-internal", "access")
-            and str(r.get("subnet") or "") != "0.0.0.0/0"
-            for r in (dev.get("routes") or [])
-        )
-        is_core = (
-            "core" in hn.lower()
-            or "5412" in str(dev.get("model", "")).lower()
-            or "ex4600" in str(dev.get("model", "")).lower()
-            or dev.get("device_persona") in ("router", "firewall")
-        )
-        if len(devices) <= 20 or len(l3_ints) >= 2 or has_dyn_or_static or is_core:
-            l3_gateway_hosts.add(hn)
-        else:
-            mgmt_only_count += 1
-
-    # 1. Build adjacency list of the bipartite graph (scoped to l3_gateway_hosts when >20 devices)
-    adj = {}
-    subnets = set()
-    device_nodes = set()
-    device_config_ips = {}
-    for ip, dev in devices.items():
+    device_config_ips: dict[str, dict] = {}
+    for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
         device_config_ips[hostname] = parse_interface_ips_from_config(cfg) if cfg else {}
-        if hostname not in l3_gateway_hosts:
-            continue
-        device_nodes.add(hostname)
-        adj.setdefault(hostname, set())
 
-        for intf in dev.get("l3_interfaces", []) or []:
-            intf_ip = intf.get("ip_address")
-            intf_name = intf.get("interface", "")
-            if not intf_ip or intf_ip in ["unassigned", "down", "up", "unset"]:
-                continue
+    non_ap_nodes = [n for n in (model.get("nodes") or []) if n.get("role") != "ap"]
+    all_l3_subnets = model.get("l3_subnets") or []
+    sites = model.get("sites") or []
+    is_campus_l3 = len(non_ap_nodes) > 10 or (len(sites) >= 2 and len(all_l3_subnets) > 10)
+    omitted_l2_mgmt = sum(1 for n in non_ap_nodes if n.get("is_crawled") and not n.get("is_l3_gateway"))
 
-            norm_intf = normalize_interface_name(intf_name)
-            _cfg_ip, cfg_mask = device_config_ips[hostname].get(norm_intf, (None, None))
-            clean_ip, net = parse_interface_network(intf_ip, cfg_mask)
-            if not net or clean_ip.startswith(("127.", "128.0.")):
-                continue
-
-            clean_ip_base = f"{net.network}/{net.prefixlen}"
-            subnets.add(clean_ip_base)
-            adj.setdefault(clean_ip_base, set())
-            adj[hostname].add(clean_ip_base)
-            adj[clean_ip_base].add(hostname)
-
-    diagram_lines = []
-    if not adj:
-        diagram_lines.append("graph TD")
-        diagram_lines.append('  root["No L3 Interfaces Discovered"]')
-    else:
-        diagram_lines.append("graph TD")
-        diagram_lines.append("  %% Style configurations")
-        diagram_lines.append("  classDef device fill:#f5f5f5,stroke:#333,stroke-width:2px;")
-        diagram_lines.append("  classDef subnet fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;")
-        diagram_lines.append("")
-
-        # Pre-populate safe IDs for all nodes
-        node_ids = {}
-        counter = 0
-        for sub in sorted(list(subnets)):
-            node_ids[sub] = f"sub_{counter}"
-            counter += 1
-        for dev in sorted(list(device_nodes)):
-            node_ids[dev] = f"dev_{counter}"
-            counter += 1
-
-        # Define Subnets (stadium oval: ([...]))
-        diagram_lines.append("  %% Subnets (Ovals)")
-        for sub in sorted(list(subnets)):
-            node_id = node_ids[sub]
-            vnames = subnet_vlan_names.get(sub, set())
-            vname_suffix = f" ({'/'.join(sorted(vnames))})" if vnames else ""
-            label = f"{sub}{vname_suffix}"
-            safe_label = label.replace('"', "'")
-            diagram_lines.append(f'  {node_id}(["{safe_label}"])')
-            diagram_lines.append(f"  class {node_id} subnet;")
-
-        # Define Devices (square: [...])
-        diagram_lines.append("\n  %% Devices (Squares)")
-        for dev in sorted(list(device_nodes)):
-            node_id = node_ids[dev]
-            safe_dev = dev.replace('"', '\\"')
-            diagram_lines.append(f'  {node_id}["{safe_dev}"]')
-            diagram_lines.append(f"  class {node_id} device;")
-
-        # Draw Links
-        diagram_lines.append("\n  %% Connectivity Links")
-        for dev in sorted(list(device_nodes)):
-            dev_id = node_ids[dev]
-            for sub in sorted(list(adj.get(dev, []))):
-                sub_id = node_ids[sub]
-                diagram_lines.append(f"  {dev_id} --- {sub_id}")
-
-    lines = [
+    lines: list[str] = [
         "# Layer 3 & Logical Network Diagrams",
         "",
-        "This file documents Layer 3 boundaries, Switch Virtual Interfaces (SVIs), VLAN maps, and routing domains/VRFs.",
+        "This file documents Layer 3 boundaries, Switch Virtual Interfaces (SVIs), VLAN maps, routing conflicts, and routing domains/VRFs.",
         "",
         "## Logical Routing Boundary Diagram",
-        "```mermaid",
-        "\n".join(diagram_lines),
-        "```",
-        "",
     ]
-    if mgmt_only_count > 0:
+
+    # Section 1: Logical Routing Boundary Diagram
+    m1 = ["```mermaid", "flowchart LR", *_mermaid_l3_classdefs(), ""]
+    l3_id_map: dict[str, str] = {}
+    used_l3_ids: set[str] = set()
+
+    def _alloc_l3_mid(nid: str, prefix: str = "l3") -> str:
+        if nid in l3_id_map:
+            return l3_id_map[nid]
+        cand = f"{prefix}_{_mermaid_slug(nid)}"
+        base = cand
+        seq = 1
+        while cand in used_l3_ids:
+            seq += 1
+            cand = f"{base}_{seq}"
+        used_l3_ids.add(cand)
+        l3_id_map[nid] = cand
+        return cand
+
+    l3_nodes_by_id = {n["id"]: n for n in l3_nodes}
+    l3_nodes_by_host = {str(n.get("hostname") or "").lower(): n["id"] for n in l3_nodes if n.get("hostname")}
+
+    if not l3_nodes and not all_l3_subnets:
+        m1.append('  root["No L3 Interfaces Discovered"]')
+        m1.append("  class root device;")
+    elif is_campus_l3:
+        linked_ids = {lk["source"] for lk in l3_links} | {lk["target"] for lk in l3_links}
+        active_l3_nodes = [
+            n
+            for n in l3_nodes
+            if (
+                n.get("role") != "wan_cloud" and (n["id"] in linked_ids or n.get("is_crawled") or n.get("has_conflict"))
+            )
+            or n["id"] in linked_ids
+        ]
+        cls_lines: list[str] = []
+        for n in active_l3_nodes:
+            mid = _alloc_l3_mid(n["id"])
+            defn, css_cls = _l3_node_def_and_class(n, mid)
+            m1.append(defn)
+            cls_lines.append(f"  class {mid} {css_cls};")
+
+        # Emit explicit red conflict warning nodes for duplicate gateway IP / overlapping site subnet
+        conflict_links: list[tuple[str, str, str]] = []
+        for cidx, conf in enumerate(l3_conflicts):
+            ctype = conf.get("conflict_type") or ""
+            if ctype not in ("duplicate_gateway_ip", "overlapping_site_subnet"):
+                continue
+            cid = f"conflict_{cidx}"
+            used_l3_ids.add(cid)
+            cidr_lbl = _mermaid_safe_text(conf.get("cidr") or "")
+            title_lbl = "Duplicate Gateway IP" if ctype == "duplicate_gateway_ip" else "Overlapping Site Subnet"
+            dup_ip = f" ({conf['duplicate_ip']})" if conf.get("duplicate_ip") else ""
+            m1.append(f'  {cid}(["CONFLICT: {title_lbl}<br/>{cidr_lbl}{_mermaid_safe_text(dup_ip)}"])')
+            cls_lines.append(f"  class {cid} conflict;")
+            hub_tgt = _mermaid_safe_text(conf.get("active_hub_route_target") or "")
+            edge_lbl = f"CONFLICT - Hub routes to {hub_tgt}" if hub_tgt else "CONFLICT - Overlapping Subnet"
+            for dname in conf.get("devices") or []:
+                dn_id = l3_nodes_by_host.get(str(dname).lower())
+                if dn_id and dn_id in l3_id_map:
+                    conflict_links.append((l3_id_map[dn_id], cid, edge_lbl))
+
+        m1.extend(cls_lines)
+        m1.append("")
+        m1.append("  %% L3 Routing & Transit Links")
+        link_styles: list[str] = []
+        link_idx = 0
+        for lk in l3_links:
+            if lk["source"] not in l3_id_map or lk["target"] not in l3_id_map:
+                continue
+            eline, sln = _format_l3_link_mermaid(l3_id_map[lk["source"]], l3_id_map[lk["target"]], lk, link_idx)
+            m1.append(eline)
+            link_styles.append(sln)
+            link_idx += 1
+        for src_mid, cid, elbl in conflict_links:
+            m1.append(f'  {src_mid} -.->|"{_mermaid_safe_text(elbl)}"| {cid}')
+            link_styles.append(f"  linkStyle {link_idx} stroke:#dc2626,stroke-width:2.5px,stroke-dasharray: 5 5;")
+            link_idx += 1
+        if link_styles:
+            m1.append("")
+            m1.extend(link_styles)
+    else:
+        # Small Lab Mode: show L3 nodes + subnet ovals (with accurate CIDR masks) + L3 egress/route arrows
+        cls_lines = []
+        for n in l3_nodes:
+            mid = _alloc_l3_mid(n["id"])
+            defn, css_cls = _l3_node_def_and_class(n, mid)
+            m1.append(defn)
+            cls_lines.append(f"  class {mid} {css_cls};")
+
+        # Collect authoritative CIDRs (supporting raw_config mask hints when l3_interfaces lacks CIDR)
+        subnet_meta: dict[str, dict[str, set[str]]] = {}
+        dev_to_sub_edges: list[tuple[str, str]] = []
+        for ip, dev in infra_devices.items():
+            hn = dev.get("hostname") or ip
+            nid = l3_nodes_by_host.get(hn.lower())
+            if not nid or nid not in l3_id_map:
+                continue
+            for intf in dev.get("l3_interfaces") or []:
+                ip_addr = str(intf.get("ip_address") or "")
+                intf_name = str(intf.get("interface") or "")
+                norm_intf = normalize_interface_name(intf_name)
+                _cfg_ip, cfg_mask = device_config_ips.get(hn, {}).get(norm_intf, (None, None))
+                clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
+                if not net or clean_ip.startswith(("127.", "128.0.")):
+                    continue
+                cidr = f"{net.network}/{net.prefixlen}"
+                svi_row = svi_lookup.get((hn, intf_name.lower()), {})
+                vid = svi_row.get("vlan_id") or ""
+                vname = svi_row.get("vlan_name") or ""
+                entry = subnet_meta.setdefault(cidr, {"labels": set()})
+                if vid or vname:
+                    entry["labels"].add(f"VLAN {vid}: {vname}".strip(": ") if vid else vname)
+                dev_to_sub_edges.append((l3_id_map[nid], cidr))
+
+        sub_mid_map: dict[str, str] = {}
+        for idx, cidr in enumerate(sorted(subnet_meta.keys())):
+            smid = f"sub_{idx}"
+            sub_mid_map[cidr] = smid
+            lbls = sorted(subnet_meta[cidr]["labels"])
+            vname_suffix = f"<br/>({'/'.join(lbls)})" if lbls else ""
+            m1.append(f'  {smid}(["{_mermaid_safe_text(cidr + vname_suffix)}"])')
+            cls_lines.append(f"  class {smid} subnet;")
+
+        m1.extend(cls_lines)
+        m1.append("")
+        link_styles = []
+        link_idx = 0
+        seen_sub_edges: set[tuple[str, str]] = set()
+        for dev_mid, cidr in sorted(dev_to_sub_edges):
+            smid = sub_mid_map[cidr]
+            if (dev_mid, smid) in seen_sub_edges:
+                continue
+            seen_sub_edges.add((dev_mid, smid))
+            m1.append(f"  {dev_mid} --- {smid}")
+            link_styles.append(f"  linkStyle {link_idx} stroke:#64748b,stroke-width:2px;")
+            link_idx += 1
+
+        for lk in l3_links:
+            if lk["source"] not in l3_id_map or lk["target"] not in l3_id_map:
+                continue
+            eline, sln = _format_l3_link_mermaid(l3_id_map[lk["source"]], l3_id_map[lk["target"]], lk, link_idx)
+            m1.append(eline)
+            link_styles.append(sln)
+            link_idx += 1
+
+        if link_styles:
+            m1.append("")
+            m1.extend(link_styles)
+
+    m1.append("```")
+    lines.extend(_compact_mermaid_block_if_oversized(m1))
+    lines.append("")
+
+    if is_campus_l3 and omitted_l2_mgmt > 0:
         lines.extend(
             [
-                f"> [!NOTE] Scoped to **{len(l3_gateway_hosts)}** L3 routing gateways / core switches; **{mgmt_only_count}** single-SVI L2 management switches omitted from the Mermaid graph above (all SVIs remain listed in the table below).",
+                f"> [!NOTE] Scoped to **{len(l3_nodes)}** L3 routing gateways, perimeter firewalls, and routed next-hops; **{omitted_l2_mgmt}** single-SVI L2 management switches omitted from the backbone Mermaid graph above (all SVIs remain listed in the table below).",
                 "",
             ]
         )
+
+    model_svi_desc_lookup: dict[tuple[str, str], str] = {}
+    model_vid_desc_lookup: dict[tuple[str, str], str] = {}
+    for mnode in model.get("nodes") or []:
+        mhn = str(mnode.get("hostname") or "").lower()
+        for sub in mnode.get("l3_subnets") or []:
+            vdesc = str(sub.get("vlan_description") or "").strip('"')
+            if not vdesc:
+                continue
+            if sub.get("interface"):
+                model_svi_desc_lookup[(mhn, str(sub["interface"]).lower())] = vdesc
+            if sub.get("vlan_id"):
+                model_vid_desc_lookup[(mhn, str(sub["vlan_id"]))] = vdesc
+
+    # Section 2: Site-Scoped Layer 3 Functional Architecture Diagrams
+    if is_campus_l3:
+        lines.extend(["## Site-Scoped Layer 3 Functional Architecture Diagrams", ""])
+        for sc in sites:
+            site_l3_nodes = [
+                n for n in l3_nodes if n.get("site") == sc and n.get("role") not in ("wan_cloud", "external_nexthop")
+            ]
+            if not site_l3_nodes:
+                continue
+            site_l3_ids = {n["id"] for n in site_l3_nodes}
+            site_subs = [sub for n in site_l3_nodes for sub in (n.get("l3_subnets") or [])]
+            sc_groups = site_vlan_groups.get(sc) or {}
+            sc_relays = dhcp_relay_targets.get(sc) or []
+            if not site_subs and not sc_groups:
+                continue
+
+            site_links = [lk for lk in l3_links if lk["source"] in site_l3_ids or lk["target"] in site_l3_ids]
+
+            s_m = ["```mermaid", "flowchart LR", *_mermaid_l3_classdefs(), ""]
+            s_id_map: dict[str, str] = {}
+            s_used: set[str] = set()
+            s_cls: list[str] = []
+
+            def _alloc_site_l3(nid: str, _s_id_map=s_id_map, _s_used=s_used) -> str:
+                if nid in _s_id_map:
+                    return _s_id_map[nid]
+                cand = f"s_{_mermaid_slug(nid)}"
+                base = cand
+                seq = 1
+                while cand in _s_used:
+                    seq += 1
+                    cand = f"{base}_{seq}"
+                _s_used.add(cand)
+                _s_id_map[nid] = cand
+                return cand
+
+            node_pool_ids = set(site_l3_ids)
+            for lk in site_links:
+                node_pool_ids.add(lk["source"])
+                node_pool_ids.add(lk["target"])
+
+            for nid in sorted(node_pool_ids):
+                n_obj = l3_nodes_by_id.get(nid)
+                if not n_obj:
+                    continue
+                mid = _alloc_site_l3(nid)
+                defn, css_cls = _l3_node_def_and_class(n_obj, mid)
+                s_m.append(defn)
+                s_cls.append(f"  class {mid} {css_cls};")
+
+            primary_site_gw_node = max(
+                site_l3_nodes,
+                key=lambda n: (
+                    1 if n.get("is_crawled") else 0,
+                    len(n.get("l3_subnets") or []),
+                    -int(n.get("layer") or 4),
+                ),
+            )
+            primary_site_mid = s_id_map[primary_site_gw_node["id"]]
+
+            s_edges_lines: list[str] = []
+            s_link_styles: list[str] = []
+            s_lidx = 0
+
+            for lk in site_links:
+                if lk["source"] in s_id_map and lk["target"] in s_id_map:
+                    eline, sln = _format_l3_link_mermaid(s_id_map[lk["source"]], s_id_map[lk["target"]], lk, s_lidx)
+                    s_edges_lines.append(eline)
+                    s_link_styles.append(sln)
+                    s_lidx += 1
+
+            if len(site_subs) > 10 and sc_groups:
+                for gidx, (bname, bdata) in enumerate(sorted(sc_groups.items())):
+                    gid = f"grp_{gidx}"
+                    s_used.add(gid)
+                    samples = []
+                    for it in bdata.get("items") or []:
+                        lbl = str(it.get("vlan_description") or it.get("vlan_name") or "").strip()
+                        if lbl and lbl not in samples:
+                            samples.append(lbl)
+                        if len(samples) >= 2:
+                            break
+                    samp_str = f"<br/>e.g. {', '.join(samples)}" if samples else ""
+                    g_lbl = _mermaid_safe_text(
+                        f"{bname} ({bdata.get('count', 0)} SVIs)<br/>{bdata.get('cidr_summary', '')}{samp_str}"
+                    )
+                    s_m.append(f'  {gid}(["{g_lbl}"])')
+                    s_cls.append(f"  class {gid} subnet;")
+                    s_edges_lines.append(f"  {primary_site_mid} --> {gid}")
+                    s_link_styles.append(f"  linkStyle {s_lidx} stroke:#0288d1,stroke-width:2px;")
+                    s_lidx += 1
+            else:
+                for sidx, sub in enumerate(site_subs):
+                    sid = f"sub_{sidx}"
+                    s_used.add(sid)
+                    vid = sub.get("vlan_id") or ""
+                    vname = sub.get("vlan_name") or ""
+                    vdesc = sub.get("vlan_description") or ""
+                    meta_p = f"VLAN {vid}: {vname}".strip(": ") if (vid or vname) else ""
+                    desc_p = f" — {vdesc}" if vdesc else ""
+                    lbl = _mermaid_safe_text(f"{sub.get('cidr', '')}<br/>{meta_p}{desc_p}".strip("<br/>"))
+                    s_m.append(f'  {sid}(["{lbl}"])')
+                    s_cls.append(f"  class {sid} subnet;")
+                    s_edges_lines.append(f"  {primary_site_mid} --- {sid}")
+                    s_link_styles.append(f"  linkStyle {s_lidx} stroke:#64748b,stroke-width:2px;")
+                    s_lidx += 1
+
+            if sc_relays:
+                did = f"dhcp_{_mermaid_slug(sc)}"
+                s_used.add(did)
+                relay_txt = _mermaid_safe_text(", ".join(sc_relays))
+                s_m.append(f'  {did}["DHCP Relays<br/>{relay_txt}"]')
+                s_cls.append(f"  class {did} router;")
+                s_edges_lines.append(f'  {primary_site_mid} -.->|"DHCP Helper"| {did}')
+                s_link_styles.append(f"  linkStyle {s_lidx} stroke:#6366f1,stroke-width:2px,stroke-dasharray: 2 4;")
+                s_lidx += 1
+
+            s_m.extend(s_cls)
+            s_m.append("")
+            s_m.extend(s_edges_lines)
+            if s_link_styles:
+                s_m.append("")
+                s_m.extend(s_link_styles)
+            s_m.append("```")
+            s_m = _compact_mermaid_block_if_oversized(s_m)
+            lines.extend([f"### Site `{sc}` Layer 3 Architecture", *s_m, ""])
+
+    # Section 3: L3 Routing Conflicts, Mask Mismatches & Collapsible Subnet Tree
+    lines.extend(["### Detected L3 Conflicts & Mask Mismatches", ""])
+    if l3_conflicts:
+        lines.extend(
+            [
+                "| Conflict Type | CIDR / Subnet | Affected Devices | Active Hub Route Target | Impact Summary |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for c in l3_conflicts:
+            ctype = str(c.get("conflict_type") or "").replace("_", " ").title()
+            cidr_c = c.get("cidr") or ""
+            devs_c = ", ".join(c.get("devices") or [])
+            tgt_c = c.get("active_hub_route_target") or "-"
+            imp_c = c.get("impact_summary") or ""
+            lines.append(f"| **{ctype}** | `{cidr_c}` | {devs_c} | {tgt_c} | {imp_c} |")
+        lines.append("")
+    else:
+        lines.extend(["✓ No duplicate gateway IPs, overlapping site subnets, or transit mask mismatches detected.", ""])
+
+    if infra_devices:
+        lines.extend(
+            [
+                "## Collapsible Layer 3 Hierarchy Tree",
+                "Expand a site or device below to inspect all routed/SVI subnets, VLAN IDs, names, and descriptions at full size:",
+                "",
+            ]
+        )
+        site_by_host = {
+            n["hostname"].lower(): n["site"]
+            for n in (model.get("nodes") or [])
+            if n.get("is_crawled") and n.get("hostname")
+        }
+        site_by_ip = {n["ip"]: n["site"] for n in (model.get("nodes") or []) if n.get("is_crawled") and n.get("ip")}
+        by_site_l3: dict[str, list[tuple[str, list[dict]]]] = {}
+        for ip, dev in infra_devices.items():
+            hn = dev.get("hostname") or ip
+            l3_items = []
+            for intf in dev.get("l3_interfaces") or []:
+                ip_addr = str(intf.get("ip_address") or "")
+                intf_name = str(intf.get("interface") or "")
+                norm_intf = normalize_interface_name(intf_name)
+                _cfg_ip, cfg_mask = device_config_ips.get(hn, {}).get(norm_intf, (None, None))
+                clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
+                if not clean_ip or clean_ip.startswith(("127.", "128.0.")):
+                    continue
+                cidr = f"{net.network}/{net.prefixlen}" if net else clean_ip
+                svi_row = svi_lookup.get((hn, intf_name.lower()), {})
+                vid = svi_row.get("vlan_id") or ""
+                if not vid:
+                    vm = re.search(r"(?:vlan\.?|vl|irb\.)0*(\d+)", intf_name, re.IGNORECASE)
+                    if vm:
+                        vid = vm.group(1)
+                vinfo = (dev.get("vlans") or {}).get(vid, {}) if vid else {}
+                vname = svi_row.get("vlan_name") or (vinfo.get("name", "") if isinstance(vinfo, dict) else "")
+                vdesc = (
+                    svi_row.get("vlan_description")
+                    or (vinfo.get("description", "") if isinstance(vinfo, dict) else "")
+                    or model_svi_desc_lookup.get((hn.lower(), intf_name.lower()), "")
+                    or model_vid_desc_lookup.get((hn.lower(), str(vid)), "")
+                )
+                l3_items.append(
+                    {
+                        "cidr": cidr,
+                        "vid": vid,
+                        "vname": str(vname).strip('"'),
+                        "vdesc": str(vdesc).strip('"'),
+                        "intf": intf_name,
+                        "ip": ip_addr,
+                    }
+                )
+            if l3_items:
+                sc = (
+                    site_by_ip.get(str(dev.get("ip") or ip))
+                    or site_by_host.get(hn.lower())
+                    or dev.get("site_code")
+                    or "CORE"
+                )
+                by_site_l3.setdefault(sc, []).append((hn, l3_items))
+
+        for sc in sorted(by_site_l3.keys()):
+            dev_entries = sorted(by_site_l3[sc], key=lambda x: x[0].lower())
+            lines.append(f"<details><summary><strong>Site: {sc}</strong> ({len(dev_entries)} L3 node(s))</summary>")
+            lines.append("")
+            for hn, items in dev_entries:
+                lines.append(f"<details><summary><strong>{hn}</strong> — {len(items)} subnet(s)</summary>")
+                lines.append("")
+                for it in sorted(items, key=lambda x: (x["cidr"], x["intf"])):
+                    vid_s = f"VLAN {it['vid']}" if it["vid"] else "N/A"
+                    vn_s = it["vname"] or "N/A"
+                    vd_s = it["vdesc"] or "N/A"
+                    lines.append(f"  - `{it['cidr']}` — {vid_s} | `{vn_s}` | {vd_s} (`{it['intf']}`: `{it['ip']}`)")
+                lines.append("")
+                lines.append("</details>")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
+
+    # Section 4: Authoritative VLAN, Subnet & SVI Map (preserve 8 columns across ALL infra devices)
     lines.extend(
         [
             "## Authoritative VLAN, Subnet & SVI Map",
@@ -974,9 +1691,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
         ]
     )
 
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
+    for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
         l3_ints = dev.get("l3_interfaces", [])
         ints_detail = dev.get("interfaces_detail", {})
@@ -985,7 +1700,6 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             ip_addr = intf.get("ip_address")
             status = intf.get("status")
 
-            # Match SVI name to interfaces_detail to get description
             desc = ""
             norm_name = normalize_interface_name(intf_name)
             for name, stats in ints_detail.items():
@@ -1000,8 +1714,15 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
                 vlan_match = re.search(r"(?:vlan\.?|vl|irb\.)0*(\d+)", str(intf_name or ""), re.IGNORECASE)
                 if vlan_match:
                     vlan_id_str = vlan_match.group(1)
-            if not vlan_name and vlan_id_str:
-                vlan_name = (dev.get("vlans") or {}).get(vlan_id_str, {}).get("name", "")
+            v_entry = (dev.get("vlans") or {}).get(vlan_id_str, {}) if vlan_id_str else {}
+            if not vlan_name and isinstance(v_entry, dict):
+                vlan_name = v_entry.get("name", "")
+            vlan_desc = (
+                svi_row.get("vlan_description")
+                or (str(v_entry.get("description", "")).strip('"') if isinstance(v_entry, dict) else "")
+                or model_svi_desc_lookup.get((hostname.lower(), str(intf_name or "").lower()), "")
+                or model_vid_desc_lookup.get((hostname.lower(), str(vlan_id_str)), "")
+            )
 
             _cfg_ip, cfg_mask = device_config_ips.get(hostname, {}).get(norm_name, (None, None))
             clean_ip, net = parse_interface_network(ip_addr, cfg_mask)
@@ -1013,7 +1734,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             else:
                 subnet_range = svi_row.get("prefix_cidr") or svi_row.get("subnet") or parsed_subnet or "N/A"
             lines.append(
-                f"| {hostname} | {intf_name} | {vlan_id_str or 'N/A'} | {vlan_name or 'N/A'} | {desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
+                f"| {hostname} | {intf_name} | {vlan_id_str or 'N/A'} | {vlan_name or 'N/A'} | {desc or vlan_desc or 'N/A'} | {ip_addr} | {subnet_range} | {status} |"
             )
 
     lines.extend(
@@ -1024,14 +1745,10 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
         ]
     )
 
-    # Search running config for VRFs
     vrf_found = False
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
+    for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
         cfg = dev.get("raw_config", "")
-        # Look for "vrf definition X" or "ip vrf X"
         vrfs = list(set(re.findall(r"(?:ip vrf|vrf definition)\s+(\S+)", cfg)))
         if vrfs:
             vrf_found = True
@@ -1044,7 +1761,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             "\nNo virtual routing and forwarding (VRF) instances were detected in active device configurations (standard global table only)."
         )
 
-    # Complete Routing Tables
+    # Complete Routing Tables (summarizing /32 Access-internal / Local / Host routes per (protocol, interface))
     lines.extend(
         [
             "",
@@ -1054,9 +1771,7 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
     )
 
     has_routes = False
-    for ip, dev in devices.items():
-        if not _is_network_infra(dev):
-            continue
+    for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
         routes = dev.get("routes", [])
         if routes:
@@ -1068,33 +1783,27 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
                 lines.append("| --- | --- | --- | --- | --- |")
                 has_routes = True
 
-            sorted_routes = []
-            for r in routes:
-                sorted_routes.append(get_route_details(r))
+            sorted_routes = sorted((get_route_details(r) for r in routes), key=_route_sort_key)
 
-            sorted_routes.sort(key=_route_sort_key)
-
-            omitted_host_routes = 0
+            collapsed_host_routes: dict[tuple[str, str], int] = {}
             for rt in sorted_routes:
-                sub = rt["subnet"]
-                proto_l = str(rt["protocol"] or "").lower()
-                if proto_l in ("local", "access-internal", "access") and sub.endswith("/32"):
-                    omitted_host_routes += 1
+                sub = str(rt["subnet"] or "")
+                proto = str(rt["protocol"] or "")
+                proto_l = proto.lower()
+                iface = rt["interface"] or "N/A"
+                if sub.endswith("/32") and proto_l in ("local", "access-internal", "access", "host"):
+                    collapsed_host_routes[(proto, iface)] = collapsed_host_routes.get((proto, iface), 0) + 1
                     continue
+                lines.append(f"| {hostname} | `{sub}` | {proto} | {rt['next_hop']} | {iface} |")
+            for (proto_d, iface_d), cnt in sorted(collapsed_host_routes.items()):
                 lines.append(
-                    f"| {hostname} | `{sub}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |"
-                )
-            if omitted_host_routes:
-                lines.append(
-                    f"| {hostname} | *({omitted_host_routes} `/32` Access-internal DHCP/subscriber host routes omitted)* | Access-internal | - | - |"
+                    f"| {hostname} | *({cnt} `/32` {proto_d} host/subscriber routes summarized)* | {proto_d} | - | {iface_d} |"
                 )
 
     if not has_routes:
         lines.append("\nNo routing table entries were parsed or simulated for the scanned devices.")
 
     try:
-        from net_docu_crawler.diagram_validator import validate_mermaid_block
-
         full_md = "\n".join(lines)
         for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
             errs = validate_mermaid_block(m_blk)
@@ -1389,8 +2098,18 @@ def _render_routing_protocols_and_tables_section(devices: dict) -> list[str]:
         lines.append("| Route Prefix | Protocol | Next Hop / Gateway | Outgoing Interface |")
         lines.append("| --- | --- | --- | --- |")
         sorted_routes = sorted((get_route_details(r) for r in routes), key=_route_sort_key)
+        collapsed_host_routes: dict[tuple[str, str], int] = {}
         for rt in sorted_routes:
-            lines.append(f"| `{rt['subnet']}` | {rt['protocol']} | {rt['next_hop']} | {rt['interface'] or 'N/A'} |")
+            sub = str(rt["subnet"] or "")
+            proto = str(rt["protocol"] or "")
+            proto_l = proto.lower()
+            iface = rt["interface"] or "N/A"
+            if sub.endswith("/32") and proto_l in ("local", "access-internal", "access", "host"):
+                collapsed_host_routes[(proto, iface)] = collapsed_host_routes.get((proto, iface), 0) + 1
+                continue
+            lines.append(f"| `{sub}` | {proto} | {rt['next_hop']} | {iface} |")
+        for (proto_d, iface_d), cnt in sorted(collapsed_host_routes.items()):
+            lines.append(f"| *({cnt} `/32` {proto_d} subscriber/host routes summarized)* | {proto_d} | - | {iface_d} |")
 
     if not has_routes_any:
         lines.append("  * No routing table entries were parsed or simulated for the scanned devices.")
@@ -2560,7 +3279,11 @@ def _render_blueprint_header_and_toc(scope: str, dns_domain: str, timestamp: str
     return lines
 
 
-def _collect_discovery_readiness_metrics(unique_devs: dict, failed_hosts_count: int = 0) -> dict:
+def _collect_discovery_readiness_metrics(
+    unique_devs: dict,
+    failed_hosts_count: int = 0,
+    non_infra_failed_count: int = 0,
+) -> dict:
     """Compute discovery confidence, L2 link accuracy, and SPOF/blocker flags from crawled devices."""
     lldp_enabled = 0
     lldp_missing: list[tuple[str, str, str]] = []
@@ -2631,6 +3354,7 @@ def _collect_discovery_readiness_metrics(unique_devs: dict, failed_hosts_count: 
     return {
         "gate": gate,
         "failed_hosts_count": failed_hosts_count,
+        "non_infra_failed_count": non_infra_failed_count,
         "lldp_enabled": lldp_enabled,
         "lldp_missing": lldp_missing,
         "cdp_enabled": cdp_enabled,
@@ -2647,9 +3371,17 @@ def _collect_discovery_readiness_metrics(unique_devs: dict, failed_hosts_count: 
     }
 
 
-def _render_blueprint_executive_summary_section(unique_devs: dict, failed_hosts_count: int = 0) -> list[str]:
+def _render_blueprint_executive_summary_section(
+    unique_devs: dict,
+    failed_hosts_count: int = 0,
+    non_infra_failed_count: int = 0,
+) -> list[str]:
     """Render Section 1: Executive Summary, Deliverables Index, Risks & Hardware Estate."""
-    metrics = _collect_discovery_readiness_metrics(unique_devs, failed_hosts_count=failed_hosts_count)
+    metrics = _collect_discovery_readiness_metrics(
+        unique_devs,
+        failed_hosts_count=failed_hosts_count,
+        non_infra_failed_count=non_infra_failed_count,
+    )
     total_nodes = len(unique_devs)
     gate_badge = (
         f"❌ **{metrics['gate']}**"
@@ -2662,6 +3394,18 @@ def _render_blueprint_executive_summary_section(unique_devs: dict, failed_hosts_
         if not metrics["lldp_missing"]
         else f"⚠ {len(metrics['lldp_missing'])} device(s) lack LLDP"
     )
+    non_infra_note = (
+        f" (`{non_infra_failed_count}` passive/unsupported non-infra hosts)" if non_infra_failed_count > 0 else ""
+    )
+    if metrics["failed_hosts_count"] == 0:
+        scope_assess = (
+            f"✓ Complete infra scope ({non_infra_failed_count} passive/unsupported non-infra hosts in failed_hosts.json)"
+            if non_infra_failed_count > 0
+            else "✓ Complete scope"
+        )
+    else:
+        scope_assess = f"⚠ Review {metrics['failed_hosts_count']} infra target(s) in failed_hosts.json"
+
     lines = [
         "",
         "---",
@@ -2673,8 +3417,7 @@ def _render_blueprint_executive_summary_section(unique_devs: dict, failed_hosts_
         "| Readiness Indicator | Observed Value | Assessment |",
         "| :--- | :--- | :--- |",
         f"| **Cutover Readiness Gate** | {gate_badge} | Based on crawl coverage, L2 visibility & SPOF checks |",
-        f"| **Crawled Infrastructure Nodes** | `{total_nodes}` succeeded / `{metrics['failed_hosts_count']}` failed | "
-        f"{'✓ Complete scope' if metrics['failed_hosts_count'] == 0 else '⚠ Review failed_hosts.json'} |",
+        f"| **Crawled Infrastructure Nodes** | `{total_nodes}` succeeded / `{metrics['failed_hosts_count']}` infra failed{non_infra_note} | {scope_assess} |",
         f"| **L2 Protocol Visibility (LLDP / CDP)** | `{metrics['lldp_enabled']}/{total_nodes}` LLDP enabled (`{metrics['cdp_enabled']}` CDP) | {lldp_assess} |",
         f"| **L2 Adjacency Confidence** | `{metrics['direct_nbrs']}` direct / `{metrics['mac_inferred_nbrs']}` MAC-inferred / `{metrics['passthrough_nbrs']}` passthrough | "
         f"{'✓ Direct cabling verified' if not (metrics['mac_inferred_nbrs'] or metrics['passthrough_nbrs']) else '⚠ Verify dashed links in L2 diagram'} |",
@@ -2686,6 +3429,8 @@ def _render_blueprint_executive_summary_section(unique_devs: dict, failed_hosts_
         "| :--- | :--- | :--- |",
         "| [L2_network_diagrams.md](./L2_network_diagrams.md) | Physical L2 Mermaid graph, wireless AP overlay & per-device LLDP/CDP audit | Managers & Engineers |",
         "| [L3_network_diagrams.md](./L3_network_diagrams.md) | Layer 3 routed topology, subnets & CIDR conflict audit | Managers & Engineers |",
+        "| [topology_interactive.html](./topology_interactive.html) | Interactive offline HTML topology viewer (collapsible tree, search, site filter & port inspector) | Managers & Engineers |",
+        "| [manual_followup_report.md](./manual_followup_report.md) | Consolidated manual follow-up checklist (unauth, command mismatches, unmanaged switches, PoE, non-AP trunks) | Field & Network Engineers |",
         "| [cutover_runbook.md](./cutover_runbook.md) | Standalone maintenance-window execution sequence, T-minus checklist & rollback plan | Cutover Lead |",
         "| [trunk_vlan_audit.md](./trunk_vlan_audit.md) | 802.1Q trunk symmetry & native VLAN mismatch audit | Switching Engineer |",
         "| [net_docu_crawler_live_report.md](./net_docu_crawler_live_report.md) | Full per-device interface telemetry, errors & operational state | Engineers |",
@@ -3123,6 +3868,21 @@ def _render_blueprint_stp_section(unique_devs: dict) -> list[str]:
         lines.append(
             f"| **{hostname}** | `{proto}` | {root_label} | `{prio}` | {edge_label} | {bpdu_label} | Standard IEEE 802.1w / 802.1s |"
         )
+    lines.extend(
+        [
+            "",
+            "### 6.1 Loop Protection & BPDU Guard Best-Practice Matrix (By Link Type)",
+            "",
+            "| Link / Port Type | STP Edge / PortFast | BPDU Guard / Block | Loop Protection (`loop-protect`) | Additional Guardrails (Often Missed) |",
+            "| :--- | :---: | :---: | :---: | :--- |",
+            "| **User Access (PC / Printer / Wall Jack)** | **Yes** | **Yes** | **Yes** | Enable Storm Control + auto-recovery timer (`errdisable recovery`) so transient user loops recover after unplugging. |",
+            "| **VoIP Phone + PC Daisy-Chain** | **Yes** | **Yes** | **Yes** | Configure Voice VLAN + LLDP-MED and allow MAC limit >= 2–3 (phone + PC) so port security does not trip. |",
+            "| **Wireless Access Point (AP)** | **Yes** | **Yes** *(off if mesh)* | **Yes** | Disable BPDU Guard if APs run wired-to-wireless mesh; keep Loop Protection on to catch dual-cable/injector loops. |",
+            "| **Inter-Switch Trunk (Access ↔ Dist)** | **No** | **No** | **No** | Enable **STP Root Guard** on Distribution ports facing Access switches, plus **STP Loop Guard** / **UDLD** on fiber uplinks. |",
+            "| **Spine / Core-to-Core / LAG** | **No** | **No** | **No** | Prefer **L3 routed P2P (`/30`/`/31`)** links where possible; on L2 trunks/LAGs use **LACP (`802.3ad`)** + **Loop Guard** + **UDLD**. |",
+            "| **Firewall / Router / Hypervisor** | **Yes** *(if L3)* | **Yes** *(vSwitch/L3)* | **Yes** *(vSwitch)* | Keep BPDU Guard **off** on transparent/bridged firewalls; enable on Proxmox/ESXi uplinks to catch `vmbr`/vSwitch loops. |",
+        ]
+    )
     return lines
 
 
@@ -3174,6 +3934,67 @@ def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
                 lines.append(
                     f"| **{hostname}** | `{rd.get('next_hop')}` | `{rd.get('interface')}` | `{rd.get('protocol')}` | 1 (Static) |"
                 )
+
+    from net_docu_crawler.topology_renderer import build_topology_graph_model
+
+    model = build_topology_graph_model(unique_devs)
+    l3_graph = model.get("l3_graph") or {}
+    l3_nodes_by_id = {n["id"]: n for n in (l3_graph.get("l3_nodes") or [])}
+    l3_links = l3_graph.get("l3_links") or []
+    l3_conflicts = l3_graph.get("l3_conflicts") or []
+
+    lines.extend(["", "### 8.2 L3 Backbone, WAN Egress & Conflict Summary", ""])
+    if l3_links:
+        lines.extend(
+            [
+                "| Source Node | Target Node | Transit CIDR | Transport Type | Routing Mechanism | Routed Prefixes / Warnings |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        tt_labels = {
+            "metro_ethernet": "Metro-E (ARP+L3)",
+            "wan_carrier": "WAN Carrier",
+            "direct_l2_uplink": "Direct Fiber LLDP",
+            "l3_egress": "L3 Egress",
+            "l3_routed": "L3 Route",
+        }
+        for lk in l3_links:
+            src_hn = (l3_nodes_by_id.get(lk["source"]) or {}).get("hostname") or lk["source"]
+            dst_hn = (l3_nodes_by_id.get(lk["target"]) or {}).get("hostname") or lk["target"]
+            tcidr = lk.get("transit_cidr") or "-"
+            tt_lbl = tt_labels.get(lk.get("transport_type") or "", lk.get("transport_type") or "L3 Route")
+            mech = lk.get("routing_mechanism") or "-"
+            notes = []
+            if lk.get("mask_mismatch"):
+                notes.append(f"⚠️ MASK MISMATCH ({lk.get('mask_mismatch_detail') or 'prefix mismatch'})")
+            if lk.get("routed_prefixes_summary"):
+                notes.append(lk["routed_prefixes_summary"])
+            note_s = "; ".join(notes) or "-"
+            lines.append(f"| **{src_hn}** | **{dst_hn}** | `{tcidr}` | {tt_lbl} | `{mech}` | {note_s} |")
+        lines.append("")
+    else:
+        lines.extend(["> No multi-node L3 routed transit or WAN egress adjacencies detected.", ""])
+
+    if l3_conflicts:
+        lines.extend(
+            [
+                "#### Detected L3 Routing Conflicts & Mask Mismatches",
+                "| Conflict Type | CIDR | Affected Devices | Active Hub Route Target | Impact Summary |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for c in l3_conflicts:
+            ctype = str(c.get("conflict_type") or "").replace("_", " ").title()
+            devs_s = ", ".join(c.get("devices") or [])
+            tgt_s = c.get("active_hub_route_target") or "-"
+            lines.append(
+                f"| **{ctype}** | `{c.get('cidr') or ''}` | {devs_s} | {tgt_s} | {c.get('impact_summary') or ''} |"
+            )
+        lines.append("")
+    else:
+        lines.append(
+            "✓ **No L3 duplicate gateway IPs, overlapping site subnets, or transit mask mismatches detected.**"
+        )
     return lines
 
 
@@ -3337,38 +4158,96 @@ def generate_cutover_runbook(
     """
     Generate the standalone Maintenance Window Cutover Runbook & Rollback Plan (cutover_runbook.md).
     """
+    from net_docu_crawler.topology_renderer import build_topology_graph_model
+
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
-    gateways = []
-    stp_roots = []
-    relays = []
-    lldp_gaps = []
+    model = build_topology_graph_model(unique_devs)
+    gateways: list[tuple[str, str, str, str]] = []
+    relays: list[tuple[str, str, str]] = []
+    lldp_gaps: list[tuple[str, str]] = []
 
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         for r in dev.get("routes", []):
             rd = get_route_details(r)
             if rd.get("subnet") in ("0.0.0.0/0", "default"):
-                gateways.append(f"`{hostname}` -> `{rd.get('next_hop')}` via `{rd.get('interface')}`")
-        stp = dev.get("stp") or {}
-        if stp.get("is_root") or stp.get("is_verified_campus_root"):
-            stp_roots.append(f"`{hostname}` (`{stp.get('root_bridge') or 'Root'}`)")
+                gateways.append(
+                    (
+                        hostname,
+                        str(rd.get("next_hop") or ""),
+                        str(rd.get("interface") or ""),
+                        str(rd.get("protocol") or ""),
+                    )
+                )
         dev_relays = (dev.get("dhcp") or {}).get("relays", []) or []
         if dev_relays:
             for rel in dev_relays:
                 if rel.get("helper_ip"):
-                    relays.append(f"`{hostname}` `{rel.get('interface', '')}` -> `{rel['helper_ip']}`")
+                    relays.append((hostname, str(rel.get("interface", "") or "-"), str(rel["helper_ip"])))
         else:
             for r_ip in (dev.get("services") or {}).get("dhcp_relays", []) or []:
-                relays.append(f"`{hostname}` -> `{r_ip}`")
+                relays.append((hostname, "Config Services", str(r_ip)))
         dp = dev.get("discovery_protocols") or {}
         lldp_st = dp.get("lldp", "unknown")
         if lldp_st in ("disabled", "not_installed") or (
             lldp_st == "unknown" and not (dev.get("neighbors") or []) and dp.get("cdp") != "enabled"
         ):
-            lldp_gaps.append(f"`{hostname}` (`lldp={lldp_st}`)")
+            lldp_gaps.append((hostname, lldp_st))
+
+    campus_roots = [n for n in (model.get("nodes") or []) if n.get("stp_root_scope") == "campus_root"]
+    isolated_roots = [n for n in (model.get("nodes") or []) if n.get("stp_root_scope") == "isolated_self_root"]
+
+    def _fmt_inline_or_count(items: list, inline_fn, empty_msg: str, noun: str) -> str:
+        if not items:
+            return empty_msg
+        if len(items) <= 4:
+            return ", ".join(inline_fn(it) for it in items)
+        return f"**{len(items)}** {noun} verified (expand reference table below)."
+
+    gw_summary = _fmt_inline_or_count(
+        gateways,
+        lambda g: f"`{g[0]}` -> `{g[1]}` via `{g[2]}`",
+        "Verify default routes on target L3 gateways.",
+        "default gateways",
+    )
+    if campus_roots:
+        cr_part = _fmt_inline_or_count(
+            campus_roots,
+            lambda n: f"`{n['hostname']}` (`{n.get('stp_root_bridge_mac') or 'Root'}`)",
+            "",
+            "verified campus STP root(s)",
+        )
+        iso_part = (
+            f" (⚠️ **{len(isolated_roots)}** isolated self-root island(s) also detected — see below)"
+            if isolated_roots
+            else ""
+        )
+        stp_summary = f"Verified campus root(s): {cr_part}{iso_part}"
+    elif isolated_roots:
+        stp_summary = (
+            f"⚠️ **0** multi-switch verified campus roots; **{len(isolated_roots)}** isolated self-root switch(es) flagged "
+            "(confirm intended STP root bridge priority on target core; see details below)."
+        )
+    else:
+        stp_summary = "Confirm intended STP root bridge priority on target core."
+
+    relay_summary = _fmt_inline_or_count(
+        relays,
+        lambda r: f"`{r[0]}` `{r[1]}` -> `{r[2]}`",
+        "No centralized DHCP relays detected; verify local gateway DHCP scopes if applicable.",
+        "DHCP relay bindings",
+    )
+    if not lldp_gaps:
+        lldp_summary = "All infrastructure nodes have LLDP/CDP visibility."
+    elif len(lldp_gaps) <= 4:
+        lldp_summary = "Manually trace physical cabling for: " + ", ".join(
+            f"`{h}` (`lldp={st}`)" for h, st in lldp_gaps
+        )
+    else:
+        lldp_summary = f"**{len(lldp_gaps)}** nodes lack LLDP/CDP visibility (expand table below)."
 
     lines = [
         "# Maintenance Window Cutover Runbook & Rollback Plan",
@@ -3383,31 +4262,99 @@ def generate_cutover_runbook(
         "## 1. Pre-Cutover T-Minus Checklist (24 Hours Prior)",
         "- [ ] **Configuration & Dataset Backup**: Confirm [net_docu_crawler_dataset.json](./net_docu_crawler_dataset.json) and raw device backups are archived.",
         "- [ ] **Cabling & Optics Staging**: Stage patch cords and transceivers per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv).",
-        f"- [ ] **Default Gateways Verified**: {', '.join(gateways) if gateways else 'Verify default routes on target L3 gateways.'}",
-        f"- [ ] **STP Root Placement Verified**: {', '.join(stp_roots) if stp_roots else 'Confirm intended STP root bridge priority on target core.'}",
-        f"- [ ] **DHCP Relays Provisioned**: {', '.join(relays) if relays else 'No centralized DHCP relays detected; verify local gateway DHCP scopes if applicable.'}",
-        f"- [ ] **L2 Blind-Spot Physical Trace**: {('Manually trace physical cabling for: ' + ', '.join(lldp_gaps)) if lldp_gaps else 'All infrastructure nodes have LLDP/CDP visibility.'}",
+        f"- [ ] **Default Gateways Verified**: {gw_summary}",
+        f"- [ ] **STP Root Placement Verified**: {stp_summary}",
+        f"- [ ] **DHCP Relays Provisioned**: {relay_summary}",
+        f"- [ ] **L2 Blind-Spot Physical Trace**: {lldp_summary}",
         "- [ ] **Validation Script Ready**: Confirm `./validate_cutover.sh` (or `validate_cutover.ps1`) executes cleanly against baseline.",
         "",
-        "---",
-        "",
-        "## 2. Cutover Window Execution Sequence (T-0 to T+30m)",
-        "1. **T-0:00 - Silence Monitoring Alerts**: Place target switches, routers, and firewalls in maintenance mode in SIEM/NMS.",
-        "2. **T-0:05 - Physical Cable Transfer**: Move patch cables in sequence per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv).",
-        "3. **T-0:15 - Power-On & Link Verification**: Power up replacement hardware; verify uplinks, LACP/LAG bundles, and STP convergence.",
-        "4. **T-0:20 - Automated Reachability Smoke Tests**: Run `./validate_cutover.sh` from management jumphost to verify gateway and DNS reachability.",
-        "5. **T-0:25 - Client & Wireless Verification**: Verify DHCP leases, inter-VLAN routing, and AP associations across all VLANs.",
-        "",
-        "---",
-        "",
-        "## 3. Rollback Plan & Hard Abort Gate",
-        "> [!CAUTION]",
-        "> **HARD ABORT CRITERIA**: If core gateway reachability, WAN egress, or client DHCP fails and cannot be resolved within 45 minutes of maintenance window start, trigger immediate rollback:",
-        "1. Power down or isolate replacement hardware.",
-        "2. Re-seat original patch cables into legacy ports using [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) as source of truth.",
-        "3. Power on legacy switches/gateways and run `./validate_cutover.sh` to verify 100% baseline restoration.",
-        "",
     ]
+
+    detail_blocks: list[str] = []
+    if len(gateways) > 4:
+        detail_blocks.extend(
+            [
+                f"<details><summary><strong>Default Gateways ({len(gateways)})</strong></summary>",
+                "",
+                "| Hostname | Next Hop | Exit Interface | Protocol |",
+                "| :--- | :--- | :--- | :--- |",
+                *[f"| **{h}** | `{nh}` | `{iface}` | `{proto}` |" for h, nh, iface, proto in gateways],
+                "",
+                "</details>",
+                "",
+            ]
+        )
+    if len(campus_roots) > 4 or isolated_roots:
+        detail_blocks.extend(
+            [
+                f"<details><summary><strong>STP Root Scope Breakdown ({len(campus_roots)} verified campus root(s), {len(isolated_roots)} isolated self-root(s))</strong></summary>",
+                "",
+                "| Hostname | Site | STP Scope | Root Bridge ID |",
+                "| :--- | :--- | :--- | :--- |",
+                *[
+                    f"| **{n['hostname']}** | `{n.get('site', '')}` | Verified Campus Root | `{n.get('stp_root_bridge_mac') or 'Root'}` |"
+                    for n in campus_roots
+                ],
+                *[
+                    f"| **{n['hostname']}** | `{n.get('site', '')}` | ⚠️ Isolated Self-Root | `{n.get('stp_root_bridge_mac') or 'Self'}` |"
+                    for n in isolated_roots
+                ],
+                "",
+                "</details>",
+                "",
+            ]
+        )
+    if len(relays) > 4:
+        detail_blocks.extend(
+            [
+                f"<details><summary><strong>DHCP Relay Bindings ({len(relays)})</strong></summary>",
+                "",
+                "| Hostname | Interface | Helper IP |",
+                "| :--- | :--- | :--- |",
+                *[f"| **{h}** | `{iface}` | `{hip}` |" for h, iface, hip in relays],
+                "",
+                "</details>",
+                "",
+            ]
+        )
+    if len(lldp_gaps) > 4:
+        detail_blocks.extend(
+            [
+                f"<details><summary><strong>L2 Blind-Spot Nodes ({len(lldp_gaps)})</strong></summary>",
+                "",
+                "| Hostname | LLDP Status |",
+                "| :--- | :--- |",
+                *[f"| **{h}** | `{st}` |" for h, st in lldp_gaps],
+                "",
+                "</details>",
+                "",
+            ]
+        )
+    if detail_blocks:
+        lines.extend(["### 1.1 Pre-Cutover Reference Tables", "", *detail_blocks])
+
+    lines.extend(
+        [
+            "---",
+            "",
+            "## 2. Cutover Window Execution Sequence (T-0 to T+30m)",
+            "1. **T-0:00 - Silence Monitoring Alerts**: Place target switches, routers, and firewalls in maintenance mode in SIEM/NMS.",
+            "2. **T-0:05 - Physical Cable Transfer**: Move patch cables in sequence per [migration_cabling_matrix.csv](./migration_cabling_matrix.csv).",
+            "3. **T-0:15 - Power-On & Link Verification**: Power up replacement hardware; verify uplinks, LACP/LAG bundles, and STP convergence.",
+            "4. **T-0:20 - Automated Reachability Smoke Tests**: Run `./validate_cutover.sh` from management jumphost to verify gateway and DNS reachability.",
+            "5. **T-0:25 - Client & Wireless Verification**: Verify DHCP leases, inter-VLAN routing, and AP associations across all VLANs.",
+            "",
+            "---",
+            "",
+            "## 3. Rollback Plan & Hard Abort Gate",
+            "> [!CAUTION]",
+            "> **HARD ABORT CRITERIA**: If core gateway reachability, WAN egress, or client DHCP fails and cannot be resolved within 45 minutes of maintenance window start, trigger immediate rollback:",
+            "1. Power down or isolate replacement hardware.",
+            "2. Re-seat original patch cables into legacy ports using [migration_cabling_matrix.csv](./migration_cabling_matrix.csv) as source of truth.",
+            "3. Power on legacy switches/gateways and run `./validate_cutover.sh` to verify 100% baseline restoration.",
+            "",
+        ]
+    )
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:
@@ -3452,8 +4399,34 @@ _PROBABLE_NETWORK_VENDOR_HINTS = (
 )
 
 
+def _is_infra_failed_host(fh: dict) -> bool:
+    """Return True if a failed_hosts.json entry represents infrastructure rather than a passive/unsupported endpoint."""
+    if not isinstance(fh, dict):
+        return False
+    rc = str(fh.get("record_class") or "").strip().lower()
+    if rc == "unauthenticated_infra":
+        return True
+    if rc in ("passive_endpoint", "unsupported_appliance"):
+        return False
+    st = str(fh.get("status") or "").strip().lower()
+    dtype = str(fh.get("device_type") or "").strip().lower()
+    if dtype in ("ap", "phone", "voip", "camera", "printer", "display", "av_control", "ups", "nas", "iot", "server"):
+        return False
+    if st == "unauthenticated":
+        return True
+    if dtype in ("switch", "router", "firewall", "wlc"):
+        return True
+    vend_l = str(fh.get("vendor") or "").strip().lower()
+    mod_l = str(fh.get("model") or "").strip().lower()
+    hay = f"{vend_l} {mod_l}"
+    infra_hints = tuple(h for h in _PROBABLE_NETWORK_VENDOR_HINTS if h not in ("ruckus", "hp inc"))
+    return any(h in hay for h in infra_hints)
+
+
 def _render_blueprint_manual_verification_section(devices: dict, unique_devs: dict) -> list[str]:
     """Render Section 1.5: manual verification checklist for suspected unmanaged switches, failed/unsupported hosts, and bridges."""
+    from net_docu_crawler.topology_renderer import classify_neighbor_node
+
     lines: list[str] = [
         "",
         "### 1.5 Manual Verification & Suspected Unmanaged / Unverified Switches",
@@ -3462,8 +4435,25 @@ def _render_blueprint_manual_verification_section(devices: dict, unique_devs: di
         "",
     ]
 
-    # 1. Multi-MAC ports without direct LLDP/CDP + passthrough ports + uncrawled LLDP/CDP neighbors
-    crawled_hosts_lc = {(d.get("hostname") or ip).split(".")[0].strip().lower() for ip, d in unique_devs.items()}
+    crawled_hosts_lc: set[str] = set()
+    crawled_ips: set[str] = set()
+    crawled_macs: set[str] = set()
+    for ip, d in unique_devs.items():
+        hn = str(d.get("hostname") or ip).strip()
+        if hn:
+            crawled_hosts_lc.add(hn.lower())
+            crawled_hosts_lc.add(hn.split(".")[0].lower())
+        crawled_ips.add(str(ip).strip())
+        if d.get("ip"):
+            crawled_ips.add(str(d["ip"]).strip())
+        for l3 in d.get("l3_interfaces") or []:
+            cip = str((l3 or {}).get("ip_address") or "").split("/")[0].split()[0].strip()
+            if cip and not cip.startswith(("127.", "128.0.")):
+                crawled_ips.add(cip)
+        bmac = oui_lookup.normalize_mac(str(d.get("mac_address") or "")).lower().strip()
+        if bmac and bmac != "00:00:00:00:00:00":
+            crawled_macs.add(bmac)
+
     suspected_l2_rows: list[str] = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
@@ -3472,6 +4462,11 @@ def _render_blueprint_manual_verification_section(devices: dict, unique_devs: di
             normalize_interface_name(n.get("local_port", "")).lower()
             for n in nbrs
             if n.get("local_port") and n.get("l2_accuracy", "") != "mac_inferred"
+        }
+        carrier_or_egress_ports = {
+            normalize_interface_name(n.get("local_port", "")).lower()
+            for n in nbrs
+            if n.get("local_port") and n.get("l2_accuracy", "") in ("wan_carrier_arp_route", "l3_next_hop_egress")
         }
 
         macs_by_port: dict[str, set[str]] = {}
@@ -3484,7 +4479,7 @@ def _render_blueprint_manual_verification_section(devices: dict, unique_devs: di
 
         for port, macs in sorted(macs_by_port.items()):
             norm_p = normalize_interface_name(port).lower()
-            if len(macs) >= 2 and norm_p not in direct_nbr_ports:
+            if len(macs) >= 2 and norm_p not in direct_nbr_ports and norm_p not in carrier_or_egress_ports:
                 suspected_l2_rows.append(
                     f"| **{hostname}** | `{port}` | `{len(macs)} MACs` (no direct LLDP/CDP) | Verify unmanaged switch, hypervisor vSwitch/bridge, or L2 aggregation hop |"
                 )
@@ -3494,11 +4489,20 @@ def _render_blueprint_manual_verification_section(devices: dict, unique_devs: di
                 suspected_l2_rows.append(
                     f"| **{hostname}** | `{n.get('local_port', '')}` | Multi-neighbor transit (`{n.get('remote_device', '')}`) | Verify unmanaged switch or passthrough bridge on uplink |"
                 )
-            r_host = (n.get("remote_device") or "").split(".")[0].strip().lower()
-            if r_host and r_host not in crawled_hosts_lc:
+            remote_raw = str(n.get("remote_device") or "").strip().strip('"').strip("'")
+            if not remote_raw:
+                continue
+            cls = classify_neighbor_node(
+                remote_raw,
+                n,
+                crawled_hosts_lc=crawled_hosts_lc,
+                crawled_ips=crawled_ips,
+                crawled_macs=crawled_macs,
+            )
+            if cls in ("uncrawled_switch", "firewall", "router", "isp"):
                 plat = n.get("platform") or n.get("remote_platform") or n.get("device_type") or "Unknown"
                 suspected_l2_rows.append(
-                    f"| **{hostname}** | `{n.get('local_port', '')}` | Uncrawled neighbor `{n.get('remote_device', '')}` (`{plat}`) | Verify management IP/credentials or confirm unmanaged/external peer |"
+                    f"| **{hostname}** | `{n.get('local_port', '')}` | Uncrawled neighbor `{remote_raw}` (`{plat}`) | Verify management IP/credentials or confirm unmanaged/external peer |"
                 )
 
     if suspected_l2_rows:
@@ -3540,7 +4544,6 @@ def _render_blueprint_manual_verification_section(devices: dict, unique_devs: di
         unverified_rows.append((is_probable_sw, row))
 
     if unverified_rows:
-        # Sort probable switches / network appliances first
         unverified_rows.sort(key=lambda x: (not x[0], x[1]))
         lines.extend(
             [
@@ -3614,6 +4617,7 @@ def generate_master_network_analysis_migration_blueprint(
     if not timestamp:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    non_infra_failed_count = 0
     if failed_hosts_count is None:
         failed_hosts_count = 0
         failed_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "failed_hosts.json")
@@ -3622,13 +4626,23 @@ def generate_master_network_analysis_migration_blueprint(
                 with open(failed_path, encoding="utf-8") as fh:
                     failed_data = json.load(fh)
                 if isinstance(failed_data, list):
-                    failed_hosts_count = len(failed_data)
+                    for item in failed_data:
+                        if _is_infra_failed_host(item):
+                            failed_hosts_count += 1
+                        else:
+                            non_infra_failed_count += 1
             except (OSError, ValueError):
                 failed_hosts_count = 0
 
     unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
     lines = _render_blueprint_header_and_toc(scope, dns_domain, timestamp, len(unique_devs))
-    lines.extend(_render_blueprint_executive_summary_section(unique_devs, failed_hosts_count=failed_hosts_count))
+    lines.extend(
+        _render_blueprint_executive_summary_section(
+            unique_devs,
+            failed_hosts_count=failed_hosts_count,
+            non_infra_failed_count=non_infra_failed_count,
+        )
+    )
     lines.extend(_render_blueprint_manual_verification_section(devices, unique_devs))
     lines.extend(_render_blueprint_cabling_and_mtu_section(unique_devs))
     lines.extend(_render_blueprint_optics_section(unique_devs))
@@ -4231,6 +5245,7 @@ def _export_vlans_and_svi_csvs(infra: list[dict], norm_dir: str) -> list[dict]:
         "source_device",
         "vlan_id",
         "vlan_name",
+        "vlan_description",
         "svi_interface",
         "primary_ip",
         "prefix_cidr",
@@ -4238,10 +5253,11 @@ def _export_vlans_and_svi_csvs(infra: list[dict], norm_dir: str) -> list[dict]:
         "confidence",
     ]
     with open(os.path.join(norm_dir, "svi_routes.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=svi_fields)
+        w = csv.DictWriter(f, fieldnames=svi_fields, extrasaction="ignore")
         w.writeheader()
         for sr in svi_rows:
             row = dict(sr)
+            row.setdefault("vlan_description", "")
             row["dhcp_relays"] = ",".join(sr.get("dhcp_relays") or [])
             w.writerow(row)
     return svi_rows
@@ -4344,13 +5360,25 @@ def _export_physical_links_and_endpoints_csvs(registry, corr_dir: str, run_outpu
     with open(os.path.join(corr_dir, "physical_links.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["node_a", "port_a", "node_b", "port_b", "status", "type", "link_class"],
+            fieldnames=[
+                "node_a",
+                "port_a",
+                "node_b",
+                "port_b",
+                "status",
+                "type",
+                "link_class",
+                "transport_type",
+                "evidence",
+            ],
             extrasaction="ignore",
         )
         w.writeheader()
         for lk in getattr(registry, "links", []) or []:
             row = dict(lk)
             row.setdefault("link_class", "infra_uplink")
+            row.setdefault("transport_type", "")
+            row.setdefault("evidence", "")
             w.writerow(row)
 
     ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
@@ -4574,14 +5602,108 @@ def _normalize_trunk_csv_rows(trunk_audit: dict) -> list[dict]:
     return norm_rows
 
 
+def _extract_mac_from_hostname(host: str) -> str:
+    """Extract a 12-hex MAC embedded in hostnames like ``d65-000fd30aae2f``."""
+    m = re.search(r"([0-9a-fA-F]{12})$", (host or "").strip())
+    if not m:
+        return ""
+    raw = m.group(1).lower()
+    return ":".join(raw[i : i + 2] for i in range(0, 12, 2))
+
+
+def _classify_oui_role(vendor_oui: str, dtype: str = "", platform: str = "") -> str:
+    """Classify a peer's OUI + type into a concise role label such as ``[AP]`` or ``[Phone]``."""
+    hay = f"{vendor_oui} {dtype} {platform}".lower()
+    if dtype.lower() == "ap" or any(h in hay for h in _AP_OUI_HINTS):
+        return f"{vendor_oui or 'Wireless'} [AP]"
+    if (
+        dtype.lower() in ("phone", "voip")
+        or any(h in hay for h in _PHONE_OUI_HINTS)
+        or re.match(r"^(?:d\d+|p\d+)-[0-9a-f]{12}$", platform.lower())
+    ):
+        return f"{vendor_oui or 'VoIP'} [Phone]"
+    if dtype.lower() in ("switch", "router", "firewall"):
+        return f"{vendor_oui or dtype.title()} [{dtype.title()}]"
+    return vendor_oui or "Unknown"
+
+
+def _build_host_oui_role_lookup(devices: dict | None) -> dict[str, str]:
+    """Build a lowercase hostname/IP -> OUI/role lookup table from crawled devices and LLDP neighbors."""
+    lookup: dict[str, str] = {}
+    if not isinstance(devices, dict):
+        return lookup
+    for ip, dev in devices.items():
+        if not isinstance(dev, dict):
+            continue
+        hn = str(dev.get("hostname") or ip).strip().lower()
+        dtype = str(dev.get("device_type") or dev.get("device_persona") or "").strip()
+        mac = str(dev.get("mac_address") or "").strip()
+        oui_v = oui_lookup.lookup_oui(mac) if mac else ""
+        if not oui_v or oui_v == "Unknown":
+            oui_v = str(dev.get("vendor") or "")
+        role = _classify_oui_role(oui_v, dtype=dtype, platform=str(dev.get("model") or ""))
+        for key in {str(ip).lower(), hn, hn.split(".")[0]}:
+            if key:
+                lookup[key] = role
+        for nbr in dev.get("neighbors") or []:
+            rh = str(nbr.get("remote_device") or "").strip().lower()
+            rip = str(nbr.get("remote_ip") or "").strip().lower()
+            rmac = str(nbr.get("remote_mac") or "").strip()
+            rplat = str(nbr.get("platform") or nbr.get("remote_platform") or "")
+            rdtype = str(nbr.get("device_type") or "")
+            if not rmac and rh:
+                rmac = _extract_mac_from_hostname(rh)
+            roui = oui_lookup.lookup_oui(rmac) if rmac else ""
+            if not roui or roui == "Unknown":
+                roui = rplat
+            n_role = _classify_oui_role(roui, dtype=rdtype, platform=rh or rplat)
+            for key in {rh, rh.split(".")[0], rip}:
+                if key and (key not in lookup or lookup[key] == "Unknown"):
+                    lookup[key] = n_role
+    return lookup
+
+
+def _resolve_trunk_peer_oui_role(host_a: str, host_b: str, lookup: dict[str, str]) -> str:
+    """Resolve the most informative peer OUI/role for a trunk discrepancy row."""
+    for h in (host_a, host_b):
+        hl = (h or "").strip().lower()
+        if not hl:
+            continue
+        if hl in lookup and lookup[hl] != "Unknown":
+            val = lookup[hl]
+            if "[AP]" in val or "[Phone]" in val:
+                return val
+        mac_h = _extract_mac_from_hostname(hl)
+        if mac_h:
+            oui_v = oui_lookup.lookup_oui(mac_h)
+            if oui_v and oui_v != "Unknown":
+                return _classify_oui_role(oui_v, platform=hl)
+    for h in (host_a, host_b):
+        hl = (h or "").strip().lower()
+        if hl in lookup and lookup[hl] != "Unknown":
+            return lookup[hl]
+    return "Unknown"
+
+
 def _build_trunk_audit_markdown_section(
     devices_or_audit,
     heading: str = "### Trunk VLAN Mismatch & L2 Symmetry Audit",
+    peer_lookup: dict[str, str] | None = None,
 ) -> list[str]:
     """Build a concise Markdown summary table for trunk VLAN mismatch & L2 symmetry findings."""
     audit = _resolve_trunk_audit(devices_or_audit)
     summary = (audit or {}).get("summary") or {}
     rows = _normalize_trunk_csv_rows(audit)
+    if peer_lookup is None and isinstance(devices_or_audit, dict) and "findings" not in devices_or_audit:
+        peer_lookup = _build_host_oui_role_lookup(devices_or_audit)
+    peer_lookup = peer_lookup or {}
+
+    ap_phone_cnt = 0
+    for r in rows:
+        role_str = _resolve_trunk_peer_oui_role(r["Side_A_Host"], r["Side_B_Host"], peer_lookup)
+        r["Peer_OUI_Role"] = role_str
+        if "[AP]" in role_str or "[Phone]" in role_str:
+            ap_phone_cnt += 1
 
     edges_eval = int(
         summary.get(
@@ -4603,32 +5725,35 @@ def _build_trunk_audit_markdown_section(
         (
             f"Evaluated Trunk Links: **{edges_eval}** | Total Findings: **{total_cnt}** "
             f"(CRITICAL: **{crit_cnt}**, HIGH: **{high_cnt}**, MEDIUM: **{med_cnt}**, "
-            f"LOW: **{low_cnt}**, INFO: **{info_cnt}**)"
+            f"LOW: **{low_cnt}**, INFO: **{info_cnt}**) | "
+            f"AP/Phone Edge Findings (Safe to Ignore): **{ap_phone_cnt}**"
         ),
         "",
-        "| Edge_ID | Side_A_Host | Side_A_Port | Side_B_Host | Side_B_Port | Rule_ID | Severity | Side_A_Only_VLANs | Side_B_Only_VLANs | Remediation_Hint |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| Edge_ID | Side_A_Host | Side_A_Port | Side_B_Host | Side_B_Port | Peer_OUI_Role | Rule_ID | Severity | Side_A_Only_VLANs | Side_B_Only_VLANs | Remediation_Hint |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
     if rows:
         for r in rows[:50]:
             sec_lines.append(
                 f"| `{r['Edge_ID']}` | **{r['Side_A_Host']}** | `{r['Side_A_Port']}` | "
                 f"**{r['Side_B_Host'] or 'N/A'}** | `{r['Side_B_Port'] or 'N/A'}` | "
-                f"`{r['Rule_ID']}` | **{r['Severity']}** | `{r['Side_A_Only_VLANs'] or '-'}` | "
+                f"{r.get('Peer_OUI_Role', 'Unknown')} | `{r['Rule_ID']}` | **{r['Severity']}** | `{r['Side_A_Only_VLANs'] or '-'}` | "
                 f"`{r['Side_B_Only_VLANs'] or '-'}` | {r['Remediation_Hint']} |"
             )
         if len(rows) > 50:
             sec_lines.append(
-                f"| *... and {len(rows) - 50} additional trunk findings recorded in `trunk_vlan_audit.md` and `03_correlated/trunk_mismatches.csv`* | | | | | | | | | |"
+                f"| *... and {len(rows) - 50} additional trunk findings recorded in `trunk_vlan_audit.md` and `03_correlated/trunk_mismatches.csv`* | | | | | | | | | | |"
             )
     else:
         sec_lines.append(
-            "| *All Evaluated Trunks* | *Symmetric* | `-` | *Symmetric* | `-` | `PASS` | **PASS** | `-` | `-` | ✓ Zero 802.1Q trunk VLAN, native PVID, or mode mismatches detected. |"
+            "| *All Evaluated Trunks* | *Symmetric* | `-` | *Symmetric* | `-` | `-` | `PASS` | **PASS** | `-` | `-` | ✓ Zero 802.1Q trunk VLAN, native PVID, or mode mismatches detected. |"
         )
     return sec_lines
 
 
-def generate_trunk_audit_report(devices_or_audit, output_path: str = "trunk_vlan_audit.md") -> dict:
+def generate_trunk_audit_report(
+    devices_or_audit, output_path: str = "trunk_vlan_audit.md", devices: dict | None = None
+) -> dict:
     """
     Generate the dedicated Trunk VLAN Mismatch & L2 Symmetry Audit Report (`trunk_vlan_audit.md`)
     with GNU AGPLv3 notice, summary counts, discrepancy table, and multi-vendor remediation guidance.
@@ -4678,10 +5803,18 @@ def generate_trunk_audit_report(devices_or_audit, output_path: str = "trunk_vlan
         f"| **INFO Findings (`INFO_QINQ_BOUNDARY`)** | `{info_cnt}` | Informational |",
     ]
 
+    peer_src = (
+        devices
+        if devices is not None
+        else (devices_or_audit if isinstance(devices_or_audit, dict) and "findings" not in devices_or_audit else None)
+    )
+    peer_lookup = _build_host_oui_role_lookup(peer_src)
+
     lines.extend(
         _build_trunk_audit_markdown_section(
             audit,
             heading="## 2. Trunk VLAN Mismatch & L2 Symmetry Discrepancy Table",
+            peer_lookup=peer_lookup,
         )
     )
 
@@ -4724,3 +5857,183 @@ def generate_trunk_audit_report(devices_or_audit, output_path: str = "trunk_vlan
         print(f"Error generating trunk VLAN audit report: {e}")
 
     return audit
+
+
+def generate_manual_followup_report(
+    devices: dict,
+    output_path: str = "manual_followup_report.md",
+    trunk_audit: dict | None = None,
+    quality_report: dict | None = None,
+) -> None:
+    """
+    Generate a single consolidated manual follow-up checklist (`manual_followup_report.md`)
+    pulling actionable items from quality gates, failed/unauthenticated targets,
+    suspected unmanaged switches, PoE warnings, and switch-to-switch trunk mismatches
+    (filtering out AP/Phone edges).
+    """
+    unique_devs = get_unique_devices({ip: dev for ip, dev in devices.items() if _is_network_infra(dev)})
+    peer_lookup = _build_host_oui_role_lookup(devices)
+
+    lines: list[str] = [
+        "<!--",
+        "Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>",
+        "SPDX-License-Identifier: AGPL-3.0-or-later",
+        "-->",
+        "",
+        "# Manual Follow-Up & Field Verification Report",
+        "",
+        "> **Purpose**: Consolidated engineer action list across all crawl deliverables—unauthenticated targets, command/header parse mismatches, suspected unmanaged switches, PoE anomalies, and switch-to-switch trunk mismatches (with AP/Phone edges separated).",
+        "",
+    ]
+
+    # 1. Unauthenticated & Command/Header Mismatch Devices
+    unauth = (quality_report or {}).get("unauthenticated_devices")
+    mismatches = (quality_report or {}).get("command_header_mismatches")
+    if unauth is None:
+        unauth = [
+            {
+                "ip": ip,
+                "hostname": d.get("hostname") or ip,
+                "vendor": d.get("vendor") or "Unknown",
+                "mac_address": d.get("mac_address") or "",
+                "model": d.get("model") or "",
+            }
+            for ip, d in devices.items()
+            if str(d.get("status", "")).lower() == "unauthenticated"
+        ]
+    if mismatches is None:
+        mismatches = []
+        for ip, d in devices.items():
+            if str(d.get("status", "")).lower() != "success":
+                continue
+            hn = str(d.get("hostname") or ip).strip()
+            reasons = []
+            if not hn or hn == ip or hn.lower() == "unknown":
+                reasons.append("hostname unresolved (header/version parse mismatch)")
+            if not (d.get("interfaces_detail") or {}):
+                reasons.append("0 interfaces parsed (command/driver mismatch)")
+            if reasons:
+                mismatches.append(
+                    {
+                        "ip": ip,
+                        "hostname": hn or ip,
+                        "vendor": d.get("vendor") or "Unknown",
+                        "reasons": "; ".join(reasons),
+                    }
+                )
+
+    lines.extend(["## 1. Unauthenticated & Command/Header Mismatch Devices", ""])
+    if unauth:
+        lines.extend(
+            [
+                f"### Unauthenticated Targets ({len(unauth)})",
+                "| IP Address | Hostname | Vendor / OUI | MAC Address | Banner / Model |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for u in unauth:
+            lines.append(
+                f"| `{u['ip']}` | **{u['hostname']}** | {u['vendor']} | `{u['mac_address'] or 'N/A'}` | `{u['model'] or 'N/A'}` |"
+            )
+        lines.append("")
+    if mismatches:
+        lines.extend(
+            [
+                f"### Crawled Command / Header Mismatches ({len(mismatches)})",
+                "| IP Address | Hostname | Vendor | Mismatch Detail |",
+                "| :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for m in mismatches:
+            lines.append(f"| `{m['ip']}` | **{m['hostname']}** | {m['vendor']} | {m['reasons']} |")
+        lines.append("")
+    if not unauth and not mismatches:
+        lines.extend(["✓ No unauthenticated targets or command/header parse mismatches detected.", ""])
+
+    # 2. Suspected Unmanaged Switches, Multi-MAC Ports & Unverified Targets
+    lines.extend(_render_blueprint_manual_verification_section(devices, unique_devs))
+
+    # 3. Switch-to-Switch Critical/High Trunk Mismatches (excluding AP/Phone edges)
+    audit = _resolve_trunk_audit(trunk_audit if trunk_audit is not None else unique_devs)
+    rows = _normalize_trunk_csv_rows(audit)
+    sw_crit_high = []
+    ignored_ap_phone = 0
+    for r in rows:
+        role_str = _resolve_trunk_peer_oui_role(r["Side_A_Host"], r["Side_B_Host"], peer_lookup)
+        if "[AP]" in role_str or "[Phone]" in role_str:
+            ignored_ap_phone += 1
+            continue
+        if r["Severity"] in ("CRITICAL", "HIGH"):
+            sw_crit_high.append((r, role_str))
+
+    lines.extend(["## 2. Switch-to-Switch Critical/High Trunk Mismatches (APs/Phones Filtered Out)", ""])
+    lines.append(
+        f"> Filtered out **{ignored_ap_phone}** AP/Phone edge finding(s); showing **{len(sw_crit_high)}** switch-to-switch CRITICAL/HIGH trunk mismatch(es)."
+    )
+    lines.append("")
+    if sw_crit_high:
+        lines.extend(
+            [
+                "| Edge_ID | Side_A_Host | Side_A_Port | Side_B_Host | Side_B_Port | Peer_OUI_Role | Rule_ID | Severity | Remediation_Hint |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for r, role_str in sw_crit_high[:50]:
+            lines.append(
+                f"| `{r['Edge_ID']}` | **{r['Side_A_Host']}** | `{r['Side_A_Port']}` | **{r['Side_B_Host'] or 'N/A'}** | `{r['Side_B_Port'] or 'N/A'}` | {role_str} | `{r['Rule_ID']}` | **{r['Severity']}** | {r['Remediation_Hint']} |"
+            )
+        lines.append("")
+    else:
+        lines.extend(["✓ No switch-to-switch CRITICAL/HIGH trunk mismatches remaining.", ""])
+
+    # 4. PoE Budget Contradictions & High Utilization
+    lines.extend(["## 3. PoE Budget Contradictions & High Utilization (>80%)", ""])
+    poe_items = []
+    for ip, dev in unique_devs.items():
+        hn = dev.get("hostname") or ip
+        poe = dev.get("poe") or {}
+        tot_w = float(poe.get("total_power_watts") or 0.0)
+        used_w = float(poe.get("used_power_watts") or 0.0)
+        ints = dev.get("interfaces_detail") or {}
+        up_cnt = sum(1 for s in ints.values() if str((s or {}).get("status", "")).lower() == "up")
+        poe_ports = poe.get("ports") or {}
+        poe_vals = poe_ports.values() if isinstance(poe_ports, dict) else poe_ports
+        active_poe_ports = sum(1 for p in poe_vals if isinstance(p, dict) and float(p.get("power_watts") or 0.0) > 0)
+        if active_poe_ports > up_cnt and tot_w > 0:
+            poe_items.append(
+                f"- ❌ **{hn}**: PoE contradiction (`active_poe_ports={active_poe_ports}` > `up_ports={up_cnt}`, budget={tot_w:.1f}W) — verify missing physical ports or stack members."
+            )
+        elif tot_w > 0 and (used_w / tot_w) > 0.80:
+            poe_items.append(
+                f"- ⚠️ **{hn}**: High PoE utilization ({used_w:.1f}W / {tot_w:.1f}W, {used_w / tot_w * 100:.1f}%)."
+            )
+    if poe_items:
+        lines.extend(poe_items)
+    else:
+        lines.append("✓ No PoE contradictions or >80% PoE utilization warnings detected.")
+    lines.append("")
+
+    try:
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        print(f"[+] Manual follow-up report written to: {output_path}")
+    except Exception as e:
+        print(f"Error generating manual follow-up report: {e}")
+
+
+def generate_interactive_topology_html(
+    devices: dict,
+    output_path: str = "topology_interactive.html",
+    trunk_audit: dict | None = None,
+) -> str:
+    """Generate the self-contained interactive topology viewer via ``topology_renderer``."""
+    from net_docu_crawler.topology_renderer import build_topology_graph_model, get_topology_renderer
+
+    model = build_topology_graph_model(devices, trunk_audit=trunk_audit)
+    renderer = get_topology_renderer("interactive_html")
+    written = renderer.render(model, output_path)
+    print(f"[+] Interactive topology viewer written to: {written}")
+    return written

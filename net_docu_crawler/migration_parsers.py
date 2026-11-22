@@ -1140,9 +1140,67 @@ def extract_firewall_nat_vpn(raw_config: str, vendor: str = "") -> dict:
     return out
 
 
+def _strip_outer_quotes(val: str) -> str:
+    s = val.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1].strip()
+    return s
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+    """Return index of matching '}' for '{' at `open_idx`, or -1 if unbalanced."""
+    depth = 0
+    in_quote: str | None = None
+    escaped = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if escaped:
+            escaped = False
+            continue
+        if in_quote:
+            if ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _extract_junos_brace_vlans(raw_config: str) -> list[tuple[str, str]]:
+    """Extract (vlan_name, stanza_body) pairs from Junos brace-style `vlans { ... }` blocks."""
+    blocks: list[tuple[str, str]] = []
+    for m_top in re.finditer(r"(?m)^\s*vlans\s*\{", raw_config):
+        open_idx = m_top.end() - 1
+        close_idx = _find_matching_brace(raw_config, open_idx)
+        if close_idx == -1:
+            continue
+        body = raw_config[open_idx + 1 : close_idx]
+        pos = 0
+        while pos < len(body):
+            m_child = re.search(r"([^\s{};]+)\s*\{", body[pos:])
+            if not m_child:
+                break
+            vname = _strip_outer_quotes(m_child.group(1))
+            child_open = pos + m_child.end() - 1
+            child_close = _find_matching_brace(body, child_open)
+            if child_close == -1:
+                break
+            blocks.append((vname, body[child_open + 1 : child_close]))
+            pos = child_close + 1
+    return blocks
+
+
 def extract_vlans(raw_config: str, vendor: str = "") -> dict[str, dict]:
     """
-    Extract configured VLANs {vlan_id: {"id", "name", "svi_interface", "voice"}}
+    Extract configured VLANs {vlan_id: {"id", "name", "svi_interface", "voice", "description"}}
     from Cisco IOS/Arista, HP ProCurve, and Juniper Junos configurations.
     """
     vlans: dict[str, dict] = {}
@@ -1157,26 +1215,50 @@ def extract_vlans(raw_config: str, vendor: str = "") -> dict[str, dict]:
         m_name = re.search(r'^\s*name\s+"?([^"\r\n]+)"?', body, re.MULTILINE | re.IGNORECASE)
         vname = m_name.group(1).strip() if m_name else f"VLAN_{vid}"
         is_voice = bool(re.search(r"^\s*voice\b", body, re.MULTILINE | re.IGNORECASE))
-        vlans[vid] = {"id": vid, "name": vname, "svi_interface": "", "voice": is_voice}
+        vlans[vid] = {"id": vid, "name": vname, "svi_interface": "", "voice": is_voice, "description": ""}
 
-    # 2. Juniper Junos `set vlans <vname> vlan-id <id>` & `l3-interface irb.<unit>`
+    # 2. Juniper Junos `set vlans ...` and brace-style `vlans { ... }`
     junos_vnames: dict[str, dict] = {}
+
+    def _ensure_junos_vlan(vname: str) -> dict:
+        return junos_vnames.setdefault(
+            vname,
+            {"id": "", "name": vname, "svi_interface": "", "voice": False, "description": ""},
+        )
+
     for m_vid in re.finditer(r"set\s+vlans\s+(\S+)\s+vlan-id\s+(\d+)", raw_config):
-        vname, vid = m_vid.group(1), m_vid.group(2)
-        junos_vnames.setdefault(vname, {"id": vid, "name": vname, "svi_interface": "", "voice": False})
-        junos_vnames[vname]["id"] = vid
+        vname = _strip_outer_quotes(m_vid.group(1))
+        _ensure_junos_vlan(vname)["id"] = m_vid.group(2)
+
+    for m_desc in re.finditer(r"set\s+vlans\s+(\S+)\s+description\s+([^\r\n]+)", raw_config):
+        vname = _strip_outer_quotes(m_desc.group(1))
+        _ensure_junos_vlan(vname)["description"] = _strip_outer_quotes(m_desc.group(2))
+
     for m_l3 in re.finditer(r"set\s+vlans\s+(\S+)\s+l3-interface\s+(\S+)", raw_config):
-        vname, l3_if = m_l3.group(1), m_l3.group(2)
-        if vname in junos_vnames:
-            junos_vnames[vname]["svi_interface"] = l3_if
-        else:
-            m_irb = re.match(r"^irb\.(\d+)$", l3_if, re.IGNORECASE)
+        vname = _strip_outer_quotes(m_l3.group(1))
+        _ensure_junos_vlan(vname)["svi_interface"] = _strip_outer_quotes(m_l3.group(2))
+
+    for vname, stanza in _extract_junos_brace_vlans(raw_config):
+        entry = _ensure_junos_vlan(vname)
+        m_vid = re.search(r"\bvlan-id\s+(\d+)\s*;", stanza)
+        if m_vid:
+            entry["id"] = m_vid.group(1)
+        m_desc = re.search(r'\bdescription\s+((?:"[^"]*"|\'[^\']*\'|[^;\r\n]+))\s*;', stanza)
+        if m_desc:
+            entry["description"] = _strip_outer_quotes(m_desc.group(1))
+        m_l3 = re.search(r"\bl3-interface\s+(\S+?)\s*;", stanza)
+        if m_l3:
+            entry["svi_interface"] = _strip_outer_quotes(m_l3.group(1))
+
+    for vname, vinfo in junos_vnames.items():
+        vid = vinfo.get("id") or ""
+        if not vid:
             m_vn = re.match(r"^(?:vlan|vl)[_-]?(\d+)$", vname, re.IGNORECASE)
+            m_irb = re.match(r"^(?:irb|vlan)\.(\d+)$", vinfo.get("svi_interface", ""), re.IGNORECASE)
             vid = m_vn.group(1) if m_vn else (m_irb.group(1) if m_irb else "")
-            if vid:
-                junos_vnames[vname] = {"id": vid, "name": vname, "svi_interface": l3_if, "voice": False}
-    for vinfo in junos_vnames.values():
-        vlans[vinfo["id"]] = vinfo
+        if vid:
+            vinfo["id"] = vid
+            vlans[vid] = vinfo
 
     return vlans
 

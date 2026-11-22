@@ -62,6 +62,23 @@ class CiscoDriver(BaseDriver):
             arista_drv._prefetched_sh_ver = sh_ver
             return arista_drv.crawl(conn)
 
+        if "IOS-XR" in sh_ver or "IOS XR" in sh_ver or re.search(r"^(?:RP|LC)/\d+/\d+/CPU\d+:", prompt):
+            from net_docu_crawler.drivers.cisco_xr import CiscoXRDriver
+
+            logger.info("[%s] Detected Cisco IOS-XR during CiscoDriver probe; delegating to CiscoXRDriver.", self.ip)
+            xr_drv = CiscoXRDriver(
+                ip=self.ip,
+                username=self.username,
+                password=self.password,
+                secret=self.secret,
+                timeout=self.timeout,
+                session_log=self.session_log,
+                port=self.port,
+                transport=self.transport,
+            )
+            xr_drv._prefetched_sh_ver = sh_ver
+            return xr_drv.crawl(conn)
+
         self._prefetched_sh_ver = sh_ver
         return super().crawl(conn)
 

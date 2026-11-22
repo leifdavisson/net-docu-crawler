@@ -23,6 +23,10 @@ dev = [
     "ruff>=0.1.0",
     "pytest>=7.0.0",
 ]
+xr = [
+    "ncclient>=0.6.15",
+    "pygnmi>=0.8.12",
+]
 
 [project.scripts]
 net-crawler = "net_docu_crawler.crawler:main"
