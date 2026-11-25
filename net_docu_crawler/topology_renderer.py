@@ -38,7 +38,13 @@ from netaddr import AddrFormatError, IPAddress, IPNetwork
 
 import oui_lookup
 from net_docu_crawler.schema import infer_site_code
-from net_docu_crawler.topology_resolver import normalize_interface
+from net_docu_crawler.topology_resolver import (
+    infer_interface_speed,
+    is_generic_hostname,
+    is_placeholder_serial,
+    is_shared_or_virtual_mac,
+    normalize_interface,
+)
 
 _INFRA_DEVICE_TYPES = frozenset({"switch", "router", "firewall", "ap", "wlc", "wireless", "gateway", "bridge"})
 
@@ -177,22 +183,7 @@ def _norm_iface(name: str) -> str:
     """Return a canonical lowercase interface identifier for deduplication and lookups."""
     if not name:
         return ""
-    norm = normalize_interface(name).lower().strip()
-    replacements = (
-        ("hundredgigabitethernet", "hu"),
-        ("hundredgige", "hu"),
-        ("fortygigabitethernet", "fo"),
-        ("tengigabitethernet", "te"),
-        ("gigabitethernet", "gi"),
-        ("fastethernet", "fa"),
-        ("port-channel", "po"),
-        ("bundle-ether", "be"),
-        ("ethernet", "et"),
-    )
-    for full, short in replacements:
-        if norm.startswith(full):
-            return norm.replace(full, short, 1)
-    return norm
+    return normalize_interface(name).lower().strip()
 
 
 def _normalize_vrf_name(raw_vrf: str | None) -> str:
@@ -601,42 +592,8 @@ def _classify_vlan_bucket(vlan_id: str, vlan_name: str, vlan_desc: str, intf_nam
 
 
 def _parse_speed_mbps(speed_str: str, port_name: str = "") -> tuple[int, str]:
-    """Return ``(speed_mbps, speed_label)`` from telemetry or interface naming."""
-    s = (speed_str or "").lower().strip()
-    p = _norm_iface(port_name)
-    if s:
-        if "100g" in s or "100000" in s:
-            return 100000, "100G"
-        if "40g" in s or "40000" in s:
-            return 40000, "40G"
-        if "25g" in s or "25000" in s:
-            return 25000, "25G"
-        if "10g" in s or "10000" in s:
-            return 10000, "10G"
-        if "5g" in s or "5000" in s:
-            return 5000, "5G"
-        if "2.5g" in s or "2500" in s:
-            return 2500, "2.5G"
-        if "1000m" in s or "1g" in s or "1000" in s:
-            return 1000, "1G"
-        if "100m" in s or "100" in s:
-            return 100, "100M"
-        if "10m" in s or s == "10":
-            return 10, "10M"
-
-    if p.startswith(("hu", "et-")):
-        return 100000, "100G"
-    if p.startswith("fo"):
-        return 40000, "40G"
-    if p.startswith(("xe-", "te", "25ge")):
-        return 10000, "10G"
-    if p.startswith("mge"):
-        return 2500, "2.5G"
-    if p.startswith(("ge-", "gi")):
-        return 1000, "1G"
-    if p.startswith("fa"):
-        return 100, "100M"
-    return 1000, "1G"
+    """Return ``(speed_mbps, speed_label)`` from telemetry or canonical interface naming."""
+    return infer_interface_speed(speed_str, port_name)
 
 
 def _compute_display_badge(
@@ -1880,6 +1837,15 @@ def build_topology_graph_model(
     crawled_ips: set[str] = set()
     crawled_macs: set[str] = set()
 
+    # Count short hostnames across crawled infra to guard ambiguous generic defaults (e.g. dual MikroTik/OpenWrt)
+    short_host_counts: dict[str, int] = {}
+    for ip, dev in (devices or {}).items():
+        if not isinstance(dev, dict) or not _is_network_infra(dev):
+            continue
+        sh_lc = _short_hostname(str(dev.get("hostname") or ip).strip()).lower()
+        if sh_lc:
+            short_host_counts[sh_lc] = short_host_counts.get(sh_lc, 0) + 1
+
     # 1. Materialize crawled infrastructure nodes
     for ip, dev in (devices or {}).items():
         if not isinstance(dev, dict) or not _is_network_infra(dev):
@@ -1889,17 +1855,14 @@ def build_topology_graph_model(
         short_lc = short_host.lower()
         dev_ip_str = str(dev.get("ip") or ip).strip()
         serial_str = str(dev.get("serial") or "").strip()
-        is_generic_host = short_lc in ("", "unknown", "switch", "router", "localhost")
+        is_generic_host = is_generic_hostname(short_host)
+        is_ambiguous_host = short_lc in ("", "unknown") or (is_generic_host and short_host_counts.get(short_lc, 0) > 1)
         base_id = f"node:{short_lc or _slugify(dev_ip_str)}"
         if is_generic_host:
             node_id = f"node:{short_lc or 'host'}_{_slugify(dev_ip_str)}"
         elif base_id in nodes_by_id:
             existing = nodes_by_id[base_id]
-            same_serial = bool(
-                serial_str
-                and serial_str.lower() not in ("unknown", "n/a", "none", "0", "default string", "not specified")
-                and serial_str == existing.get("serial")
-            )
+            same_serial = bool(not is_placeholder_serial(serial_str) and serial_str == existing.get("serial"))
             if dev_ip_str in host_to_id or same_serial or existing.get("ip") == dev_ip_str:
                 continue
             node_id = f"node:{short_lc}_{_slugify(dev_ip_str)}"
@@ -1957,14 +1920,14 @@ def build_topology_graph_model(
                     break
 
         base_mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
-        if base_mac and base_mac != "00:00:00:00:00:00":
+        if base_mac and not is_shared_or_virtual_mac(base_mac):
             crawled_macs.add(base_mac)
         for istats in ints.values():
             imac = oui_lookup.normalize_mac(str((istats or {}).get("mac_address") or "")).lower().strip()
-            if imac and imac != "00:00:00:00:00:00":
+            if imac and not is_shared_or_virtual_mac(imac):
                 crawled_macs.add(imac)
 
-        if not is_generic_host:
+        if not is_ambiguous_host:
             crawled_hosts_lc.add(short_lc)
             crawled_hosts_lc.add(hostname.lower())
             host_to_id.setdefault(short_lc, node_id)

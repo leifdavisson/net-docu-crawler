@@ -33,8 +33,12 @@ import netaddr
 import oui_lookup
 
 _CLEAN_IF_RE = re.compile(
-    r"^(?:(?:ge|mge|xe|et|fe|ae)-?\d+(?:/\d+)*(?::\d+)?|ae\d+"
-    r"|(?:Gi|Te|Fa|Eth|Ethernet|Tw|Fo|Hu|GigabitEthernet|TenGigabitEthernet|FastEthernet|TwentyFiveGigE|FortyGigabitEthernet|HundredGigE)\d+(?:/\d+)*"
+    r"^(?:(?:ge|mge|xe|et|fe|ae|reth)-?\d+(?:/\d+)*(?::\d+)?|ae\d+|reth\d+"
+    r"|(?:Gi|Gig|Te|Ten|TenGigE|Fa|Fast|Eth|Et|Ethernet|Twe|Tw|Fi|Fo|FortyGigE|Hu|Hun"
+    r"|25GE|GigabitEthernet|TenGigabitEthernet|FastEthernet|TwentyFiveGigE|TwentyFiveGigabitEthernet"
+    r"|TwoPointFiveGigabitEthernet|TwoPointFiveGigE|FiveGigabitEthernet|FiveGigE"
+    r"|FortyGigabitEthernet|HundredGigE|HundredGigabitEthernet"
+    r"|Po|Port-channel|BE|Bundle-Ether|Management|Mgmt|port|lag)\s*\d+(?:/\d+)*"
     r"|swp\d+|sfp\S*|ether\d+|vtnet\d+|Trk\d+|[A-L]\d+|\d{1,2}|\d+/\d+(?:/\d+)?)$",
     re.IGNORECASE,
 )
@@ -185,8 +189,12 @@ PLACEHOLDER_SERIALS = {
 
 # Factory-default hostnames that must not collide across unconfigured devices
 GENERIC_DEFAULT_HOSTNAMES = {
+    "",
+    "unknown",
+    "default",
     "openwrt",
     "opnsense",
+    "pfsense",
     "mikrotik",
     "router",
     "switch",
@@ -194,8 +202,93 @@ GENERIC_DEFAULT_HOSTNAMES = {
     "frr",
     "frr-router",
     "fortigate",
+    "fortigate-vm64",
+    "fortigate-vm64-kvm",
     "firewall",
+    "vyos",
+    "amnesiac",
+    "edgeos",
+    "ubnt",
+    "arista",
+    "veos",
 }
+
+_FHRP_VIRTUAL_MAC_PREFIXES: tuple[str, ...] = (
+    "00:00:5e:00:01:",  # VRRPv2/v3 IPv4 (RFC 5798) & FreeBSD/OPNsense CARP
+    "00:00:5e:00:02:",  # VRRPv3 IPv6 (RFC 5798)
+    "00:00:0c:07:ac:",  # Cisco HSRPv1
+    "00:07:b4:00:",  # Cisco GLBP
+    "00:09:0f:09:",  # Fortinet FGCP HA virtual MAC
+    "e0:23:ff:fc:",  # Fortinet FGCP secondary virtual MAC block
+    "00:1b:17:00:",  # Palo Alto HA virtual MAC
+    "00:23:04:ee:be:",  # Cisco Nexus vPC system MAC
+)
+
+_HSRPV2_MAC_RE = re.compile(r"^00:00:0c:9f:f[0-9a-f]:[0-9a-f]{2}$")
+
+_CANONICAL_IF_SHORT_RULES: tuple[tuple[str, str], ...] = (
+    (r"^(?:twentyfivegigabitethernet|twentyfivegige|twe|25ge)\s*(?=\d)", "Twe"),
+    (r"^(?:twopointfivegigabitethernet|twopointfivegige|tw)\s*(?=\d)", "Tw"),
+    (r"^(?:hundredgigabitethernet|hundredgige|hun|hu)\s*(?=\d)", "Hu"),
+    (r"^(?:fortygigabitethernet|fortygige|fo)\s*(?=\d)", "Fo"),
+    (r"^(?:tengigabitethernet|tengige|ten|te)\s*(?=\d)", "Te"),
+    (r"^(?:fivegigabitethernet|fivegige|fi)\s*(?=\d)", "Fi"),
+    (r"^(?:gigabitethernet|gig|gi)\s*(?=\d)", "Gi"),
+    (r"^(?:fastethernet|fast|fa)\s*(?=\d)", "Fa"),
+    (r"^(?:port-channel|po)\s*(?=\d)", "Po"),
+    (r"^(?:bundle-ether|be)\s*(?=\d)", "BE"),
+    (r"^(?:ethernet|eth|et)\s*(?=\d)", "Eth"),
+)
+
+
+def is_placeholder_serial(serial: str) -> bool:
+    """Return True if `serial` is empty or a known non-unique virtual/SMBIOS placeholder."""
+    return str(serial or "").strip().lower() in PLACEHOLDER_SERIALS
+
+
+def is_generic_hostname(hostname: str) -> bool:
+    """Return True if `hostname` (short form) is empty or a factory-default generic name."""
+    short, _ = normalize_hostname(str(hostname or ""))
+    return short.lower() in GENERIC_DEFAULT_HOSTNAMES
+
+
+def is_multicast_or_zero_mac(mac: str) -> bool:
+    """Return True for empty, malformed, all-zero, broadcast, or IEEE multicast MACs."""
+    norm = oui_lookup.normalize_mac(str(mac or "")).lower().strip()
+    if len(norm) != 17 or norm in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        return True
+    try:
+        first_octet = int(norm.split(":", 1)[0], 16)
+    except ValueError:
+        return True
+    return bool(first_octet & 0x01)
+
+
+def is_fhrp_virtual_mac(mac: str) -> bool:
+    """Return True if `mac` belongs to a shared FHRP / HA virtual MAC range (VRRP/CARP/HSRP/GLBP/HA)."""
+    norm = oui_lookup.normalize_mac(str(mac or "")).lower().strip()
+    if len(norm) != 17:
+        return False
+    if norm.startswith(_FHRP_VIRTUAL_MAC_PREFIXES):
+        return True
+    return bool(_HSRPV2_MAC_RE.match(norm))
+
+
+def is_locally_administered_mac(mac: str) -> bool:
+    """Return True if `mac` is a unicast locally administered address (LAA, IEEE bit 1 set)."""
+    norm = oui_lookup.normalize_mac(str(mac or "")).lower().strip()
+    if len(norm) != 17:
+        return False
+    try:
+        first_octet = int(norm.split(":", 1)[0], 16)
+    except ValueError:
+        return False
+    return (first_octet & 0x03) == 0x02
+
+
+def is_shared_or_virtual_mac(mac: str) -> bool:
+    """Return True if `mac` must never be used as a unique physical chassis identity."""
+    return is_multicast_or_zero_mac(mac) or is_fhrp_virtual_mac(mac)
 
 
 def normalize_hostname(raw_hostname: str) -> tuple[str, str]:
@@ -226,25 +319,222 @@ def normalize_interface(intf: str) -> str:
       'GigabitEthernet1/0/1' -> 'Gi1/0/1'
       'TenGigabitEthernet1/0/48' -> 'Te1/0/48'
       'ge-0/0/1.0' -> 'ge-0/0/1'
-      'Ethernet1/1' -> 'Eth1/1'
+      'Ethernet1/1' / 'Eth1/1' / 'Et1/1' -> 'Eth1/1'
+      'Port-channel1' / 'Po1' -> 'Po1'
+      'Bundle-Ether10' / 'BE10' -> 'BE10'
+      'eth0' (Linux/appliance NIC) -> 'eth0'
     """
     if not intf:
         return ""
     name = intf.strip().strip('"').strip("'")
+    if not name:
+        return ""
 
-    # Cisco / Arista interface abbreviations
-    name = re.sub(r"^GigabitEthernet", "Gi", name, flags=re.IGNORECASE)
-    name = re.sub(r"^TenGigabitEthernet", "Te", name, flags=re.IGNORECASE)
-    name = re.sub(r"^FastEthernet", "Fa", name, flags=re.IGNORECASE)
-    name = re.sub(r"^Ethernet(?=\d)", "Eth", name, flags=re.IGNORECASE)
-    name = re.sub(r"^TwentyFiveGigE", "25GE", name, flags=re.IGNORECASE)
-    name = re.sub(r"^FortyGigabitEthernet", "Fo", name, flags=re.IGNORECASE)
-    name = re.sub(r"^HundredGigE", "Hu", name, flags=re.IGNORECASE)
-
-    # Junos sub-interface strip e.g. ge-0/0/1.0 -> ge-0/0/1
+    # Strip trailing Junos/router unit .0 suffix (preserve non-zero VLAN subinterfaces e.g. .10)
     name = re.sub(r"\.0$", "", name)
 
+    # Preserve Junos interface prefixes before Ethernet short-form rules (protects et-0/0/0 100G)
+    m_junos = re.match(r"^(ge-|mge-|xe-|et-|fe-|ae(?=\d)|reth(?=\d))(.*)$", name, flags=re.IGNORECASE)
+    if m_junos:
+        return f"{m_junos.group(1).lower()}{m_junos.group(2)}"
+
+    # Preserve exact lowercase Linux/appliance ethN[.V] NICs without rewriting to Cisco/Arista EthN
+    if re.fullmatch(r"eth\d+(?:\.\d+)?", name):
+        return name
+
+    for pattern, short_prefix in _CANONICAL_IF_SHORT_RULES:
+        if re.match(pattern, name, flags=re.IGNORECASE):
+            return re.sub(pattern, short_prefix, name, count=1, flags=re.IGNORECASE)
+
     return name
+
+
+def normalize_interface_key(intf: str) -> str:
+    """Return a canonical lowercase lookup key for interface matching across modules."""
+    return normalize_interface(intf).lower().strip()
+
+
+def infer_interface_speed(speed_str: str = "", port_name: str = "") -> tuple[int, str]:
+    """
+    Return `(speed_mbps, speed_label)` from operational speed telemetry or vendor port naming.
+    Uses strict prefix matching on canonicalized port names so `et-0/0/0` (100G), `Twe` (25G),
+    `Tw` (2.5G), `vtnet0`, and `ether1` never collide with legacy 10M/2.5G/5G rules.
+    """
+    s = (speed_str or "").lower().strip()
+    if s:
+        if "400g" in s or "400000" in s:
+            return 400000, "400G"
+        if "100g" in s or "100000" in s:
+            return 100000, "100G"
+        if "40g" in s or "40000" in s:
+            return 40000, "40G"
+        if "25g" in s or "25000" in s:
+            return 25000, "25G"
+        if "10g" in s or "10000" in s:
+            return 10000, "10G"
+        if "5g" in s or "5000" in s:
+            return 5000, "5G"
+        if "2.5g" in s or "2500" in s:
+            return 2500, "2.5G"
+        if "1000m" in s or "1g" in s or "1000" in s:
+            return 1000, "1G"
+        if "100m" in s or "100" in s:
+            return 100, "100M"
+        if "10m" in s or s == "10":
+            return 10, "10M"
+
+    p = normalize_interface_key(port_name)
+    if p.startswith(("hu", "et-")):
+        return 100000, "100G"
+    if p.startswith("fo"):
+        return 40000, "40G"
+    if p.startswith(("twe", "25ge")):
+        return 25000, "25G"
+    if p.startswith(("xe-", "te")):
+        return 10000, "10G"
+    if p.startswith("fi"):
+        return 5000, "5G"
+    if p.startswith(("mge", "tw")):
+        return 2500, "2.5G"
+    if p.startswith(("ge-", "gi")):
+        return 1000, "1G"
+    if p.startswith("fa"):
+        return 100, "100M"
+    return 1000, "1G"
+
+
+def _extract_device_fhrp_vips(device_data: dict) -> set[str]:
+    """Return all FHRP (HSRP/VRRP/CARP/GLBP) virtual IP addresses configured on `device_data`."""
+    vips: set[str] = set()
+    for entry in device_data.get("fhrp") or []:
+        if not isinstance(entry, dict):
+            continue
+        vip = str(entry.get("vip") or entry.get("virtual_ip") or "").split("/", 1)[0].strip()
+        if vip:
+            vips.add(vip)
+    return vips
+
+
+def _extract_owned_ips(device_data: dict, exclude_fhrp_vips: bool = True) -> set[str]:
+    """Return non-loopback, non-fabric IPv4/IPv6 addresses owned by `device_data`."""
+    fhrp_vips = _extract_device_fhrp_vips(device_data) if exclude_fhrp_vips else set()
+    ips: set[str] = set()
+    primary_ip = str(device_data.get("ip") or "").strip()
+    if primary_ip and not primary_ip.startswith(("127.", "128.0.")) and primary_ip != "::1":
+        ips.add(primary_ip)
+    for intf in device_data.get("l3_interfaces") or []:
+        if not isinstance(intf, dict):
+            continue
+        ip_raw = str(intf.get("ip_address") or "")
+        ip_clean = ip_raw.split("/")[0].split()[0].split("%")[0].strip()
+        if (
+            ip_clean
+            and ip_clean not in ("N/A", "unassigned", "0.0.0.0", "::")
+            and not ip_clean.startswith(("127.", "128.0."))
+            and ip_clean != "::1"
+            and ip_clean not in fhrp_vips
+        ):
+            ips.add(ip_clean)
+    return ips
+
+
+def _extract_hw_macs(device_data: dict) -> set[str]:
+    """Return normalized non-virtual, non-hypervisor, non-LAA hardware MAC addresses on `device_data`."""
+    from net_docu_crawler.drivers.detector import is_hypervisor_mac
+
+    macs: set[str] = set()
+    raw_candidates = [device_data.get("mac_address", "")]
+    for stats in (device_data.get("interfaces_detail") or {}).values():
+        if isinstance(stats, dict):
+            raw_candidates.append(stats.get("mac_address", ""))
+    for raw_m in raw_candidates:
+        m = oui_lookup.normalize_mac(str(raw_m or "")).lower().strip()
+        if m and not is_shared_or_virtual_mac(m) and not is_hypervisor_mac(m) and not is_locally_administered_mac(m):
+            macs.add(m)
+    return macs
+
+
+def dedupe_devices(devices: dict[str, dict]) -> dict[str, dict]:
+    """
+    Canonical multi-SVI chassis deduplicator shared across registry and reporting.
+
+    Preserves distinct cloned VMs, hypervisor guests, FHRP HA pairs, and factory-default
+    appliances by rejecting placeholder serials, FHRP/virtual MACs, and generic hostnames,
+    and only falling back to hostname matching when neither peer has a valid hardware serial.
+    """
+    if not devices:
+        return {}
+
+    def _ip_sort_key(ip: str) -> list[int]:
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+            return [int(x) for x in ip.split(".")]
+        return [0]
+
+    sorted_ips = sorted(
+        devices.keys(),
+        key=lambda ip: (
+            devices[ip].get("status") == "success",
+            str(devices[ip].get("mgmt_method", "")).startswith("SSH"),
+            _ip_sort_key(ip),
+        ),
+        reverse=True,
+    )
+
+    unique_devices: dict[str, dict] = {}
+    seen_serials: dict[str, str] = {}
+    seen_owned_ips: dict[str, str] = {}
+    seen_hw_macs: dict[str, str] = {}
+    seen_hostnames: dict[str, tuple[str, bool, set[str]]] = {}
+
+    for ip in sorted_ips:
+        dev = devices[ip]
+        if not isinstance(dev, dict):
+            continue
+        serial = str(dev.get("serial") or "").strip()
+        has_valid_serial = not is_placeholder_serial(serial)
+        serial_key = serial.upper() if has_valid_serial else ""
+        short_host, _ = normalize_hostname(str(dev.get("hostname") or ""))
+        has_unique_host = not is_generic_hostname(short_host)
+        host_key = short_host.lower() if has_unique_host else ""
+        owned_ips = _extract_owned_ips(dev, exclude_fhrp_vips=True)
+        owned_ips.add(ip)
+        hw_macs = _extract_hw_macs(dev)
+
+        is_dup = False
+        if has_valid_serial and serial_key in seen_serials:
+            is_dup = True
+        elif any(oip in seen_owned_ips for oip in owned_ips):
+            matched_ip = next(seen_owned_ips[oip] for oip in owned_ips if oip in seen_owned_ips)
+            existing_ser = str(unique_devices[matched_ip].get("serial") or "").strip()
+            if not (
+                has_valid_serial and not is_placeholder_serial(existing_ser) and existing_ser.upper() != serial_key
+            ):
+                is_dup = True
+        elif any(m in seen_hw_macs for m in hw_macs):
+            matched_ip = next(seen_hw_macs[m] for m in hw_macs if m in seen_hw_macs)
+            existing_ser = str(unique_devices[matched_ip].get("serial") or "").strip()
+            if not (
+                has_valid_serial and not is_placeholder_serial(existing_ser) and existing_ser.upper() != serial_key
+            ):
+                is_dup = True
+        elif not has_valid_serial and has_unique_host and host_key in seen_hostnames:
+            _prev_ip, prev_has_serial, prev_hw_macs = seen_hostnames[host_key]
+            # Fallback hostname dedupe only when neither device has a verified serial or distinct hardware MACs
+            if not prev_has_serial and not (hw_macs and prev_hw_macs and hw_macs.isdisjoint(prev_hw_macs)):
+                is_dup = True
+
+        if not is_dup:
+            unique_devices[ip] = dev
+            if has_valid_serial:
+                seen_serials[serial_key] = ip
+            for oip in owned_ips:
+                seen_owned_ips.setdefault(oip, ip)
+            for m in hw_macs:
+                seen_hw_macs.setdefault(m, ip)
+            if has_unique_host:
+                seen_hostnames.setdefault(host_key, (ip, has_valid_serial, hw_macs))
+
+    return {ip: unique_devices[ip] for ip in sorted(unique_devices.keys(), key=_ip_sort_key)}
 
 
 def is_crawlable_network_device(capabilities: list[str], device_type: str = "", vendor_or_model: str = "") -> bool:
@@ -288,7 +578,7 @@ class DeviceRegistry:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Canonical device records keyed by primary device_id (serial or base_mac or short_name or ip)
         self.devices: dict[str, dict] = {}
         # Mapping: alias_ip -> canonical_device_id
@@ -323,77 +613,127 @@ class DeviceRegistry:
         with self._lock:
             self.in_progress_ips.discard(ip)
 
+    def _find_existing_svi_device_id(
+        self,
+        owned_ips: set[str],
+        hw_macs: set[str],
+        serial: str,
+        has_valid_serial: bool,
+    ) -> str:
+        """Return an existing canonical device_id when `owned_ips` or `hw_macs` match a previously registered chassis."""
+        for candidate_id in [self.ip_to_device_id[ip] for ip in owned_ips if ip in self.ip_to_device_id] + [
+            self.mac_to_device_id[m] for m in hw_macs if m in self.mac_to_device_id
+        ]:
+            existing = self.devices.get(candidate_id)
+            if not existing:
+                continue
+            existing_serial = str(existing.get("serial") or "").strip()
+            existing_has_serial = not is_placeholder_serial(existing_serial)
+            if has_valid_serial and existing_has_serial and existing_serial.upper() != serial.upper():
+                continue
+            return candidate_id
+        return ""
+
     def register_device(self, device_data: dict) -> str:
         """
         Registers a crawled device, linking all its SVIs, MACs, and hostnames to a single canonical entity.
-        Rejects placeholder virtual serials and factory-default hostnames so cloned VMs/containers never collide.
+        Rejects placeholder virtual serials, shared FHRP virtual MACs, and factory-default hostnames so
+        cloned VMs/containers and HA pairs never collide, while merging multi-SVI crawls of the same chassis.
         Returns the canonical device_id.
         """
+        from net_docu_crawler.drivers.detector import is_hypervisor_mac
+
         with self._lock:
             short_host, fqdn = normalize_hostname(device_data.get("hostname", ""))
-            serial = device_data.get("serial", "").strip()
-            base_mac = oui_lookup.normalize_mac(device_data.get("mac_address", "")).lower().strip()
-            primary_ip = device_data.get("ip", "")
+            serial = str(device_data.get("serial") or "").strip()
+            base_mac = oui_lookup.normalize_mac(str(device_data.get("mac_address") or "")).lower().strip()
+            primary_ip = str(device_data.get("ip") or "").strip()
 
-            has_valid_serial = bool(serial) and serial.lower() not in PLACEHOLDER_SERIALS
-            has_unique_host = bool(short_host) and short_host.lower() not in GENERIC_DEFAULT_HOSTNAMES
+            has_valid_serial = not is_placeholder_serial(serial)
+            has_unique_host = not is_generic_hostname(short_host)
+            owned_ips = _extract_owned_ips(device_data, exclude_fhrp_vips=True)
+            hw_macs = _extract_hw_macs(device_data)
+            usable_base_mac = bool(base_mac) and not is_shared_or_virtual_mac(base_mac)
 
-            # Determine primary unique key: Verified Serial > Base MAC > Unique Hostname > IP
+            # Determine primary unique key: Verified Serial > Multi-SVI Existing Match > Usable Base MAC > Unique Hostname > IP
+            device_id = ""
             if has_valid_serial:
                 device_id = f"SER_{serial}"
-            elif base_mac and base_mac != "00:00:00:00:00:00":
-                device_id = f"MAC_{base_mac.replace(':', '').replace('.', '')}"
-            elif has_unique_host:
-                cand_id = f"HOST_{short_host}"
-                existing = self.devices.get(cand_id)
-                if existing and existing.get("ip") != primary_ip:
-                    device_id = f"HOST_{short_host}_{primary_ip}"
-                else:
-                    device_id = cand_id
             else:
-                device_id = f"IP_{primary_ip}"
+                device_id = self._find_existing_svi_device_id(owned_ips, hw_macs, serial, has_valid_serial)
 
-            # Store FQDN mapping
-            if short_host and fqdn:
+            if not device_id:
+                if usable_base_mac:
+                    mac_hex = base_mac.replace(":", "").replace(".", "")
+                    cand_id = f"MAC_{mac_hex}"
+                    existing = self.devices.get(cand_id)
+                    if existing and (is_hypervisor_mac(base_mac) or is_locally_administered_mac(base_mac)):
+                        existing_ips = _extract_owned_ips(existing, exclude_fhrp_vips=True)
+                        if owned_ips and existing_ips and owned_ips.isdisjoint(existing_ips):
+                            device_id = f"MAC_{mac_hex}_{primary_ip}" if primary_ip else f"IP_{primary_ip}"
+                        else:
+                            device_id = cand_id
+                    else:
+                        device_id = cand_id
+                elif has_unique_host:
+                    cand_id = f"HOST_{short_host}"
+                    existing = self.devices.get(cand_id)
+                    if existing and existing.get("ip") != primary_ip:
+                        existing_ips = _extract_owned_ips(existing, exclude_fhrp_vips=True)
+                        if owned_ips and existing_ips and not owned_ips.isdisjoint(existing_ips):
+                            device_id = cand_id
+                        else:
+                            device_id = f"HOST_{short_host}_{primary_ip}"
+                    else:
+                        device_id = cand_id
+                else:
+                    device_id = f"IP_{primary_ip}"
+
+            # Store FQDN mapping (only for non-generic hostnames)
+            if has_unique_host and fqdn:
                 self.fqdn_table[short_host] = fqdn
 
-            # Register all L3 interfaces (SVIs, Loopbacks, Routed Ports) to this device_id
-            if primary_ip:
-                self.ip_to_device_id[primary_ip] = device_id
-            for intf in device_data.get("l3_interfaces", []):
-                ip_raw = intf.get("ip_address", "")
-                ip_clean = ip_raw.split("/")[0].split()[0].strip()
-                if (
-                    ip_clean
-                    and ip_clean not in ("N/A", "unassigned", "0.0.0.0")
-                    and not ip_clean.startswith(("127.", "128.0."))
-                ):
-                    self.ip_to_device_id[ip_clean] = device_id
+            # Register all owned L3 interfaces (excluding FHRP VIPs, loopbacks, internal fabric) to this device_id
+            for ip_clean in owned_ips:
+                self.ip_to_device_id[ip_clean] = device_id
 
-            # Register base MAC and any per-interface MACs
-            if base_mac:
-                self.mac_to_device_id[base_mac] = device_id
-            for stats in device_data.get("interfaces_detail", {}).values():
-                imac = oui_lookup.normalize_mac(stats.get("mac_address", "")).lower().strip()
-                if imac and imac != "00:00:00:00:00:00":
-                    self.mac_to_device_id[imac] = device_id
+            # Register non-virtual base MAC and per-interface MACs (never index FHRP/multicast MACs,
+            # and never clobber a different device's shared hypervisor/LAA MAC)
+            candidate_macs = [base_mac] if usable_base_mac else []
+            for stats in (device_data.get("interfaces_detail") or {}).values():
+                if not isinstance(stats, dict):
+                    continue
+                imac = oui_lookup.normalize_mac(str(stats.get("mac_address") or "")).lower().strip()
+                if imac and not is_shared_or_virtual_mac(imac):
+                    candidate_macs.append(imac)
+            for m in candidate_macs:
+                if (is_hypervisor_mac(m) or is_locally_administered_mac(m)) and m in self.mac_to_device_id:
+                    if self.mac_to_device_id[m] != device_id:
+                        continue
+                self.mac_to_device_id[m] = device_id
 
             # Ingest device ARP entries into global ARP table
             for arp in device_data.get("arp_table", []):
                 a_ip = arp.get("ip", "")
                 a_mac = oui_lookup.normalize_mac(arp.get("mac", "")).lower().strip()
-                if a_ip and a_mac:
+                if a_ip and a_mac and not is_multicast_or_zero_mac(a_mac):
                     self.global_arp[a_ip] = {
                         "mac": a_mac,
                         "vendor": arp.get("vendor") or oui_lookup.lookup_oui(a_mac),
                         "discovered_on": primary_ip,
                     }
 
-            # Store or update the canonical record
+            # Store or update the canonical record (do not let a non-success stub overwrite a crawled success record)
             device_data["canonical_id"] = device_id
             device_data["canonical_hostname"] = short_host
             device_data["fqdn"] = fqdn
-            self.devices[device_id] = device_data
+            existing_rec = self.devices.get(device_id)
+            if not (
+                existing_rec
+                and existing_rec.get("status", "success") == "success"
+                and device_data.get("status", "success") != "success"
+            ):
+                self.devices[device_id] = device_data
             self.in_progress_ips.discard(primary_ip)
 
             return device_id
@@ -550,33 +890,39 @@ class DeviceRegistry:
         """
         Resolve a potentially truncated or FQDN neighbor name (e.g. 'NMS_MDF_CORE_BL')
         to a registered device's canonical hostname ('NMS_MDF_CORE_BLDG_B').
+        Thread-safe via re-entrant `self._lock`.
         """
-        short, _ = normalize_hostname(raw_name)
-        if remote_ip and remote_ip in self.ip_to_device_id:
-            dev = self.devices.get(self.ip_to_device_id[remote_ip])
-            if dev and dev.get("hostname"):
-                return dev["hostname"]
-        if remote_mac:
-            m_clean = oui_lookup.normalize_mac(remote_mac).lower().strip()
-            if m_clean in self.mac_to_device_id:
-                dev = self.devices.get(self.mac_to_device_id[m_clean])
+        with self._lock:
+            short, _ = normalize_hostname(raw_name)
+            if remote_ip and remote_ip in self.ip_to_device_id:
+                dev = self.devices.get(self.ip_to_device_id[remote_ip])
                 if dev and dev.get("hostname"):
                     return dev["hostname"]
-        if short:
-            low = short.lower()
-            for dev in self.devices.values():
-                ch = (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
-                if ch and ch.lower() == low:
-                    return ch
-            if len(low) >= 12:
-                prefix_matches = [
-                    (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
-                    for dev in self.devices.values()
-                    if (dev.get("canonical_hostname") or dev.get("hostname") or "").strip().lower().startswith(low)
-                ]
-                if len(prefix_matches) == 1:
-                    return prefix_matches[0]
-        return short or raw_name
+            if remote_mac:
+                m_clean = oui_lookup.normalize_mac(remote_mac).lower().strip()
+                if m_clean and not is_shared_or_virtual_mac(m_clean) and m_clean in self.mac_to_device_id:
+                    dev = self.devices.get(self.mac_to_device_id[m_clean])
+                    if dev and dev.get("hostname"):
+                        return dev["hostname"]
+            if short:
+                low = short.lower()
+                if not is_generic_hostname(short):
+                    for dev in self.devices.values():
+                        ch = (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
+                        if ch and ch.lower() == low:
+                            return ch
+                    if len(low) >= 12:
+                        prefix_matches = [
+                            (dev.get("canonical_hostname") or dev.get("hostname") or "").strip()
+                            for dev in self.devices.values()
+                            if (dev.get("canonical_hostname") or dev.get("hostname") or "")
+                            .strip()
+                            .lower()
+                            .startswith(low)
+                        ]
+                        if len(prefix_matches) == 1:
+                            return prefix_matches[0]
+            return short or raw_name
 
     @staticmethod
     def _needs_remote_port_resolution(r_port: str, r_host: str) -> bool:
@@ -760,11 +1106,11 @@ class DeviceRegistry:
             mac_set = dev_macs.setdefault(d_key, set())
             for intf_name, intf_info in (dev.get("interfaces_detail") or {}).items():
                 imac = oui_lookup.normalize_mac((intf_info or {}).get("mac_address", "") or "").lower()
-                if imac and imac != "00:00:00:00:00:00":
+                if imac and not is_shared_or_virtual_mac(imac):
                     mac_to_dev.setdefault(imac, (dev, intf_name))
                     mac_set.add(imac)
             base_mac = oui_lookup.normalize_mac(dev.get("mac_address", "") or "").lower()
-            if base_mac and base_mac != "00:00:00:00:00:00":
+            if base_mac and not is_shared_or_virtual_mac(base_mac):
                 mac_to_dev.setdefault(base_mac, (dev, ""))
                 mac_set.add(base_mac)
 
