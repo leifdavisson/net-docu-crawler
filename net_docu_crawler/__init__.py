@@ -19,13 +19,16 @@ Consolidates zero-blast-radius discovery across Cisco, Juniper, Aruba, Palo Alto
 Arista, MikroTik, Fortinet, FRRouting, OPNsense, and OpenWrt platforms.
 """
 
-__version__ = "2.0.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "BaseDriver",
     "CiscoDriver",
+    "CiscoSMBDriver",
+    "CiscoXRDriver",
     "JuniperDriver",
     "ArubaDriver",
+    "HPProCurveDriver",
     "PaloAltoDriver",
     "FortinetDriver",
     "AristaDriver",

@@ -26,7 +26,7 @@ from net_docu_crawler.dependency_checker import ensure_dependencies
 
 if __name__ == "__main__":
     auto_install = "--install-deps" in sys.argv
-    if "--install-deps" in sys.argv:
+    while "--install-deps" in sys.argv:
         sys.argv.remove("--install-deps")
 
     if not ensure_dependencies(auto_install=auto_install, prompt=True):

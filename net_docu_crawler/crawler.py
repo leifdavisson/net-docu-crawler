@@ -315,6 +315,7 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
         errors.append(f"{source}: top-level JSON must be a list of credential objects, got {type(entries).__name__}.")
         return valid_entries, warnings, errors
 
+    known_keys = {"name", "vendor", "username", "password", "secret", "enable_secret"}
     seen: dict[tuple[str, str, str, str], str] = {}
     for idx, item in enumerate(entries):
         label = f"{source}[{idx}]"
@@ -326,10 +327,17 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
         if not isinstance(name, str) or not name.strip():
             name = label
 
+        for extra_k in item:
+            if extra_k not in known_keys:
+                warnings.append(
+                    f"{name}: unrecognized key '{extra_k}' (expected name, vendor, username, password, secret)."
+                )
+
         username = item.get("username")
         if not isinstance(username, str) or not username.strip():
             errors.append(f"{name}: missing or empty 'username' string.")
             continue
+        username_clean = username.strip()
 
         password = item.get("password", "")
         if not isinstance(password, str):
@@ -342,6 +350,20 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
         if not isinstance(secret, str):
             errors.append(f"{name}: 'secret' must be a string, got {type(secret).__name__}.")
             continue
+
+        has_legacy_enable_secret = "enable_secret" in item
+        legacy_secret = item.get("enable_secret", "")
+        if legacy_secret is None:
+            legacy_secret = ""
+        if not isinstance(legacy_secret, str):
+            errors.append(f"{name}: 'enable_secret' must be a string, got {type(legacy_secret).__name__}.")
+            continue
+        if has_legacy_enable_secret:
+            warnings.append(f"{name}: 'enable_secret' is deprecated; use canonical 'secret' instead.")
+        if secret and legacy_secret and secret != legacy_secret:
+            errors.append(f"{name}: conflicting 'secret' and 'enable_secret' values; use 'secret' only.")
+            continue
+        effective_secret = secret or legacy_secret
 
         vendor = item.get("vendor", "")
         if vendor is None:
@@ -357,19 +379,20 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
             )
         vendor_norm = vendor_canon or vendor_raw
 
-        dedup_key = (vendor_norm, username, password, secret)
+        dedup_key = (vendor_norm, username_clean, password, effective_secret)
         if dedup_key in seen:
             warnings.append(
-                f"{name}: duplicate of '{seen[dedup_key]}' (vendor={vendor_norm or 'any'}, username={username!r}) — skipping."
+                f"{name}: duplicate of '{seen[dedup_key]}' (vendor={vendor_norm or 'any'}, username={username_clean!r}) — skipping."
             )
             continue
         seen[dedup_key] = name
 
         normalized = dict(item)
-        normalized["username"] = username
+        normalized.pop("enable_secret", None)
+        normalized["username"] = username_clean
         normalized["password"] = password
-        if "secret" in item or secret:
-            normalized["secret"] = secret
+        if "secret" in item or has_legacy_enable_secret or effective_secret:
+            normalized["secret"] = effective_secret
         if vendor_norm:
             normalized["vendor"] = vendor_norm
         valid_entries.append(normalized)
@@ -851,6 +874,47 @@ def _classify_connect_error(exc: Exception) -> str:
     return "driver_failed"
 
 
+def _build_driver_instance(
+    driver_cls: type,
+    ip: str,
+    user: str,
+    pwd: str,
+    secret: str,
+    timeout: int,
+    session_log: str,
+    port: int,
+    transport: str,
+    *,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
+):
+    """Instantiate `driver_cls`, forwarding NETCONF/gNMI options when supported (e.g. CiscoXRDriver)."""
+    kwargs: dict[str, object] = {
+        "ip": ip,
+        "username": user,
+        "password": pwd,
+        "secret": secret,
+        "timeout": timeout,
+        "session_log": session_log,
+        "port": port,
+        "transport": transport,
+    }
+    if getattr(driver_cls, "__name__", "") == "CiscoXRDriver":
+        kwargs.update(
+            {
+                "use_netconf": netconf,
+                "netconf_port": netconf_port,
+                "use_gnmi": gnmi,
+                "gnmi_port": gnmi_port,
+                "gnmi_insecure": gnmi_insecure,
+            }
+        )
+    return driver_cls(**kwargs)
+
+
 def _connect_and_crawl_once(
     driver_cls: type,
     ip: str,
@@ -860,6 +924,11 @@ def _connect_and_crawl_once(
     timeout: int,
     session_log: str,
     log_file: str,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> tuple[dict | None, str]:
     """Execute a single driver connection and crawl attempt; returns `(data, outcome)`."""
     user = cred.get("username", "")
@@ -867,15 +936,21 @@ def _connect_and_crawl_once(
     secret = cred.get("secret", "")
     _log_event(log_file, f"Connecting to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})...")
     try:
-        driver = driver_cls(
-            ip=ip,
-            username=user,
-            password=pwd,
-            secret=secret,
-            timeout=timeout,
-            session_log=session_log,
-            port=port,
-            transport=transport,
+        driver = _build_driver_instance(
+            driver_cls,
+            ip,
+            user,
+            pwd,
+            secret,
+            timeout,
+            session_log,
+            port,
+            transport,
+            netconf=netconf,
+            netconf_port=netconf_port,
+            gnmi=gnmi,
+            gnmi_port=gnmi_port,
+            gnmi_insecure=gnmi_insecure,
         )
         conn = driver.connect()
     except Exception as e:
@@ -917,15 +992,21 @@ def _connect_and_crawl_once(
                         f"Tier 3 prompt inspection ({raw_prompt.strip()!r} -> {prompt_os}) switched driver "
                         f"{driver_cls.__name__} -> {target_cls.__name__} on {ip}:{port}",
                     )
-                    driver = target_cls(
-                        ip=ip,
-                        username=user,
-                        password=pwd,
-                        secret=secret,
-                        timeout=timeout,
-                        session_log=session_log,
-                        port=port,
-                        transport=transport,
+                    driver = _build_driver_instance(
+                        target_cls,
+                        ip,
+                        user,
+                        pwd,
+                        secret,
+                        timeout,
+                        session_log,
+                        port,
+                        transport,
+                        netconf=netconf,
+                        netconf_port=netconf_port,
+                        gnmi=gnmi,
+                        gnmi_port=gnmi_port,
+                        gnmi_insecure=gnmi_insecure,
                     )
                     paging_cmd = getattr(driver, "paging_cmd", "")
                     if paging_cmd and hasattr(conn, "send_command"):
@@ -935,6 +1016,14 @@ def _connect_and_crawl_once(
                             logger.debug("[%s] Tier 3 paging disable '%s' failed: %s", ip, paging_cmd, pg_exc)
 
         data = driver.crawl(conn)
+        if netconf and callable(getattr(driver, "fetch_netconf_operational", None)):
+            nc_xml = driver.fetch_netconf_operational()
+            if nc_xml:
+                data["netconf_operational"] = nc_xml
+        if gnmi and callable(getattr(driver, "fetch_gnmi_operational", None)):
+            gnmi_data = driver.fetch_gnmi_operational()
+            if gnmi_data:
+                data["gnmi_operational"] = gnmi_data
     except Exception as crawl_exc:
         safe_err = _scrub_log_message(str(crawl_exc), secrets=(pwd, secret))
         _log_event(
@@ -967,6 +1056,11 @@ def _try_driver_credentials(
     log_file: str,
     attempted_users: set[str] | None = None,
     stop_host: list[bool] | None = None,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> tuple[dict | None, bool]:
     """Attempt authentication and crawl across candidate driver classes and credentials.
 
@@ -996,8 +1090,25 @@ def _try_driver_credentials(
             user_key = user.strip().lower()
             if not user_key or user_key in user_ledger:
                 continue
+            telemetry_kwargs = {}
+            if netconf or gnmi or netconf_port != 830 or gnmi_port != 57400 or gnmi_insecure:
+                telemetry_kwargs = {
+                    "netconf": netconf,
+                    "netconf_port": netconf_port,
+                    "gnmi": gnmi,
+                    "gnmi_port": gnmi_port,
+                    "gnmi_insecure": gnmi_insecure,
+                }
             data, outcome = _connect_and_crawl_once(
-                driver_cls, ip, port, transport, cred, timeout, session_log, log_file
+                driver_cls,
+                ip,
+                port,
+                transport,
+                cred,
+                timeout,
+                session_log,
+                log_file,
+                **telemetry_kwargs,
             )
             if outcome == "success":
                 return data, saw_auth_failure
@@ -1088,6 +1199,11 @@ def crawl_target_with_ports(
     http_fingerprint: bool = True,
     vendor_hint: str = "",
     try_all_creds: bool = False,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> dict | None:
     """Probe a target across its discovered open `(port, transport)` pairs and return normalized `device_data`."""
     ports_to_try = sorted(
@@ -1140,6 +1256,11 @@ def crawl_target_with_ports(
             log_file,
             attempted_users=attempted_users,
             stop_host=stop_host,
+            netconf=netconf,
+            netconf_port=netconf_port,
+            gnmi=gnmi,
+            gnmi_port=gnmi_port,
+            gnmi_insecure=gnmi_insecure,
         )
         if port_auth_fail:
             saw_auth_failure = True
@@ -1459,6 +1580,11 @@ class CrawlOptions:
     save_baseline: str = ""
     compare_baseline: str = ""
     retry_failed: str = ""
+    netconf: bool = False
+    netconf_port: int = 830
+    gnmi: bool = False
+    gnmi_port: int = 57400
+    gnmi_insecure: bool = False
 
 
 # Alias for callers referencing either CrawlOptions or CrawlConfig
@@ -1494,6 +1620,11 @@ _CRAWL_OPTION_DEFAULTS: dict[str, object] = {
     "save_baseline": "",
     "compare_baseline": "",
     "retry_failed": "",
+    "netconf": False,
+    "netconf_port": 830,
+    "gnmi": False,
+    "gnmi_port": 57400,
+    "gnmi_insecure": False,
 }
 
 
@@ -1574,11 +1705,7 @@ def _load_retry_failed_targets(retry_failed: str) -> tuple[list[str], list[dict]
 def _resolve_run_output_dir(cfg: CrawlOptions, targets: list[str]) -> tuple[str, bool, str, str]:
     """Determine `(run_output_dir, is_organized, logs_dir, crawler_log)` and ensure directories exist."""
     if cfg.organize:
-        base = (
-            cfg.output_dir
-            if (cfg.output_dir and cfg.output_dir not in ("auto", "docs/net_docu_crawler"))
-            else "deliverables"
-        )
+        base = cfg.output_dir if (cfg.output_dir and cfg.output_dir != "auto") else "deliverables"
         run_output_dir = compute_organized_output_dir(targets, base_dir=base, site=cfg.site, domain=cfg.domain)
         is_organized = True
     elif not cfg.output_dir or cfg.output_dir == "auto":
@@ -1661,6 +1788,11 @@ def _crawl_target_batch(
                     http_fingerprint=cfg.http_fingerprint,
                     vendor_hint=cfg.vendor_hint,
                     try_all_creds=cfg.try_all_creds,
+                    netconf=cfg.netconf,
+                    netconf_port=cfg.netconf_port,
+                    gnmi=cfg.gnmi,
+                    gnmi_port=cfg.gnmi_port,
+                    gnmi_insecure=cfg.gnmi_insecure,
                 ): ip
                 for ip in targets_to_crawl
             }
@@ -1988,6 +2120,11 @@ def crawl_network(
     save_baseline: str = "",
     compare_baseline: str = "",
     retry_failed: str = "",
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
     config: CrawlOptions | None = None,
 ) -> list[dict]:
     """
@@ -2024,6 +2161,11 @@ def crawl_network(
         "save_baseline": save_baseline,
         "compare_baseline": compare_baseline,
         "retry_failed": retry_failed,
+        "netconf": netconf,
+        "netconf_port": netconf_port,
+        "gnmi": gnmi,
+        "gnmi_port": gnmi_port,
+        "gnmi_insecure": gnmi_insecure,
     }
     cfg = _resolve_crawl_options(targets=targets, config=config, overrides=overrides)
     return _execute_crawl(cfg)
@@ -3060,15 +3202,16 @@ def _add_core_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default="docs/net_docu_crawler",
-        help="Flat output directory when --no-organize is used, or custom base directory when organized (default base: deliverables/)",
+        default="",
+        help="Flat output directory when --no-organize is used (default: docs/net_docu_crawler), or custom base directory when organized (default: deliverables/)",
     )
-    parser.add_argument(
+    organize_group = parser.add_mutually_exclusive_group()
+    organize_group.add_argument(
         "--organize",
         action="store_true",
         help="(Default) Store deliverables in a structured folder: deliverables/<Subnet>_<TimeStamp>_<site>/",
     )
-    parser.add_argument(
+    organize_group.add_argument(
         "--no-organize",
         action="store_true",
         help="Write flat output directly to --output-dir without creating a <Subnet>_<TimeStamp>_<site> subfolder",
@@ -3185,12 +3328,12 @@ def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-vendor",
         default="",
-        help="Generate staged target-vendor migration CLI configs (cisco, juniper, arista, hpprocurve)",
+        help="Generate staged target-vendor migration CLI configs (cisco, juniper, arista, aruba, hpprocurve, meraki, or persona=vendor pairs such as switch=juniper,ap=aruba)",
     )
     parser.add_argument(
         "--vendor-hint",
         default="",
-        help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., fortinet, ciscosmb, cisco)",
+        help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., cisco, cisco_xr, ciscosmb, juniper, arista, hpprocurve, aruba, fortinet, paloalto, mikrotik, opnsense, openwrt, frrouting)",
     )
     parser.add_argument(
         "--try-all-creds",
@@ -3257,6 +3400,11 @@ def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip TLS verification for gNMI connections (lab/self-signed certs only)",
     )
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="Auto-install missing required Python dependencies on pre-flight startup (when invoked via net_crawler.py)",
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -3269,6 +3417,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _build_arg_parser().parse_args()
+
+    if args.install_deps:
+        from net_docu_crawler.dependency_checker import ensure_dependencies
+
+        if not ensure_dependencies(auto_install=True, prompt=False):
+            sys.exit(1)
 
     if args.validate_credentials:
         creds, warnings, errors = load_and_validate_credentials(args.credentials)
@@ -3340,6 +3494,11 @@ def main():
             save_baseline=args.save_baseline,
             compare_baseline=args.compare_baseline,
             retry_failed=args.retry_failed,
+            netconf=args.netconf,
+            netconf_port=args.netconf_port,
+            gnmi=args.gnmi,
+            gnmi_port=args.gnmi_port,
+            gnmi_insecure=args.gnmi_insecure,
         )
         crawl_network(config=options)
     except ValueError:
