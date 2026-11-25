@@ -23,11 +23,98 @@ extraction, and unified per-port / PoE / L3 SVI record builders.
 import datetime
 import re
 
-SCHEMA_VERSION = "2.0"
+SCHEMA_VERSION = "2.1"
 
 TRI_STATE_VALUES = ("enabled", "disabled", "unknown")
 INFRA_PERSONAS = frozenset({"switch", "router", "firewall", "ap", "wlc", "wireless", "gateway", "bridge"})
 APPLIANCE_TYPES = frozenset({"av_control", "camera", "display", "printer", "ups", "nas", "iot", "server"})
+
+COLLECTION_STATES = (
+    "ok",
+    "not_applicable",
+    "not_collected",
+    "command_failed",
+    "parse_failed",
+    "partial",
+)
+COLLECTION_SECTIONS = (
+    "version",
+    "interfaces",
+    "neighbors",
+    "routes",
+    "arp",
+    "mac_table",
+    "stp",
+    "poe",
+    "optics",
+    "running_config",
+    "vlans",
+    "port_profiles",
+    "vrfs",
+    "routing_peers",
+    "fhrp",
+    "dhcp",
+    "services",
+    "security_policy",
+    "l2_operational",
+    "discovery_protocols",
+)
+CRITICAL_COLLECTION_SECTIONS = frozenset({"interfaces", "running_config"})
+CLI_ERROR_MARKERS = (
+    "% invalid input",
+    "% incomplete command",
+    "% ambiguous command",
+    "% unknown command",
+    "privileged mode required",
+    "syntax error",
+    "command not found",
+    "unknown command",
+    "invalid command",
+    "authorization failed",
+    "permission denied",
+)
+
+_SNIPPET_REDACT_PATTERNS = (
+    (re.compile(r"(?i)\b(secret|password|passwd|key|pre-shared-key|community)\s+(?:\d+\s+)?\S+"), r"\1 <REDACTED>"),
+    (re.compile(r"\$[1569a-zA-Z]+\$[^\s'\"]+"), "<REDACTED_HASH>"),
+)
+
+
+def normalize_collection_status(val: object) -> str:
+    """Normalize a collection_status state to a canonical COLLECTION_STATES value."""
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low in COLLECTION_STATES:
+            return low
+    return "not_collected"
+
+
+def _sanitize_error_snippet(raw: object, max_len: int = 200) -> str:
+    """Collapse whitespace, redact secret-like tokens, and bound raw_snippet length."""
+    text = re.sub(r"[\r\n\t]+", " ", str(raw or "")).strip()
+    for pat, repl in _SNIPPET_REDACT_PATTERNS:
+        text = pat.sub(repl, text)
+    if len(text) > max_len:
+        text = text[: max_len - 3].rstrip() + "..."
+    return text
+
+
+def build_parse_error(
+    section: str,
+    command: str = "",
+    stage: str = "parse",
+    error: str = "",
+    raw_snippet: str = "",
+) -> dict:
+    """Build a sanitized structured parse/command error record for device_data['parse_errors']."""
+    clean_stage = stage if stage in ("command", "parse") else "parse"
+    return {
+        "section": str(section or "unknown").strip(),
+        "command": str(command or "").strip()[:160],
+        "stage": clean_stage,
+        "error": _sanitize_error_snippet(error, max_len=200),
+        "raw_snippet": _sanitize_error_snippet(raw_snippet, max_len=200),
+    }
 
 
 def normalize_tri_state(val: object) -> str:
@@ -169,4 +256,11 @@ def stamp_schema_v2(device_data: dict, capture_time: str = "") -> dict:
     device_data.setdefault("evidence_sources", {})
     device_data.setdefault("vlans", {})
     device_data.setdefault("ports", {})
+    raw_cs = device_data.get("collection_status")
+    if isinstance(raw_cs, dict):
+        device_data["collection_status"] = {str(k): normalize_collection_status(v) for k, v in raw_cs.items()}
+    else:
+        device_data["collection_status"] = {}
+    if not isinstance(device_data.get("parse_errors"), list):
+        device_data["parse_errors"] = []
     return device_data

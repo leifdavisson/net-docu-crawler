@@ -139,6 +139,7 @@ def extract_port_profiles(
                 "is_subinterface_bundle": False,
                 "lag_group": "",
                 "lacp_mode": "",
+                "stp_edge": False,
                 "bpdu_guard": False,
                 "dot1x_mab": False,
                 "poe_watts": 0.0,
@@ -155,9 +156,21 @@ def extract_port_profiles(
     )
     if is_cisco_like and "interface " in raw_config:
         global_tag_native = bool(re.search(r"(?m)^vlan\s+dot1q\s+tag\s+native\b", raw_config, re.IGNORECASE))
+        global_portfast = bool(
+            re.search(r"(?m)^spanning-tree\s+portfast\s+(?:edge\s+)?default\b", raw_config, re.IGNORECASE)
+        )
+        global_bpduguard = bool(
+            re.search(
+                r"(?m)^spanning-tree\s+portfast\s+(?:edge\s+)?bpduguard\s+default\b",
+                raw_config,
+                re.IGNORECASE,
+            )
+        )
         cisco_subifs: dict[str, dict] = {}
         parent_has_ip: set[str] = set()
         explicit_no_native_tag: set[str] = set()
+        explicit_no_portfast: set[str] = set()
+        explicit_no_bpduguard: set[str] = set()
         cisco_touched: set[str] = set()
 
         blocks = re.split(r"(?m)^interface\s+", raw_config)
@@ -253,21 +266,40 @@ def extract_port_profiles(
                 prof["lag_group"] = f"Po{m_lag.group(1)}"
                 prof["lacp_mode"] = m_lag.group(2).lower()
 
-            if re.search(r"spanning-tree\s+bpduguard\s+enable", body, re.IGNORECASE):
+            if re.search(
+                r"^\s*(?:no\s+spanning-tree\s+portfast\b|spanning-tree\s+portfast\s+disable\b)",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                prof["stp_edge"] = False
+                explicit_no_portfast.add(port)
+            elif re.search(r"^\s*spanning-tree\s+portfast\b", body, re.MULTILINE | re.IGNORECASE):
+                prof["stp_edge"] = True
+
+            if re.search(
+                r"^\s*(?:no\s+spanning-tree\s+bpduguard\b|spanning-tree\s+bpduguard\s+disable\b)",
+                body,
+                re.MULTILINE | re.IGNORECASE,
+            ):
+                prof["bpdu_guard"] = False
+                explicit_no_bpduguard.add(port)
+            elif re.search(r"spanning-tree\s+bpduguard\s+enable", body, re.IGNORECASE):
                 prof["bpdu_guard"] = True
             if re.search(r"authentication\s+port-control|dot1x\s+pae|mab\b", body, re.IGNORECASE):
                 prof["dot1x_mab"] = True
 
-        # Apply global `vlan dot1q tag native` to Cisco/NX-OS/Arista trunk ports
-        if global_tag_native:
-            for port in cisco_touched:
-                if port in explicit_no_native_tag:
-                    continue
-                prof = profiles[port]
+        # Apply global `vlan dot1q tag native` & global PortFast / BPDU Guard defaults
+        for port in cisco_touched:
+            prof = profiles[port]
+            if global_tag_native and port not in explicit_no_native_tag:
                 if not prof["qinq_tunnel"] and (
                     prof["mode"] == "trunk" or prof["admin_mode"] in ("trunk", "dynamic_auto", "dynamic_desirable")
                 ):
                     prof["native_vlan_tagged"] = True
+            if global_portfast and port not in explicit_no_portfast and prof["mode"] == "access":
+                prof["stp_edge"] = True
+            if global_bpduguard and port not in explicit_no_bpduguard and prof.get("stp_edge") is True:
+                prof["bpdu_guard"] = True
 
         # Synthesize L3 dot1Q subinterfaces onto their parent physical/LAG port
         for parent_port, sub_info in cisco_subifs.items():
@@ -632,6 +664,41 @@ def extract_port_profiles(
             p_bp = m_bpdu.group(1).split(".")[0]
             for target_p in irange_members.get(p_bp, [p_bp]):
                 _ensure_port(target_p)["bpdu_guard"] = True
+
+        # Junos brace-style `protocols { rstp/stp/mstp { interface <port> { edge; } bpdu-block-on-edge; } }`
+        for m_proto in re.finditer(r"(?m)^\s*protocols\s*\{", raw_config):
+            p_open = m_proto.end() - 1
+            p_close = _find_matching_brace(raw_config, p_open)
+            if p_close == -1:
+                continue
+            proto_body = raw_config[p_open + 1 : p_close]
+            for m_stp in re.finditer(r"\b(?:rstp|stp|mstp|vstp)\s*\{", proto_body):
+                s_open = m_stp.end() - 1
+                s_close = _find_matching_brace(proto_body, s_open)
+                if s_close == -1:
+                    continue
+                stp_body = proto_body[s_open + 1 : s_close]
+                global_j_bpdu = bool(re.search(r"\bbpdu-block-on-edge\s*;", stp_body))
+                edge_ports_in_block: list[str] = []
+                for m_jif in re.finditer(r"\binterface\s+([^\s{};]+)\s*\{", stp_body):
+                    j_open = m_jif.end() - 1
+                    j_close = _find_matching_brace(stp_body, j_open)
+                    if j_close == -1:
+                        continue
+                    j_body = stp_body[j_open + 1 : j_close]
+                    p_raw = m_jif.group(1).split(".")[0]
+                    if p_raw == "all":
+                        continue
+                    if re.search(r"\bedge\s*;", j_body):
+                        for target_p in irange_members.get(p_raw, [p_raw]):
+                            _ensure_port(target_p)["stp_edge"] = True
+                            edge_ports_in_block.append(target_p)
+                    if re.search(r"\bbpdu-block-on-edge\s*;", j_body):
+                        for target_p in irange_members.get(p_raw, [p_raw]):
+                            _ensure_port(target_p)["bpdu_guard"] = True
+                if global_j_bpdu:
+                    for target_p in edge_ports_in_block:
+                        _ensure_port(target_p)["bpdu_guard"] = True
         for m_storm in re.finditer(
             r"set\s+interfaces\s+(\S+)\s+unit\s+0\s+family\s+ethernet-switching\s+storm-control\b", junos_cfg
         ):
@@ -744,16 +811,24 @@ def extract_routing_peers_and_fhrp_from_config(
             if s.startswith("router ") and not s.startswith("router ospf"):
                 current_ospf_pid = ""
 
-    # HSRP & VRRP on Cisco / Arista interfaces
+    # HSRP, VRRP, GLBP, NX-OS HSRP, and Arista VARP on Cisco / Arista / ProCurve interfaces
     for blk in re.split(r"(?m)^interface\s+", raw_config)[1:]:
         lines = blk.splitlines()
         if not lines:
             continue
         intf = lines[0].strip()
-        body = "\n".join(lines[1:])
+        body_lines = []
+        for ln in lines[1:]:
+            s = ln.strip()
+            if s == "!" or re.match(r"^(?:router|vlan|ip\s+route|vrf|line)\b", s, re.IGNORECASE):
+                break
+            body_lines.append(ln)
+        body = "\n".join(body_lines)
+
         for m_hsrp in re.finditer(r"^\s*standby\s+(\d+)\s+ip\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
             grp, vip = m_hsrp.groups()
             m_pri = re.search(rf"^\s*standby\s+{grp}\s+priority\s+(\d+)", body, re.MULTILINE)
+            has_preempt = bool(re.search(rf"^\s*standby\s+{grp}\s+preempt\b", body, re.MULTILINE))
             fhrp.append(
                 {
                     "protocol": "hsrp",
@@ -761,12 +836,42 @@ def extract_routing_peers_and_fhrp_from_config(
                     "interface": intf,
                     "vip": vip,
                     "priority": int(m_pri.group(1)) if m_pri else 100,
+                    "preempt": has_preempt,
                     "state": "Configured",
                 }
             )
-        for m_vrrp in re.finditer(r"^\s*vrrp\s+(\d+)\s+ip\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
+        # Cisco NX-OS sub-block: `hsrp <grp>\n  ip <vip>\n  priority <n>\n  preempt`
+        for m_nx in re.finditer(r"(?m)^[ \t]+hsrp\s+(\d+)\s*$", body):
+            grp = m_nx.group(1)
+            sub_tail = body[m_nx.end() :]
+            sub_lines = []
+            for sln in sub_tail.splitlines():
+                if not sln.strip():
+                    continue
+                if re.match(r"^[ \t]{2,}\S", sln):
+                    sub_lines.append(sln)
+                else:
+                    break
+            sub_body = "\n".join(sub_lines)
+            m_vip = re.search(r"^\s*ip\s+(\d+\.\d+\.\d+\.\d+)", sub_body, re.MULTILINE)
+            if m_vip:
+                m_pri = re.search(r"^\s*priority\s+(\d+)", sub_body, re.MULTILINE)
+                has_preempt = bool(re.search(r"^\s*preempt\b", sub_body, re.MULTILINE))
+                fhrp.append(
+                    {
+                        "protocol": "hsrp",
+                        "group": grp,
+                        "interface": intf,
+                        "vip": m_vip.group(1),
+                        "priority": int(m_pri.group(1)) if m_pri else 100,
+                        "preempt": has_preempt,
+                        "state": "Configured",
+                    }
+                )
+        for m_vrrp in re.finditer(r"^\s*vrrp\s+(\d+)\s+(?:ip|ipv4)\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
             grp, vip = m_vrrp.groups()
             m_pri = re.search(rf"^\s*vrrp\s+{grp}\s+priority\s+(\d+)", body, re.MULTILINE)
+            has_preempt = bool(re.search(rf"^\s*vrrp\s+{grp}\s+preempt\b", body, re.MULTILINE))
             fhrp.append(
                 {
                     "protocol": "vrrp",
@@ -774,15 +879,125 @@ def extract_routing_peers_and_fhrp_from_config(
                     "interface": intf,
                     "vip": vip,
                     "priority": int(m_pri.group(1)) if m_pri else 100,
+                    "preempt": has_preempt,
                     "state": "Configured",
                 }
             )
+        for m_glbp in re.finditer(r"^\s*glbp\s+(\d+)\s+ip\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
+            grp, vip = m_glbp.groups()
+            m_pri = re.search(rf"^\s*glbp\s+{grp}\s+priority\s+(\d+)", body, re.MULTILINE)
+            has_preempt = bool(re.search(rf"^\s*glbp\s+{grp}\s+preempt\b", body, re.MULTILINE))
+            fhrp.append(
+                {
+                    "protocol": "glbp",
+                    "group": grp,
+                    "interface": intf,
+                    "vip": vip,
+                    "priority": int(m_pri.group(1)) if m_pri else 100,
+                    "preempt": has_preempt,
+                    "state": "Configured",
+                }
+            )
+        for m_varp in re.finditer(
+            r"^\s*ip\s+virtual-router\s+address\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)", body, re.MULTILINE
+        ):
+            fhrp.append(
+                {
+                    "protocol": "varp",
+                    "group": "varp",
+                    "interface": intf,
+                    "vip": m_varp.group(1).split("/")[0],
+                    "priority": 100,
+                    "preempt": True,
+                    "state": "Active-Active",
+                }
+            )
+
+    # Juniper Junos set-style VRRP groups
+    junos_vrrp: dict[tuple[str, str], dict] = {}
+    for m_jv in re.finditer(
+        r"set\s+interfaces\s+(\S+)\s+unit\s+(\d+)\s+family\s+inet\s+address\s+\S+\s+vrrp-group\s+(\d+)\s+(.+)$",
+        raw_config,
+        re.MULTILINE,
+    ):
+        j_if, j_unit, j_grp, tail = m_jv.groups()
+        key = (f"{j_if}.{j_unit}", j_grp)
+        rec = junos_vrrp.setdefault(
+            key,
+            {
+                "protocol": "vrrp",
+                "group": j_grp,
+                "interface": f"{j_if}.{j_unit}",
+                "vip": "",
+                "priority": 100,
+                "preempt": False,
+                "state": "Configured",
+            },
+        )
+        m_va = re.search(r"\bvirtual-address\s+(\d+\.\d+\.\d+\.\d+)", tail)
+        if m_va:
+            rec["vip"] = m_va.group(1)
+        m_pr = re.search(r"\bpriority\s+(\d+)", tail)
+        if m_pr:
+            rec["priority"] = int(m_pr.group(1))
+        if re.search(r"\bpreempt\b", tail) and "no-preempt" not in tail:
+            rec["preempt"] = True
+    for rec in junos_vrrp.values():
+        if rec["vip"]:
+            fhrp.append(rec)
+
+    # MikroTik `/interface vrrp`
+    if "/interface vrrp" in raw_config:
+        m_mt = re.search(r"(?ms)^/interface\s+vrrp\s*\n(.*?)(?:\n/|\Z)", raw_config)
+        if m_mt:
+            for ln in m_mt.group(1).splitlines():
+                s = ln.strip()
+                if not s.startswith("add "):
+                    continue
+                m_vrid = re.search(r"\bvrid=(\d+)", s)
+                m_if = re.search(r"\binterface=([^\s]+)", s)
+                m_pri = re.search(r"\bpriority=(\d+)", s)
+                m_pre = re.search(r"\bpreemption-mode=(yes|no)", s)
+                if m_vrid:
+                    fhrp.append(
+                        {
+                            "protocol": "vrrp",
+                            "group": m_vrid.group(1),
+                            "interface": _strip_outer_quotes(m_if.group(1)) if m_if else "",
+                            "vip": "See L3 Interface",
+                            "priority": int(m_pri.group(1)) if m_pri else 100,
+                            "preempt": (m_pre.group(1) == "yes") if m_pre else True,
+                            "state": "Configured",
+                        }
+                    )
+
+    # FortiOS `config system ha` (Active-Passive / Active-Active cluster)
+    if "config system ha" in raw_config:
+        m_ha = re.search(r"(?ms)^config system ha\s*\n(.*?)\nend\b", raw_config)
+        if m_ha:
+            ha_body = m_ha.group(1)
+            m_mode = re.search(r"set\s+mode\s+(a-p|a-a)", ha_body)
+            if m_mode:
+                m_gid = re.search(r"set\s+group-id\s+(\d+)", ha_body)
+                m_pri = re.search(r"set\s+priority\s+(\d+)", ha_body)
+                has_ovr = bool(re.search(r"set\s+override\s+enable", ha_body))
+                fhrp.append(
+                    {
+                        "protocol": "fgcp-ha",
+                        "group": m_gid.group(1) if m_gid else "0",
+                        "interface": "HA-Cluster",
+                        "vip": "Cluster-Synced",
+                        "priority": int(m_pri.group(1)) if m_pri else 128,
+                        "preempt": has_ovr,
+                        "state": "Active-Passive" if m_mode.group(1) == "a-p" else "Active-Active",
+                    }
+                )
 
     # OPNsense CARP VIPs in config.xml
-    if "<virtualip>" in raw_config:
+    if "<virtualip>" in raw_config or "<VirtualIP>" in raw_config:
         try:
             root = ET.fromstring(raw_config)
-            for vip_el in root.findall(".//virtualip/vip"):
+            for vip_el in root.findall(".//virtualip/vip") + root.findall(".//VirtualIP/vip"):
                 mode = (vip_el.findtext("mode") or "").lower()
                 if mode in ("carp", "ipalias"):
                     fhrp.append(
@@ -792,6 +1007,7 @@ def extract_routing_peers_and_fhrp_from_config(
                             "interface": vip_el.findtext("interface") or "",
                             "vip": vip_el.findtext("subnet") or "",
                             "priority": int(vip_el.findtext("advskew") or 0),
+                            "preempt": mode == "carp",
                             "state": "Configured",
                         }
                     )
@@ -855,7 +1071,11 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                 break
             body_lines.append(ln)
         body = "\n".join(body_lines)
-        for m_hlp in re.finditer(r"^\s*ip\s+helper-address\s+(\d+\.\d+\.\d+\.\d+)", body, re.MULTILINE):
+        for m_hlp in re.finditer(
+            r"^\s*(?:ip\s+helper-address\s+(?:vrf\s+\S+\s+|global\s+)?|ip\s+dhcp\s+relay\s+address\s+)(\d+\.\d+\.\d+\.\d+)",
+            body,
+            re.MULTILINE | re.IGNORECASE,
+        ):
             result["relays"].append({"interface": intf, "helper_ip": m_hlp.group(1)})
 
     # HP ProCurve / ArubaOS-S VLAN-scoped ip helper-address
@@ -871,23 +1091,69 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                     seen_h.add(hip)
                     result["relays"].append({"interface": f"VLAN {vid}", "helper_ip": hip})
 
-    # Juniper Junos forwarding-options dhcp-relay
+    # Juniper Junos forwarding-options dhcp-relay (both set-style and brace-style)
     if "dhcp-relay" in raw_config or "helpers bootp" in raw_config:
         sg_ips: dict[str, list[str]] = {}
         grp_sg: dict[str, str] = {}
         grp_intfs: dict[str, list[str]] = {}
         for m_sg in re.finditer(
-            r"set\s+forwarding-options\s+dhcp-relay\s+server-group\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)", raw_config
+            r"set\s+(?:routing-instances\s+\S+\s+)?forwarding-options\s+dhcp-relay\s+server-group\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)",
+            raw_config,
         ):
             sg_ips.setdefault(m_sg.group(1), []).append(m_sg.group(2))
         for m_asg in re.finditer(
-            r"set\s+forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+active-server-group\s+(\S+)", raw_config
+            r"set\s+(?:routing-instances\s+\S+\s+)?forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+active-server-group\s+(\S+)",
+            raw_config,
         ):
             grp_sg[m_asg.group(1)] = m_asg.group(2)
         for m_gi in re.finditer(
-            r"set\s+forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+interface\s+(\S+)", raw_config
+            r"set\s+(?:routing-instances\s+\S+\s+)?forwarding-options\s+dhcp-relay\s+group\s+(\S+)\s+interface\s+(\S+)",
+            raw_config,
         ):
             grp_intfs.setdefault(m_gi.group(1), []).append(m_gi.group(2))
+
+        # Brace-style `dhcp-relay { server-group { SG { 10.0.0.1; } } group G { active-server-group { SG; } interface irb.10; } }`
+        for m_dr in re.finditer(r"\bdhcp-relay\s*\{", raw_config):
+            dr_open = m_dr.end() - 1
+            dr_close = _find_matching_brace(raw_config, dr_open)
+            if dr_close == -1:
+                continue
+            dr_body = raw_config[dr_open + 1 : dr_close]
+            for m_sgb in re.finditer(r"\bserver-group\s*\{", dr_body):
+                sg_open = m_sgb.end() - 1
+                sg_close = _find_matching_brace(dr_body, sg_open)
+                if sg_close == -1:
+                    continue
+                sg_section = dr_body[sg_open + 1 : sg_close]
+                pos = 0
+                while pos < len(sg_section):
+                    m_named = re.search(r"([^\s{};]+)\s*\{", sg_section[pos:])
+                    if not m_named:
+                        break
+                    sg_name = _strip_outer_quotes(m_named.group(1))
+                    n_open = pos + m_named.end() - 1
+                    n_close = _find_matching_brace(sg_section, n_open)
+                    if n_close == -1:
+                        break
+                    for ip_m in re.finditer(r"\b(\d+\.\d+\.\d+\.\d+)\b", sg_section[n_open + 1 : n_close]):
+                        if ip_m.group(1) not in sg_ips.setdefault(sg_name, []):
+                            sg_ips[sg_name].append(ip_m.group(1))
+                    pos = n_close + 1
+            for m_grp in re.finditer(r"\bgroup\s+([^\s{};]+)\s*\{", dr_body):
+                g_name = _strip_outer_quotes(m_grp.group(1))
+                g_open = m_grp.end() - 1
+                g_close = _find_matching_brace(dr_body, g_open)
+                if g_close == -1:
+                    continue
+                g_body = dr_body[g_open + 1 : g_close]
+                m_asg_b = re.search(r"\bactive-server-group\s*(?:\{\s*([^\s{};]+)\s*;\s*\}|([^\s{};]+)\s*;)", g_body)
+                if m_asg_b:
+                    grp_sg[g_name] = _strip_outer_quotes(m_asg_b.group(1) or m_asg_b.group(2))
+                for m_gif in re.finditer(r"\binterface\s+([^\s{};]+)\s*;", g_body):
+                    gif = _strip_outer_quotes(m_gif.group(1))
+                    if gif not in grp_intfs.setdefault(g_name, []):
+                        grp_intfs[g_name].append(gif)
+
         for grp, intfs in grp_intfs.items():
             sg = grp_sg.get(grp, "")
             ips = sg_ips.get(sg, [])
@@ -900,8 +1166,8 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
         ):
             result["relays"].append({"interface": m_bootp.group(2), "helper_ip": m_bootp.group(1)})
 
-    # 2. OPNsense config.xml <dhcpd>
-    if "<dhcpd>" in raw_config:
+    # 2. OPNsense config.xml <dhcpd>, legacy <dhcrelay>, and MVC <DHCRelay>
+    if "<dhcpd>" in raw_config or "<dhcrelay>" in raw_config or "<DHCRelay>" in raw_config:
         try:
             root = ET.fromstring(raw_config)
             dhcpd = root.find("dhcpd")
@@ -929,6 +1195,27 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                                 "pool": iface_name,
                             }
                         )
+            dhcrelay = root.find("dhcrelay")
+            if dhcrelay is not None and (dhcrelay.findtext("enable") or "1").strip() not in ("0", "false"):
+                r_intfs = [i.strip() for i in (dhcrelay.findtext("interface") or "").split(",") if i.strip()]
+                r_srvs = [s.strip() for s in (dhcrelay.findtext("server") or "").split(",") if s.strip()]
+                for r_if in r_intfs or ["global"]:
+                    for r_ip in r_srvs:
+                        result["relays"].append({"interface": r_if, "helper_ip": r_ip})
+            for mvc_rel in root.findall(".//DHCRelay/relays/relay"):
+                if (mvc_rel.findtext("enabled") or "1").strip() in ("0", "false"):
+                    continue
+                r_if = (mvc_rel.findtext("interface") or "global").strip()
+                dest_uuid = (mvc_rel.findtext("destination") or "").strip()
+                dest_srvs = []
+                if dest_uuid:
+                    for dest_el in root.findall(".//DHCRelay/destinations/destination"):
+                        if dest_el.attrib.get("uuid") == dest_uuid:
+                            dest_srvs.extend(
+                                s.strip() for s in (dest_el.findtext("server") or "").split(",") if s.strip()
+                            )
+                for r_ip in dest_srvs:
+                    result["relays"].append({"interface": r_if, "helper_ip": r_ip})
         except ET.ParseError:
             pass
 
@@ -1067,6 +1354,34 @@ def extract_dhcp_config(raw_config: str, vendor: str = "") -> dict:
                     elif line.startswith("set description "):
                         cur_res["hostname"] = line.split("set description", 1)[1].strip().strip('"')
 
+    # 5. FortiOS interface-scoped DHCP relays (`set dhcp-relay-ip "ip1" "ip2"`)
+    if "dhcp-relay-ip" in raw_config and "config system interface" in raw_config:
+        m_if_sec = re.search(r"(?ms)^config system interface\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)", raw_config)
+        if m_if_sec:
+            for m_edit in re.finditer(r'(?ms)^\s*edit\s+"?([^"\r\n]+)"?\s*\n(.*?)^\s*next\b', m_if_sec.group(1)):
+                if_name, if_body = m_edit.group(1).strip(), m_edit.group(2)
+                m_rip = re.search(r"^\s*set\s+dhcp-relay-ip\s+([^\r\n]+)", if_body, re.MULTILINE)
+                if m_rip:
+                    for rip in re.findall(r"\b(\d+\.\d+\.\d+\.\d+)\b", m_rip.group(1)):
+                        result["relays"].append({"interface": if_name, "helper_ip": rip})
+
+    # 6. MikroTik `/ip dhcp-relay`
+    if "/ip dhcp-relay" in raw_config:
+        m_mt = re.search(r"(?ms)^/ip\s+dhcp-relay\s*\n(.*?)(?:\n/|\Z)", raw_config)
+        if m_mt:
+            for ln in m_mt.group(1).splitlines():
+                s = ln.strip()
+                if not s.startswith("add ") or "disabled=yes" in s:
+                    continue
+                m_srv = re.search(r"\bdhcp-server=([^\s]+)", s)
+                m_if = re.search(r"\binterface=([^\s]+)", s)
+                if m_srv:
+                    intf_lbl = _strip_outer_quotes(m_if.group(1)) if m_if else "global"
+                    for rip in _strip_outer_quotes(m_srv.group(1)).split(","):
+                        rip_c = rip.strip()
+                        if rip_c:
+                            result["relays"].append({"interface": intf_lbl, "helper_ip": rip_c})
+
     return result
 
 
@@ -1105,6 +1420,27 @@ def extract_firewall_nat_vpn(raw_config: str, vendor: str = "") -> dict:
                         "target": nat.findtext("target") or "interface-ip",
                     }
                 )
+            for pnat in root.findall("./nat/rule"):
+                if pnat.find("disabled") is not None:
+                    continue
+                out["nat_rules"].append(
+                    {
+                        "type": "port-forward",
+                        "interface": pnat.findtext("interface") or "",
+                        "src": pnat.findtext("source/network") or "any",
+                        "target": pnat.findtext("target") or "",
+                    }
+                )
+            out_mode = (root.findtext("./nat/outbound/mode") or "").strip().lower()
+            if out_mode in ("automatic", "hybrid") and not any(r.get("type") == "outbound" for r in out["nat_rules"]):
+                out["nat_rules"].append(
+                    {
+                        "type": f"outbound-{out_mode}",
+                        "interface": "wan",
+                        "src": "lan-subnets",
+                        "target": "interface-ip",
+                    }
+                )
             for p1 in root.findall("./ipsec/phase1"):
                 out["vpn_tunnels"].append(
                     {
@@ -1116,19 +1452,22 @@ def extract_firewall_nat_vpn(raw_config: str, vendor: str = "") -> dict:
         except ET.ParseError:
             pass
 
-    # FortiOS firewall policies
+    # FortiOS firewall policies & NAT
     if "config firewall policy" in raw_config:
-        for m_pol in re.finditer(r"edit\s+(\d+)(.*?)next", raw_config, re.DOTALL):
+        m_fp = re.search(r"(?ms)^config firewall policy\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)", raw_config)
+        fp_body = m_fp.group(1) if m_fp else raw_config
+        for m_pol in re.finditer(r"edit\s+(\d+)(.*?)next", fp_body, re.DOTALL):
             body = m_pol.group(2)
             if "set srcintf" not in body:
                 continue
             srcintf = re.search(r'set\s+srcintf\s+"([^"]+)"', body)
             dstintf = re.search(r'set\s+dstintf\s+"([^"]+)"', body)
             action = re.search(r"set\s+action\s+(\S+)", body)
+            iface_pair = f"{srcintf.group(1) if srcintf else ''}->{dstintf.group(1) if dstintf else ''}"
             out["firewall_rules"].append(
                 {
                     "action": action.group(1) if action else "deny",
-                    "interface": f"{srcintf.group(1) if srcintf else ''}->{dstintf.group(1) if dstintf else ''}",
+                    "interface": iface_pair,
                     "protocol": "any",
                     "src": "policy",
                     "dst": "policy",
@@ -1136,6 +1475,120 @@ def extract_firewall_nat_vpn(raw_config: str, vendor: str = "") -> dict:
                     "descr": f"policy-{m_pol.group(1)}",
                 }
             )
+            if re.search(r"^\s*set\s+nat\s+enable\b", body, re.MULTILINE):
+                out["nat_rules"].append(
+                    {
+                        "type": "policy-nat",
+                        "interface": iface_pair,
+                        "src": "policy",
+                        "target": f"policy-{m_pol.group(1)}",
+                    }
+                )
+    if "config firewall vip" in raw_config:
+        m_vip = re.search(r"(?ms)^config firewall vip\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)", raw_config)
+        if m_vip:
+            for m_e in re.finditer(r'(?ms)^\s*edit\s+"?([^"\r\n]+)"?\s*\n(.*?)^\s*next\b', m_vip.group(1)):
+                vname, vbody = m_e.group(1).strip(), m_e.group(2)
+                m_ext = re.search(r"set\s+extip\s+(\S+)", vbody)
+                m_map = re.search(r'set\s+mappedip\s+"?([^"\r\n]+)"?', vbody)
+                out["nat_rules"].append(
+                    {
+                        "type": "vip-dnat",
+                        "interface": vname,
+                        "src": m_ext.group(1) if m_ext else "",
+                        "target": m_map.group(1).strip() if m_map else "",
+                    }
+                )
+
+    # Cisco IOS / Arista EOS ACLs & NAT overload/static rules
+    for m_acl in re.finditer(r"(?m)^ip\s+access-list\s+(?:extended|standard)\s+(\S+)", raw_config, re.IGNORECASE):
+        out["firewall_rules"].append(
+            {
+                "action": "acl",
+                "interface": "",
+                "protocol": "ip",
+                "src": "",
+                "dst": "",
+                "dst_port": "",
+                "descr": m_acl.group(1),
+            }
+        )
+    for m_nat in re.finditer(r"(?m)^ip\s+nat\s+(inside|outside)\s+source\s+([^\r\n]+)", raw_config, re.IGNORECASE):
+        out["nat_rules"].append(
+            {
+                "type": f"cisco-nat-{m_nat.group(1).lower()}",
+                "interface": "",
+                "src": m_nat.group(2).strip()[:80],
+                "target": "overload" if "overload" in m_nat.group(2).lower() else "static",
+            }
+        )
+
+    # MikroTik `/ip firewall filter` & `/ip firewall nat`
+    if "/ip firewall filter" in raw_config:
+        m_mf = re.search(r"(?ms)^/ip\s+firewall\s+filter\s*\n(.*?)(?:\n/|\Z)", raw_config)
+        if m_mf:
+            for ln in m_mf.group(1).splitlines():
+                s = ln.strip()
+                if not s.startswith("add ") or "disabled=yes" in s:
+                    continue
+                m_act = re.search(r"\baction=(\S+)", s)
+                m_ch = re.search(r"\bchain=(\S+)", s)
+                out["firewall_rules"].append(
+                    {
+                        "action": m_act.group(1) if m_act else "accept",
+                        "interface": m_ch.group(1) if m_ch else "forward",
+                        "protocol": "any",
+                        "src": "",
+                        "dst": "",
+                        "dst_port": "",
+                        "descr": s[:80],
+                    }
+                )
+    if "/ip firewall nat" in raw_config:
+        m_mn = re.search(r"(?ms)^/ip\s+firewall\s+nat\s*\n(.*?)(?:\n/|\Z)", raw_config)
+        if m_mn:
+            for ln in m_mn.group(1).splitlines():
+                s = ln.strip()
+                if not s.startswith("add ") or "disabled=yes" in s:
+                    continue
+                m_act = re.search(r"\baction=(\S+)", s)
+                m_if = re.search(r"\bout-interface=(\S+)", s)
+                out["nat_rules"].append(
+                    {
+                        "type": m_act.group(1) if m_act else "nat",
+                        "interface": _strip_outer_quotes(m_if.group(1)) if m_if else "",
+                        "src": "",
+                        "target": m_act.group(1) if m_act else "",
+                    }
+                )
+
+    # OpenWrt UCI firewall rules & redirects
+    for m_ur in re.finditer(r"firewall\.@rule\[(\d+)\]=rule", raw_config):
+        idx = m_ur.group(1)
+        m_nm = re.search(rf"firewall\.@rule\[{idx}\]\.name='([^']+)'", raw_config)
+        m_tg = re.search(rf"firewall\.@rule\[{idx}\]\.target='([^']+)'", raw_config)
+        out["firewall_rules"].append(
+            {
+                "action": m_tg.group(1) if m_tg else "ACCEPT",
+                "interface": "uci",
+                "protocol": "any",
+                "src": "",
+                "dst": "",
+                "dst_port": "",
+                "descr": m_nm.group(1) if m_nm else f"rule-{idx}",
+            }
+        )
+    for m_ud in re.finditer(r"firewall\.@redirect\[(\d+)\]=redirect", raw_config):
+        idx = m_ud.group(1)
+        m_nm = re.search(rf"firewall\.@redirect\[{idx}\]\.name='([^']+)'", raw_config)
+        out["nat_rules"].append(
+            {
+                "type": "uci-redirect",
+                "interface": "wan",
+                "src": "",
+                "target": m_nm.group(1) if m_nm else f"redirect-{idx}",
+            }
+        )
 
     return out
 
@@ -1260,31 +1713,160 @@ def extract_vlans(raw_config: str, vendor: str = "") -> dict[str, dict]:
             vinfo["id"] = vid
             vlans[vid] = vinfo
 
+    # 3. OPNsense / pfSense XML `<vlans><vlan>`
+    if "<vlans>" in raw_config:
+        try:
+            root = ET.fromstring(raw_config)
+            for v_el in root.findall(".//vlans/vlan"):
+                tag = (v_el.findtext("tag") or "").strip()
+                if tag.isdigit() and 1 <= int(tag) <= 4094:
+                    descr = (v_el.findtext("descr") or "").strip()
+                    vlanif = (v_el.findtext("vlanif") or "").strip()
+                    vlans[tag] = {
+                        "id": tag,
+                        "name": descr or vlanif or f"VLAN_{tag}",
+                        "svi_interface": vlanif,
+                        "voice": False,
+                        "description": descr,
+                    }
+        except ET.ParseError:
+            pass
+
+    # 4. FortiOS `config system interface` VLAN subinterfaces (`set vlanid <id>`)
+    if "set vlanid" in raw_config and "config system interface" in raw_config:
+        m_if_sec = re.search(r"(?ms)^config system interface\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)", raw_config)
+        if m_if_sec:
+            for m_edit in re.finditer(r'(?ms)^\s*edit\s+"?([^"\r\n]+)"?\s*\n(.*?)^\s*next\b', m_if_sec.group(1)):
+                if_name, if_body = m_edit.group(1).strip(), m_edit.group(2)
+                m_vid = re.search(r"^\s*set\s+vlanid\s+(\d+)", if_body, re.MULTILINE)
+                if m_vid and 1 <= int(m_vid.group(1)) <= 4094:
+                    vid = m_vid.group(1)
+                    m_alias = re.search(r'^\s*set\s+alias\s+"?([^"\r\n]+)"?', if_body, re.MULTILINE)
+                    vname = m_alias.group(1).strip() if m_alias else if_name
+                    vlans[vid] = {
+                        "id": vid,
+                        "name": vname,
+                        "svi_interface": if_name,
+                        "voice": False,
+                        "description": vname,
+                    }
+
+    # 5. MikroTik `/interface vlan`
+    if "/interface vlan" in raw_config:
+        m_mt = re.search(r"(?ms)^/interface\s+vlan\s*\n(.*?)(?:\n/|\Z)", raw_config)
+        if m_mt:
+            for ln in m_mt.group(1).splitlines():
+                s = ln.strip()
+                if not s.startswith("add ") or "disabled=yes" in s:
+                    continue
+                m_vid = re.search(r"\bvlan-id=(\d+)", s)
+                m_nm = re.search(r'\bname=("[^"]+"|[^\s]+)', s)
+                if m_vid and 1 <= int(m_vid.group(1)) <= 4094:
+                    vid = m_vid.group(1)
+                    vname = _strip_outer_quotes(m_nm.group(1)) if m_nm else f"VLAN_{vid}"
+                    vlans[vid] = {
+                        "id": vid,
+                        "name": vname,
+                        "svi_interface": vname,
+                        "voice": False,
+                        "description": "",
+                    }
+
+    # 6. OpenWrt UCI `bridge-vlan` / `switch_vlan`
+    for m_ov in re.finditer(r"network\.@(?:bridge-vlan|switch_vlan)\[\d+\]\.vlan='(\d+)'", raw_config):
+        vid = m_ov.group(1)
+        if 1 <= int(vid) <= 4094 and vid not in vlans:
+            vlans[vid] = {"id": vid, "name": f"VLAN_{vid}", "svi_interface": "", "voice": False, "description": ""}
+
     return vlans
 
 
 def extract_vrfs_and_acls(raw_config: str, vendor: str = "") -> tuple[list[dict], dict[str, dict]]:
     """
-    Extract VRF / routing-instance names and per-interface ACL bindings
-    (`acl_in`, `acl_out`) from Cisco, Arista, HP ProCurve, and Junos configs.
+    Extract VRF / routing-instance names (with RD & bound interfaces) and per-interface ACL bindings
+    (`acl_in`, `acl_out`) from Cisco IOS/NX-OS/XR, Arista, HP ProCurve, Junos, FortiOS, and FRR configs.
     """
     vrfs: list[dict] = []
     acls: dict[str, dict] = {}
     if not raw_config:
         return vrfs, acls
 
-    seen_vrfs: set[str] = set()
-    for m_vrf in re.finditer(r"(?m)^(?:ip\s+vrf|vrf\s+definition)\s+(\S+)", raw_config):
-        vname = m_vrf.group(1)
-        if vname not in seen_vrfs:
-            seen_vrfs.add(vname)
-            vrfs.append({"name": vname, "type": "vrf"})
+    vrf_map: dict[str, dict] = {}
+
+    def _ensure_vrf(name: str, vtype: str = "vrf") -> dict:
+        clean = _strip_outer_quotes(name)
+        return vrf_map.setdefault(clean, {"name": clean, "type": vtype, "rd": "", "interfaces": []})
+
+    # Cisco IOS (`ip vrf`, `vrf definition`), NX-OS (`vrf context`), Arista (`vrf instance`), IOS-XR/FRR (`vrf <name>`)
+    vrf_header_re = re.compile(
+        r"(?m)^(?:ip\s+vrf|vrf\s+definition|vrf\s+context|vrf\s+instance|vrf)\s+([^\s{};]+)\s*$",
+        re.IGNORECASE,
+    )
+    reserved_vrf_tokens = frozenset(
+        {"forwarding", "member", "receive", "selection", "definition", "context", "instance"}
+    )
+    for m_vrf in vrf_header_re.finditer(raw_config):
+        vname = m_vrf.group(1).strip()
+        if not vname or vname.lower() in reserved_vrf_tokens:
+            continue
+        rec = _ensure_vrf(vname, "vrf")
+        tail = raw_config[m_vrf.end() :]
+        for ln in tail.splitlines():
+            if not ln.strip():
+                continue
+            if ln[0] in (" ", "\t"):
+                m_rd = re.match(r"^\s*rd\s+(\S+)", ln, re.IGNORECASE)
+                if m_rd:
+                    rec["rd"] = m_rd.group(1)
+            else:
+                break
+
+    # Juniper Junos set-style `routing-instances`
     for m_ri in re.finditer(r"set\s+routing-instances\s+(\S+)\s+instance-type\s+(\S+)", raw_config):
         vname, rtype = m_ri.groups()
-        if vname not in seen_vrfs:
-            seen_vrfs.add(vname)
-            vrfs.append({"name": vname, "type": rtype})
+        _ensure_vrf(vname, rtype)
+    for m_ri_rd in re.finditer(r"set\s+routing-instances\s+(\S+)\s+route-distinguisher\s+(\S+)", raw_config):
+        _ensure_vrf(m_ri_rd.group(1))["rd"] = m_ri_rd.group(2)
+    for m_ri_if in re.finditer(r"set\s+routing-instances\s+(\S+)\s+interface\s+(\S+)", raw_config):
+        rec = _ensure_vrf(m_ri_if.group(1))
+        if m_ri_if.group(2) not in rec["interfaces"]:
+            rec["interfaces"].append(m_ri_if.group(2))
 
+    # Juniper Junos brace-style `routing-instances { <name> { ... } }`
+    for m_top in re.finditer(r"(?m)^\s*routing-instances\s*\{", raw_config):
+        r_open = m_top.end() - 1
+        r_close = _find_matching_brace(raw_config, r_open)
+        if r_close == -1:
+            continue
+        r_body = raw_config[r_open + 1 : r_close]
+        pos = 0
+        while pos < len(r_body):
+            m_child = re.search(r"([^\s{};]+)\s*\{", r_body[pos:])
+            if not m_child:
+                break
+            vname = _strip_outer_quotes(m_child.group(1))
+            c_open = pos + m_child.end() - 1
+            c_close = _find_matching_brace(r_body, c_open)
+            if c_close == -1:
+                break
+            stanza = r_body[c_open + 1 : c_close]
+            m_rt = re.search(r"\binstance-type\s+([^\s;]+)\s*;", stanza)
+            rec = _ensure_vrf(vname, m_rt.group(1) if m_rt else "vrf")
+            m_rd = re.search(r"\broute-distinguisher\s+([^\s;]+)\s*;", stanza)
+            if m_rd:
+                rec["rd"] = m_rd.group(1)
+            for m_rif in re.finditer(r"\binterface\s+([^\s;]+)\s*;", stanza):
+                if m_rif.group(1) not in rec["interfaces"]:
+                    rec["interfaces"].append(m_rif.group(1))
+            pos = c_close + 1
+
+    # FortiOS multi-VDOM (`config vdom\n edit <vdom_name>`)
+    if "config vdom" in raw_config:
+        for m_vd in re.finditer(r"(?ms)^config\s+vdom\s*\n(.*?)(?:\nend\s*$|\nend\s*\n)", raw_config):
+            for m_ed in re.finditer(r'(?m)^\s*edit\s+"?([^"\r\n]+)"?', m_vd.group(1)):
+                _ensure_vrf(m_ed.group(1).strip(), "vdom")
+
+    # Interface -> VRF bindings & per-interface ACLs
     for m_jfilt in re.finditer(
         r"set\s+interfaces\s+(\S+)\s+unit\s+\d+\s+family\s+(?:ethernet-switching|inet)\s+filter\s+(input|output)\s+(\S+)",
         raw_config,
@@ -1293,11 +1875,30 @@ def extract_vrfs_and_acls(raw_config: str, vendor: str = "") -> tuple[list[dict]
         acls.setdefault(port, {"acl_in": "", "acl_out": ""})
         acls[port]["acl_in" if direction == "input" else "acl_out"] = fname
 
-    for m_intf in re.finditer(r"(?m)^interface\s+(\S+)\s*\r?\n((?:[ \t]+[^\r\n]+\r?\n)*)", raw_config):
+    for m_intf in re.finditer(r"(?m)^interface\s+(\S+)\s*\r?\n((?:[ \t]+[^\r\n]+\r?\n?)*)", raw_config):
         port, body = m_intf.group(1), m_intf.group(2)
         for m_ag in re.finditer(r"(?m)^\s*(?:ip|ipv6)\s+access-group\s+(\S+)\s+(in|out)\b", body, re.IGNORECASE):
             fname, direction = m_ag.group(1), m_ag.group(2).lower()
             acls.setdefault(port, {"acl_in": "", "acl_out": ""})
             acls[port]["acl_in" if direction == "in" else "acl_out"] = fname
+        m_ivrf = re.search(
+            r"(?m)^\s*(?:(?:ip\s+)?vrf\s+forwarding|vrf\s+member|vrf)\s+(\S+)",
+            body,
+            re.IGNORECASE,
+        )
+        if m_ivrf:
+            vname = m_ivrf.group(1).strip()
+            if vname.lower() not in reserved_vrf_tokens:
+                rec = _ensure_vrf(vname, "vrf")
+                if port not in rec["interfaces"]:
+                    rec["interfaces"].append(port)
 
+    vrfs = []
+    for rec in vrf_map.values():
+        entry: dict = {"name": rec["name"], "type": rec["type"]}
+        if rec.get("rd"):
+            entry["rd"] = rec["rd"]
+        if rec.get("interfaces"):
+            entry["interfaces"] = rec["interfaces"]
+        vrfs.append(entry)
     return vrfs, acls

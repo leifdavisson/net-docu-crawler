@@ -23,6 +23,27 @@ import json
 import os
 from collections import Counter
 
+from net_docu_crawler.schema import (
+    APPLIANCE_TYPES,
+    CLI_ERROR_MARKERS,
+    CRITICAL_COLLECTION_SECTIONS,
+    normalize_collection_status,
+)
+
+
+def _is_crawled_infra_record(dev: dict) -> bool:
+    """Return True only for crawled network infrastructure (never unsupported_appliance/server hosts)."""
+    if not isinstance(dev, dict):
+        return False
+    rc = str(dev.get("record_class") or "").strip().lower()
+    if rc:
+        return rc == "crawled_infra"
+    status = str(dev.get("status") or "").strip().lower()
+    if status != "success":
+        return False
+    dtype = str(dev.get("device_type") or dev.get("device_persona") or "").strip().lower()
+    return dtype not in APPLIANCE_TYPES
+
 
 def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = None) -> dict:
     """Evaluate correlated `raw_devices` against P0/P1 cutover-readiness gates."""
@@ -32,8 +53,8 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
         trunk_audit = evaluate_trunk_mismatches(raw_devices)
     trunk_summary = dict((trunk_audit or {}).get("summary") or {})
 
-    funnel = Counter(d.get("record_class", "unknown") for d in raw_devices)
-    infra = [d for d in raw_devices if d.get("record_class") == "crawled_infra" or d.get("status") == "success"]
+    funnel = Counter(d.get("record_class", "unknown") for d in raw_devices if isinstance(d, dict))
+    infra = [d for d in raw_devices if _is_crawled_infra_record(d)]
 
     gates: list[dict] = []
     total_ports = 0
@@ -44,6 +65,11 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
 
     poe_contradictions: list[str] = []
     stp_missing_root: list[str] = []
+    critical_collection_failures: list[str] = []
+    optional_collection_failures: list[str] = []
+    section_state_counts: dict[str, dict[str, int]] = {}
+    total_parse_errors = 0
+    has_explicit_collection_status = False
 
     for dev in infra:
         host = dev.get("hostname") or dev.get("ip", "")
@@ -73,12 +99,39 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
         if stp.get("is_root") and not stp.get("root_bridge"):
             stp_missing_root.append(host)
 
+        cs_raw = dev.get("collection_status")
+        if isinstance(cs_raw, dict) and cs_raw:
+            has_explicit_collection_status = True
+            for sec, raw_st in cs_raw.items():
+                st_norm = normalize_collection_status(raw_st)
+                bucket = section_state_counts.setdefault(str(sec), {})
+                bucket[st_norm] = bucket.get(st_norm, 0) + 1
+                if st_norm in ("command_failed", "parse_failed"):
+                    label = f"{host}:{sec} ({st_norm})"
+                    if sec in CRITICAL_COLLECTION_SECTIONS:
+                        critical_collection_failures.append(label)
+                    else:
+                        optional_collection_failures.append(label)
+        p_errs = dev.get("parse_errors")
+        if isinstance(p_errs, list):
+            total_parse_errors += len(p_errs)
+
+    if total_ports == 0:
+        cabling_vlan_status = "NOT_EVALUATED"
+        cabling_vlan_detail = "0 profiled ports evaluated across crawled infrastructure."
+    elif known_vlan > 0:
+        cabling_vlan_status = "PASS"
+        cabling_vlan_detail = f"{known_vlan}/{total_ports} ports have resolved access or allowed VLANs."
+    else:
+        cabling_vlan_status = "FAIL"
+        cabling_vlan_detail = f"0/{total_ports} ports have resolved access or allowed VLANs."
+
     gates.append(
         {
             "gate": "GATE_CABLING_VLAN_EMPTY",
             "severity": "P0",
-            "status": "PASS" if (total_ports == 0 or known_vlan > 0) else "FAIL",
-            "detail": f"{known_vlan}/{total_ports} ports have resolved access or allowed VLANs.",
+            "status": cabling_vlan_status,
+            "detail": cabling_vlan_detail,
         }
     )
     gates.append(
@@ -105,8 +158,14 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
         {
             "gate": "GATE_TRUNK_NATIVE_UNKNOWN",
             "severity": "P1",
-            "status": "WARN" if (trunk_ports > 0 and known_native_on_trunk < trunk_ports) else "PASS",
-            "detail": f"{known_native_on_trunk}/{trunk_ports} trunk ports have resolved native VLAN.",
+            "status": (
+                "NOT_EVALUATED" if trunk_ports == 0 else ("WARN" if known_native_on_trunk < trunk_ports else "PASS")
+            ),
+            "detail": (
+                "0 trunk ports evaluated."
+                if trunk_ports == 0
+                else f"{known_native_on_trunk}/{trunk_ports} trunk ports have resolved native VLAN."
+            ),
         }
     )
 
@@ -129,6 +188,11 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
             f"across {edges_eval} evaluated trunk link(s) "
             f"({total_findings} total finding(s): {crit_cnt} CRITICAL, {high_cnt} HIGH, {med_cnt} MEDIUM, {low_cnt} LOW)."
         )
+    elif edges_eval == 0:
+        trunk_mismatch_status = "NOT_EVALUATED"
+        trunk_mismatch_detail = (
+            f"0 trunk links evaluated ({total_findings} finding(s)); no inter-switch trunks audited."
+        )
     else:
         trunk_mismatch_status = "PASS"
         trunk_mismatch_detail = (
@@ -141,6 +205,34 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
             "severity": "P1",
             "status": trunk_mismatch_status,
             "detail": trunk_mismatch_detail,
+        }
+    )
+
+    if critical_collection_failures:
+        coll_sev, coll_status = "P0", "FAIL"
+        coll_detail = (
+            f"Critical telemetry collection failed on {len(critical_collection_failures)} section(s): "
+            f"{', '.join(critical_collection_failures[:8])}"
+        )
+    elif optional_collection_failures or total_parse_errors > 0:
+        coll_sev, coll_status = "P1", "WARN"
+        coll_detail = (
+            f"{len(optional_collection_failures)} optional section failure(s) and "
+            f"{total_parse_errors} parse error(s): {', '.join(optional_collection_failures[:8]) or 'see parse_errors'}"
+        )
+    elif has_explicit_collection_status:
+        coll_sev, coll_status = "P1", "PASS"
+        coll_detail = "All collected telemetry sections completed without command/parse failures."
+    else:
+        coll_sev, coll_status = "P1", "NOT_EVALUATED"
+        coll_detail = "Legacy dataset without per-section collection_status metadata."
+
+    gates.append(
+        {
+            "gate": "GATE_COLLECTION_INTEGRITY",
+            "severity": coll_sev,
+            "status": coll_status,
+            "detail": coll_detail,
         }
     )
 
@@ -162,20 +254,14 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
                     "model": str(dev.get("model") or ""),
                 }
             )
-        elif st == "success":
+        elif _is_crawled_infra_record(dev):
             reasons: list[str] = []
             if not hn or hn == ip or hn.lower() == "unknown":
                 reasons.append("hostname unresolved (header/version parse mismatch)")
             if not (dev.get("interfaces_detail") or {}):
                 reasons.append("0 interfaces parsed (command/driver mismatch)")
             cfg_l = str(dev.get("raw_config") or "").lower()
-            for marker in (
-                "% invalid input",
-                "privileged mode required",
-                "syntax error",
-                "command not found",
-                "unknown command",
-            ):
+            for marker in CLI_ERROR_MARKERS:
                 if marker in cfg_l:
                     reasons.append(f"CLI error in config output (`{marker}`)")
                     break
@@ -196,6 +282,12 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
         "trunk_audit_summary": trunk_summary,
         "unauthenticated_devices": unauthenticated_devices,
         "command_header_mismatches": command_header_mismatches,
+        "collection_coverage": {
+            "sections": section_state_counts,
+            "critical_failures": critical_collection_failures,
+            "optional_failures": optional_collection_failures,
+            "parse_error_count": total_parse_errors,
+        },
         "funnel": {
             "total_records": len(raw_devices),
             "crawled_infra": funnel.get("crawled_infra", 0),
