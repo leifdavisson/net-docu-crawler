@@ -26,7 +26,6 @@ Official Upstream Documentation & References:
 import base64
 import hashlib
 import ipaddress
-import json
 import logging
 import os
 import re
@@ -36,12 +35,28 @@ import time
 import paramiko
 
 import oui_lookup
+from net_docu_crawler.drivers._lldpd import parse_lldpd_json
 from net_docu_crawler.drivers.base import BaseDriver
 
 logger = logging.getLogger(__name__)
 
 OPNSENSE_PSEUDO_INTERFACES = ("lo", "enc", "pflog", "pfsync")
 _STRICT_HOST_KEY_ENV_VAR = "NDC_STRICT_HOST_KEYS"
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
+_SMBIOS_PLACEHOLDER_SERIALS = frozenset(
+    {
+        "0",
+        "none",
+        "not specified",
+        "default string",
+        "to be filled by o.e.m.",
+        "system serial number",
+        "chassis serial number",
+        "n/a",
+        "unknown",
+    }
+)
 
 
 def _format_host_key_fingerprint(key: paramiko.PKey) -> str:
@@ -355,127 +370,234 @@ class OPNsenseDriver(BaseDriver):
             "device_persona": self.device_persona,
         }
         try:
-            h = conn.send_command("hostname").strip()
+            h = (conn.send_command("hostname") or "").strip()
             if h:
                 info["hostname"] = h
         except Exception as exc:
-            logger.debug("OPNsense hostname query failed on %s: %s", self.ip, exc)
+            logger.warning("OPNsense hostname query failed on %s: %s", self.ip, exc)
 
         try:
-            raw_ver = conn.send_command("opnsense-version").strip()
+            raw_ver = (conn.send_command("opnsense-version") or "").strip()
             if raw_ver:
                 info["firmware"] = raw_ver
         except Exception as exc:
-            logger.debug("OPNsense firmware version query failed on %s: %s", self.ip, exc)
+            logger.warning("OPNsense firmware version query failed on %s: %s", self.ip, exc)
 
         try:
-            prod = conn.send_command("kenv smbios.system.product 2>/dev/null").strip()
+            prod = (conn.send_command("kenv smbios.system.product 2>/dev/null") or "").strip()
             if prod:
                 info["model"] = f"OPNsense ({prod})"
-            ser = conn.send_command("kenv smbios.system.serial 2>/dev/null").strip()
-            if ser and ser.lower() not in ("0", "none", "not specified", "default string"):
+            ser = (conn.send_command("kenv smbios.system.serial 2>/dev/null") or "").strip()
+            if ser and ser.lower() not in _SMBIOS_PLACEHOLDER_SERIALS:
                 info["serial"] = ser
         except Exception as exc:
-            logger.debug("OPNsense SMBIOS kenv query failed on %s: %s", self.ip, exc)
+            logger.warning("OPNsense SMBIOS kenv query failed on %s: %s", self.ip, exc)
 
         return info
 
+    def _parse_ifconfig_netmask(self, parts: list[str], header: str, intf_name: str) -> int:
+        """Extract IPv4 prefix length from a FreeBSD `ifconfig -a` `inet` line (normal or P2P `-->`)."""
+        if "netmask" in parts:
+            idx = parts.index("netmask")
+            if idx + 1 < len(parts):
+                mask_tok = parts[idx + 1]
+                if _IPV4_RE.match(mask_tok):
+                    try:
+                        return ipaddress.IPv4Network(f"0.0.0.0/{mask_tok}").prefixlen
+                    except ValueError as exc:
+                        logger.warning(
+                            "Invalid OPNsense dotted netmask %r on %s (%s); defaulting to /24: %s",
+                            mask_tok,
+                            self.ip,
+                            intf_name,
+                            exc,
+                        )
+                        return 24
+                try:
+                    return bin(int(mask_tok, 16)).count("1")
+                except ValueError as exc:
+                    logger.warning(
+                        "Invalid OPNsense hex netmask %r on %s (%s); defaulting to /24: %s",
+                        mask_tok,
+                        self.ip,
+                        intf_name,
+                        exc,
+                    )
+                    return 24
+        if "-->" in parts or "POINTOPOINT" in header:
+            return 32
+        return 24
+
+    def _parse_ifconfig_output(self, raw: str) -> tuple[list[dict], dict[str, dict], list[dict]]:
+        """Parse FreeBSD `ifconfig -a` into `(l3_interfaces, interfaces_detail, carp_fhrp)`."""
+        l3_interfaces: list[dict] = []
+        interfaces_detail: dict[str, dict] = {}
+        carp_fhrp: list[dict] = []
+
+        blocks = re.split(r"\n(?=[a-zA-Z0-9_.\-]+:)", raw or "")
+        for block in blocks:
+            lines = block.strip().splitlines()
+            if not lines:
+                continue
+            header = lines[0]
+            m_intf = re.match(r"^([a-zA-Z0-9_.\-]+):", header)
+            if not m_intf:
+                continue
+            intf_name = m_intf.group(1)
+            if intf_name.lower().startswith(OPNSENSE_PSEUDO_INTERFACES):
+                continue
+
+            admin_up = "<UP," in header or "<UP>" in header
+            m_mtu = re.search(r"\bmtu\s+(\d+)", header)
+            mtu = int(m_mtu.group(1)) if m_mtu else None
+
+            desc = ""
+            mac = ""
+            link_status = ""
+            speed = ""
+            duplex = ""
+            inet_addrs: list[str] = []
+            block_l3: list[dict] = []
+            vhid_vips: dict[str, str] = {}
+            carp_lines: list[tuple[str, str, int]] = []
+
+            for line in lines[1:]:
+                line_s = line.strip()
+                if line_s.startswith("description:"):
+                    desc = line_s.split("description:", 1)[1].strip()
+                elif line_s.startswith("ether "):
+                    eth_parts = line_s.split()
+                    if len(eth_parts) >= 2:
+                        mac = oui_lookup.normalize_mac(eth_parts[1].strip()).lower()
+                elif line_s.startswith("status:"):
+                    link_status = line_s.split("status:", 1)[1].strip().lower()
+                elif line_s.startswith("media:"):
+                    m_media = re.search(r"\(([^)]+)\)", line_s)
+                    if m_media:
+                        media_val = m_media.group(1).strip()
+                        if media_val.lower() != "none":
+                            m_dup = re.search(r"<(full-duplex|half-duplex)>", media_val, re.IGNORECASE)
+                            if m_dup:
+                                duplex = m_dup.group(1).lower()
+                            spd_tok = re.sub(r"<[^>]+>", "", media_val).strip()
+                            if spd_tok:
+                                speed = spd_tok
+                elif line_s.startswith("carp:"):
+                    m_carp = re.match(
+                        r"^carp:\s*(\S+)\s+vhid\s+(\d+)(?:.*?advskew\s+(\d+))?",
+                        line_s,
+                        re.IGNORECASE,
+                    )
+                    if m_carp:
+                        carp_state = m_carp.group(1).upper()
+                        carp_vhid = m_carp.group(2)
+                        carp_skew = int(m_carp.group(3)) if m_carp.group(3) else 0
+                        carp_lines.append((carp_state, carp_vhid, carp_skew))
+                elif line_s.startswith("inet "):
+                    parts = line_s.split()
+                    if len(parts) < 2:
+                        continue
+                    ip_val = parts[1]
+                    if ip_val.startswith("127."):
+                        continue
+                    prefix_len = self._parse_ifconfig_netmask(parts, header, intf_name)
+                    full_ip = f"{ip_val}/{prefix_len}"
+                    if "vhid" in parts:
+                        v_idx = parts.index("vhid")
+                        if v_idx + 1 < len(parts):
+                            vhid_vips[parts[v_idx + 1]] = full_ip
+                    inet_addrs.append(full_ip)
+                    block_l3.append(
+                        {
+                            "interface": intf_name,
+                            "ip_address": full_ip,
+                            "status": "up",
+                            "protocol": "up",
+                        }
+                    )
+
+            if not admin_up or link_status in ("no carrier", "down", "inactive"):
+                status = "down"
+            else:
+                status = "up"
+
+            for row in block_l3:
+                row["status"] = status
+                row["protocol"] = status
+                l3_interfaces.append(row)
+
+            primary_ip = inet_addrs[0] if inet_addrs else ""
+            detail: dict = {
+                "ip_address": primary_ip,
+                "status": status,
+                "mac_address": mac,
+                "description": desc,
+            }
+            if mtu is not None:
+                detail["mtu"] = mtu
+            if speed:
+                detail["speed"] = speed
+            if duplex:
+                detail["duplex"] = duplex
+            interfaces_detail[intf_name] = detail
+
+            for carp_state, carp_vhid, carp_skew in carp_lines:
+                carp_fhrp.append(
+                    {
+                        "protocol": "carp",
+                        "group": carp_vhid,
+                        "interface": intf_name,
+                        "vip": vhid_vips.get(carp_vhid, primary_ip),
+                        "priority": carp_skew,
+                        "state": carp_state,
+                    }
+                )
+
+        return l3_interfaces, interfaces_detail, carp_fhrp
+
     def get_interfaces(self, conn) -> tuple[list, dict]:
-        l3_interfaces = []
-        interfaces_detail = {}
+        l3_interfaces: list[dict] = []
+        interfaces_detail: dict[str, dict] = {}
+        carp_fhrp: list[dict] = []
         try:
             raw = conn.send_command("ifconfig -a")
-            blocks = re.split(r"\n(?=[a-zA-Z0-9_]+:)", raw)
-            for block in blocks:
-                lines = block.strip().splitlines()
-                if not lines:
-                    continue
-                header = lines[0]
-                m_intf = re.match(r"^([a-zA-Z0-9_]+):", header)
-                if not m_intf:
-                    continue
-                intf_name = m_intf.group(1)
-                if intf_name.lower().startswith(OPNSENSE_PSEUDO_INTERFACES):
-                    continue
-
-                status = "up" if "<UP," in header or "<UP>" in header else "down"
-                desc = ""
-                mac = ""
-                inet_addrs = []
-
-                for line in lines[1:]:
-                    line_s = line.strip()
-                    if line_s.startswith("description:"):
-                        desc = line_s.split("description:", 1)[1].strip()
-                    elif line_s.startswith("ether "):
-                        mac = oui_lookup.normalize_mac(line_s.split()[1].strip()).lower()
-                    elif line_s.startswith("inet "):
-                        parts = line_s.split()
-                        ip_val = parts[1]
-                        if ip_val.startswith("127."):
-                            continue
-                        mask_hex = parts[3] if len(parts) >= 4 and parts[2] == "netmask" else "0xffffff00"
-                        try:
-                            mask_int = int(mask_hex, 16)
-                            prefix_len = bin(mask_int).count("1")
-                        except ValueError as exc:
-                            logger.debug(
-                                "Invalid OPNsense hex netmask %r on %s (%s); defaulting to /24: %s",
-                                mask_hex,
-                                self.ip,
-                                intf_name,
-                                exc,
-                            )
-                            prefix_len = 24
-                        full_ip = f"{ip_val}/{prefix_len}"
-                        inet_addrs.append(full_ip)
-                        l3_interfaces.append(
-                            {
-                                "interface": intf_name,
-                                "ip_address": full_ip,
-                                "status": status,
-                                "protocol": status,
-                            }
-                        )
-
-                primary_ip = inet_addrs[0] if inet_addrs else ""
-                interfaces_detail[intf_name] = {
-                    "ip_address": primary_ip,
-                    "status": status,
-                    "mac_address": mac,
-                    "description": desc,
-                }
+            l3_interfaces, interfaces_detail, carp_fhrp = self._parse_ifconfig_output(raw)
         except Exception as exc:
             logger.warning("OPNsense interface discovery failed on %s: %s", self.ip, exc)
         self._last_l3_interfaces = l3_interfaces
         self._last_interfaces_detail = interfaces_detail
+        self._last_carp_fhrp = carp_fhrp
+        self._ifconfig_cached = True
         return l3_interfaces, interfaces_detail
 
+    def get_fhrp(self, conn) -> list[dict]:
+        """Return live CARP redundancy state parsed from read-only `ifconfig -a` (reusing cached crawl output)."""
+        if getattr(self, "_ifconfig_cached", False):
+            return list(getattr(self, "_last_carp_fhrp", []))
+        try:
+            raw = conn.send_command("ifconfig -a")
+            _, _, carp_fhrp = self._parse_ifconfig_output(raw)
+            self._last_carp_fhrp = carp_fhrp
+            self._ifconfig_cached = True
+            return list(carp_fhrp)
+        except Exception as exc:
+            logger.warning("OPNsense CARP FHRP discovery failed on %s: %s", self.ip, exc)
+            return []
+
     def get_neighbors(self, conn) -> list[dict]:
-        neighbors = []
+        neighbors: list[dict] = []
         lldp_status = "unknown"
         notes = ""
         try:
-            raw = conn.send_command("lldpctl -f json 2>/dev/null")
-            if raw and raw.strip().startswith("{"):
-                lldp_status = "enabled"
-                data = json.loads(raw)
-                for lldp_entry in data.get("lldp", {}).get("interface", []):
-                    for intf_name, info in lldp_entry.items():
-                        chassis = info.get("chassis", {})
-                        port = info.get("port", {})
-                        descr = chassis.get("descr", {}).get("value", "")[:60]
-                        neighbors.append(
-                            {
-                                "local_port": intf_name,
-                                "remote_device": chassis.get("name", {}).get("value", "Unknown"),
-                                "remote_port": port.get("id", {}).get("value", "Unknown"),
-                                "remote_ip": "",
-                                "platform": descr,
-                                "remote_platform": descr,
-                                "device_type": "switch",
-                            }
-                        )
+            raw = (conn.send_command("lldpctl -f json 2>/dev/null") or "").strip()
+            if raw.startswith("{"):
+                parsed_nbrs, ok = parse_lldpd_json(raw, default_device_type="switch", log=logger, ip=self.ip)
+                if ok:
+                    lldp_status = "enabled"
+                    neighbors.extend(parsed_nbrs)
+                else:
+                    lldp_status = "unknown"
+                    notes = "lldpctl returned unparseable JSON output."
             else:
                 chk = (conn.send_command("command -v lldpctl >/dev/null 2>&1 || echo __NO_LLDPD__") or "").strip()
                 if "__NO_LLDPD__" in chk:
@@ -484,10 +606,8 @@ class OPNsenseDriver(BaseDriver):
                 else:
                     lldp_status = "disabled"
                     notes = "lldpctl returned no JSON output; lldpd service may be stopped."
-        except (json.JSONDecodeError, TypeError, AttributeError) as exc:
-            logger.debug("OPNsense LLDP JSON parse failed on %s: %s", self.ip, exc)
         except Exception as exc:
-            logger.debug("OPNsense LLDP query failed on %s: %s", self.ip, exc)
+            logger.warning("OPNsense LLDP query failed on %s: %s", self.ip, exc)
         self._discovery_protocols = {
             "lldp": lldp_status,
             "cdp": "unsupported",
@@ -531,7 +651,7 @@ class OPNsenseDriver(BaseDriver):
             raw = conn.send_command("netstat -rnW -f inet")
             if "Destination" not in (raw or ""):
                 raw = conn.send_command("netstat -rn -f inet")
-            lines = raw.strip().splitlines()
+            lines = (raw or "").strip().splitlines()
             start = False
             netif_idx = 3
             for line in lines:
@@ -551,9 +671,21 @@ class OPNsenseDriver(BaseDriver):
                     netif = parts[netif_idx]
                     if dst == "127.0.0.1" or netif.startswith("lo"):
                         continue
-                    subnet = "0.0.0.0/0" if dst == "default" else dst
+                    if dst == "default":
+                        subnet = "0.0.0.0/0"
+                    elif _IPV4_RE.match(dst):
+                        subnet = f"{dst}/32"
+                    else:
+                        subnet = dst
                     netif = self._resolve_truncated_netif(netif, subnet)
-                    proto = "static" if "S" in flags else "connected"
+                    if gw.startswith("link#") or _MAC_RE.match(gw):
+                        proto = "connected"
+                    elif "S" in flags:
+                        proto = "static"
+                    elif "G" in flags:
+                        proto = "dynamic"
+                    else:
+                        proto = "connected"
                     routes.append(
                         {
                             "subnet": subnet,
@@ -569,25 +701,26 @@ class OPNsenseDriver(BaseDriver):
     def get_arp_table(self, conn) -> list[dict]:
         arp_entries = []
         try:
-            raw = conn.send_command("arp -an")
+            raw = conn.send_command("arp -an") or ""
             for line in raw.strip().splitlines():
-                m = re.search(r"\(([\d\.]+)\)\s+at\s+([0-9a-fA-F:]+)\s+on\s+([a-zA-Z0-9_]+)", line)
+                m = re.search(r"\(([\d\.]+)\)\s+at\s+([0-9a-fA-F:]+)\s+on\s+([a-zA-Z0-9_.\-]+)", line)
                 if m:
                     ip_val = m.group(1)
                     mac_val = oui_lookup.normalize_mac(m.group(2)).lower()
                     intf_val = m.group(3)
                     if mac_val and mac_val != "(incomplete)":
+                        arp_type = "static" if " permanent" in line.lower() else "dynamic"
                         arp_entries.append(
                             {
                                 "ip": ip_val,
                                 "mac": mac_val,
                                 "interface": intf_val,
-                                "type": "dynamic",
+                                "type": arp_type,
                                 "vendor": oui_lookup.lookup_oui(mac_val),
                             }
                         )
         except Exception as exc:
-            logger.debug("OPNsense ARP table query failed on %s: %s", self.ip, exc)
+            logger.warning("OPNsense ARP table query failed on %s: %s", self.ip, exc)
         return arp_entries
 
     def get_running_config(self, conn) -> str:
