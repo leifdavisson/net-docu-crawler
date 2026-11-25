@@ -28,10 +28,12 @@ REQUIRED_DEPENDENCIES = {
     "netmiko": "netmiko>=4.0.0",
     "paramiko": "paramiko>=3.0.0",
     "netaddr": "netaddr>=0.8.0",
+    "cryptography": "cryptography>=41.0.0",
 }
 
 OPTIONAL_DEPENDENCIES = {
-    "jinja2": "jinja2>=3.0.0",
+    "ncclient": "ncclient>=0.6.15",
+    "pygnmi": "pygnmi>=0.8.12",
     "ruff": "ruff>=0.1.0",
     "pytest": "pytest>=7.0.0",
 }

@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$Py = if (Test-Path ".\venv\Scripts\python.exe") { ".\venv\Scripts\python.exe" } else { "python" }
+$Py = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } elseif (Test-Path ".\venv\Scripts\python.exe") { ".\venv\Scripts\python.exe" } else { "python" }
 
 Write-Host "=== Net-Docu-Crawler Operator Wrapper ===" -ForegroundColor Cyan
 Write-Host "1) Validate credentials.json"
