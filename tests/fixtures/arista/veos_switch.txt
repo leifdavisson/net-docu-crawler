@@ -1,0 +1,133 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from Arista vEOS-lab EOS JSON)
+# Vendor: Arista Networks (EOS)
+# PROMPT: sw-eos-01#
+# Official CLI Reference: https://www.arista.com/en/um-eos
+
+--- COMMAND: show version | json ---
+{
+  "modelName": "vEOS-lab",
+  "version": "4.32.2F",
+  "serialNumber": "VEOSLAB00003",
+  "systemMacAddress": "00:1c:73:aa:03:03"
+}
+
+--- COMMAND: show hostname | json ---
+{
+  "hostname": "sw-eos-01",
+  "fqdn": "sw-eos-01.lab.example.invalid"
+}
+
+--- COMMAND: show ip interface | json ---
+{
+  "interfaces": {
+    "Management1": {
+      "interfaceStatus": "connected",
+      "lineProtocolStatus": "up",
+      "interfaceAddress": {
+        "primaryIp": {"address": "10.10.1.31", "maskLen": 24}
+      }
+    }
+  }
+}
+
+--- COMMAND: show interfaces | json ---
+{
+  "interfaces": {
+    "Ethernet1": {
+      "interfaceStatus": "connected",
+      "lineProtocolStatus": "up",
+      "physicalAddress": "00:1c:73:aa:03:11",
+      "description": "Uplink to sw-core-01",
+      "bandwidth": 1000000000,
+      "duplex": "duplexFull"
+    },
+    "Management1": {
+      "interfaceStatus": "connected",
+      "lineProtocolStatus": "up",
+      "physicalAddress": "00:1c:73:aa:03:03",
+      "description": "OOB-Mgmt",
+      "bandwidth": 1000000000,
+      "duplex": "duplexFull"
+    }
+  }
+}
+
+--- COMMAND: show lldp neighbors detail | json ---
+{
+  "lldpNeighbors": {
+    "Ethernet1": {
+      "lldpNeighborInfo": [
+        {
+          "systemName": "sw-core-01",
+          "chassisId": "0000.0caa.0202",
+          "neighborInterfaceInfo": {"interfaceId": "Gi1/0/10"},
+          "systemDescription": "Cisco IOS XE Software, WS-C3850-48P",
+          "managementAddresses": [{"address": "10.10.1.2"}]
+        }
+      ]
+    }
+  }
+}
+
+--- COMMAND: show ip route | json ---
+{
+  "vrfs": {
+    "default": {
+      "routes": {
+        "0.0.0.0/0": {
+          "routeType": "static",
+          "vias": [{"nexthopAddr": "10.10.1.1", "interface": "Management1"}]
+        },
+        "10.10.1.0/24": {
+          "routeType": "connected",
+          "vias": [{"interface": "Management1"}]
+        }
+      }
+    }
+  }
+}
+
+--- COMMAND: show ip arp | json ---
+{
+  "ipV4Neighbors": [
+    {"address": "10.10.1.1", "hwAddress": "0009.0faa.0101", "interface": "Management1"}
+  ]
+}
+
+--- COMMAND: show spanning-tree | json ---
+{
+  "spanningTreeInstances": {
+    "VL10": {
+      "rootBridge": {"priority": 4096, "macAddress": "00:00:0c:aa:02:02"},
+      "bridge": {"priority": 32768, "macAddress": "00:1c:73:aa:03:03"}
+    }
+  }
+}
+
+--- COMMAND: show mac address-table | json ---
+{
+  "unicastTable": {
+    "tableEntries": [
+      {"vlanId": 10, "macAddress": "00:00:0c:aa:02:02", "interface": "Ethernet1", "entryType": "learnedDynamic"}
+    ]
+  }
+}
+
+--- COMMAND: show running-config ---
+hostname sw-eos-01
+ip name-server 9.9.9.9
+ntp server 10.10.99.50
+!
+vlan 10
+   name Corp-LAN
+!
+interface Ethernet1
+   description Uplink to sw-core-01
+   switchport mode trunk
+   switchport trunk allowed vlan 10,20
+!
+interface Management1
+   ip address 10.10.1.31/24
+!
+ip route 0.0.0.0/0 10.10.1.1
+end

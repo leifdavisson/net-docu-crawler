@@ -1,0 +1,71 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from Cisco 891 IOS 15.0(1)M6)
+# Vendor: Cisco Systems (IOS Router)
+# PROMPT: rtr-branch-01#
+# Official CLI Reference: https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html
+
+--- COMMAND: show version ---
+Cisco IOS Software, C890 Software (C890-UNIVERSALK9-M), Version 15.0(1)M6, RELEASE SOFTWARE (fc1)
+rtr-branch-01 uptime is 7 hours, 1 minute
+cisco CISCO891-K9 (MPC8300) processor with 524288K bytes of physical memory.
+Processor board ID FTX17LAB0001
+
+--- COMMAND: show inventory ---
+NAME: "891", DESCR: "891 chassis, Hw Serial#: FTX17LAB0001, Hw Revision: 1.0"
+PID: CISCO891-K9       , VID: V02, SN: FTX17LAB0001
+
+--- COMMAND: show ip interface brief ---
+Interface                  IP-Address      OK? Method Status                Protocol
+FastEthernet0              unassigned      YES unset  up                    up
+FastEthernet1              unassigned      YES unset  down                  down
+GigabitEthernet0           unassigned      YES unset  administratively down down
+Vlan1                      10.10.2.1       YES manual up                    up
+
+--- COMMAND: show interfaces ---
+FastEthernet0 is up, line protocol is up
+  Hardware is Fast Ethernet, address is 0000.0caa.2001 (bia 0000.0caa.2001)
+  MTU 1500 bytes, BW 100000 Kbit/sec, DLY 100 usec,
+  Full-duplex, 100Mb/s
+Vlan1 is up, line protocol is up
+  Hardware is EtherSVI, address is 0000.0caa.2000 (bia 0000.0caa.2000)
+  Internet address is 10.10.2.1/24
+  MTU 1500 bytes, BW 100000 Kbit/sec, DLY 100 usec,
+
+--- COMMAND: show cdp neighbors detail ---
+-------------------------
+Device ID: rtr-mikrotik-01
+Entry address(es):
+  IP address: 10.10.2.2
+Platform: MikroTik,  Capabilities: Router
+Interface: FastEthernet0,  Port ID (outgoing port): ether1
+Holdtime : 116 sec
+
+--- COMMAND: show lldp neighbors detail ---
+% Invalid input detected at '^' marker.
+
+--- COMMAND: show ip route ---
+Gateway of last resort is 10.10.2.254 to network 0.0.0.0
+
+S*    0.0.0.0/0 [1/0] via 10.10.2.254
+C        10.10.2.0/24 is directly connected, Vlan1
+L        10.10.2.1/32 is directly connected, Vlan1
+
+--- COMMAND: show ip arp ---
+Protocol  Address          Age (min)  Hardware Addr   Type   Interface
+Internet  10.10.2.1               -   0000.0caa.2000  ARPA   Vlan1
+Internet  10.10.2.2               4   000c.42aa.0404  ARPA   Vlan1
+
+--- COMMAND: show spanning-tree ---
+VLAN1 is executing the ieee compatible Spanning Tree protocol
+  Bridge Identifier has priority 32768, address 0000.0caa.2000
+  We are the root of the spanning tree
+
+--- COMMAND: show running-config ---
+hostname rtr-branch-01
+ip domain name lab.example.invalid
+ip name-server 9.9.9.9
+!
+interface Vlan1
+ ip address 10.10.2.1 255.255.255.0
+!
+ip route 0.0.0.0 0.0.0.0 10.10.2.254
+end

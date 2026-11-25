@@ -1,0 +1,43 @@
+# Fixture provenance: SYNTHETIC-DOC-BACKED (NEEDS-DEVICE-DATA for live PAN-OS hardware)
+# Vendor: Palo Alto Networks (PAN-OS Firewall)
+# PROMPT: admin@fw-panos-01>
+# Official CLI Reference: https://docs.paloaltonetworks.com/pan-os
+
+--- COMMAND: show system info ---
+hostname: fw-panos-01
+ip-address: 10.10.5.1
+model: PA-220
+serial: 0120LAB00005
+sw-version: 10.2.9
+mac-address: 00:1b:17:aa:05:05
+
+--- COMMAND: show interface all ---
+ethernet1/1  10.10.5.1/24  up  up
+ethernet1/2  198.51.100.6/30  up  up
+
+--- COMMAND: show lldp neighbors all ---
+Interface: ethernet1/1
+System Name: sw-core-01
+Port ID: Gi1/0/12
+Management Address: 10.10.1.2
+
+--- COMMAND: show routing route ---
+0.0.0.0/0  198.51.100.5  A  ethernet1/2
+10.10.5.0/24  0.0.0.0  C  ethernet1/1
+
+--- COMMAND: show arp all ---
+10.10.5.2  00:00:0c:aa:02:02  ethernet1/1
+
+--- COMMAND: show config running ---
+<config>
+  <devices>
+    <entry name="localhost.localdomain">
+      <deviceconfig>
+        <system>
+          <hostname>fw-panos-01</hostname>
+          <dnsserver>9.9.9.9</dnsserver>
+        </system>
+      </deviceconfig>
+    </entry>
+  </devices>
+</config>

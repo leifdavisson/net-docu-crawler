@@ -1,0 +1,44 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from MikroTik CHR RouterOS 7.16.1)
+# Vendor: MikroTik (RouterOS v7)
+# PROMPT: [admin@rtr-mikrotik-01] >
+# Official CLI Reference: https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface
+
+--- COMMAND: /system identity print ---
+  name: rtr-mikrotik-01
+
+--- COMMAND: /system resource print ---
+                   uptime: 5d3h12m
+                  version: 7.16.1 (stable)
+        architecture-name: x86_64
+               board-name: CHR QEMU Standard PC
+                 platform: MikroTik
+
+--- COMMAND: /system routerboard print ---
+  serial-number: MTCHRLAB0004
+
+--- COMMAND: /interface ethernet print detail ---
+Flags: X - disabled, R - running; S - slave
+ 0 R  name="ether1" default-name="ether1" mtu=1500 mac-address=00:0C:42:AA:04:04 orig-mac-address=00:0C:42:AA:04:04 speed=1Gbps
+
+--- COMMAND: /ip address print detail ---
+Flags: X - disabled, I - invalid, D - dynamic
+ 0   address=10.10.2.2/24 network=10.10.2.0 interface=ether1 actual-interface=ether1
+
+--- COMMAND: /ip neighbor print detail ---
+ 0 interface=ether1 mac-address=00:00:0C:AA:20:01 identity="rtr-branch-01" platform="Cisco" version="15.0(1)M6" interface-name="FastEthernet0" address=10.10.2.1
+
+--- COMMAND: /ip route print detail ---
+Flags: D - dynamic; X - disabled, I - inactive, A - active; c - connect, s - static
+ 0  As  dst-address=0.0.0.0/0 gateway=10.10.2.1 gateway-status=10.10.2.1 reachable via  ether1 distance=1
+ 1  DAc dst-address=10.10.2.0/24 gateway=ether1 distance=0
+
+--- COMMAND: /ip arp print detail ---
+Flags: X - disabled, I - invalid, H - DHCP, D - dynamic, P - published, C - complete
+ 0 DC address=10.10.2.1 mac-address=00:00:0C:AA:20:01 interface=ether1
+
+--- COMMAND: /export compact ---
+/system identity set name=rtr-mikrotik-01
+/ip dns set servers=9.9.9.9
+/system ntp client set enabled=yes servers=10.10.99.50
+/ip address add address=10.10.2.2/24 interface=ether1
+/ip route add dst-address=0.0.0.0/0 gateway=10.10.2.1
