@@ -39,11 +39,15 @@ from netaddr import AddrFormatError, IPAddress, IPNetwork
 import oui_lookup
 from net_docu_crawler.schema import infer_site_code
 from net_docu_crawler.topology_resolver import (
+    _extract_device_fhrp_vips,
+    extract_vlan_id_from_interface,
     infer_interface_speed,
     is_generic_hostname,
+    is_locally_administered_mac,
     is_placeholder_serial,
     is_shared_or_virtual_mac,
     normalize_interface,
+    normalize_stp_bridge_id,
 )
 
 _INFRA_DEVICE_TYPES = frozenset({"switch", "router", "firewall", "ap", "wlc", "wireless", "gateway", "bridge"})
@@ -475,8 +479,10 @@ def _resolve_vlan_meta(
     intf_name: str,
     vlans_map: dict[str, Any],
     fallback_descs: dict[str, str],
+    intf_meta: dict[str, Any] | None = None,
+    interfaces_detail: dict[str, Any] | None = None,
 ) -> tuple[str, str, str]:
-    """Resolve ``(vlan_id, vlan_name, vlan_description)`` for an SVI interface."""
+    """Resolve ``(vlan_id, vlan_name, vlan_description)`` for an SVI or dot1Q subinterface."""
     iname = (intf_name or "").strip()
     if not iname or not isinstance(vlans_map, dict):
         return "", "", ""
@@ -487,21 +493,30 @@ def _resolve_vlan_meta(
             d = fallback_descs.get(vname.lower(), "")
         return d
 
-    m_vid = re.match(r"^(?:vlan\.?|vl|irb\.)0*(\d+)$", iname, re.IGNORECASE)
-    if m_vid:
-        vid = m_vid.group(1)
-        vinfo = vlans_map.get(vid) if isinstance(vlans_map.get(vid), dict) else {}
-        vname = str(vinfo.get("name") or "").strip().strip('"')
-        return vid, vname, _desc_for(vinfo, vname)
-
     iname_l = iname.lower()
+    iname_norm = _norm_iface(iname)
+
+    # 1. Explicit `svi_interface` mapping always wins (handles `irb.0` -> VLAN 1 and non-1:1 `irb.<unit>`)
     for vid, vinfo in vlans_map.items():
         if not isinstance(vinfo, dict):
             continue
-        svi = str(vinfo.get("svi_interface") or "").strip().lower()
-        vname = str(vinfo.get("name") or "").strip().strip('"')
-        if svi and svi == iname_l:
+        svi = str(vinfo.get("svi_interface") or "").strip()
+        if svi and (svi.lower() == iname_l or _norm_iface(svi) == iname_norm):
+            vname = str(vinfo.get("name") or "").strip().strip('"')
             return str(vid), vname, _desc_for(vinfo, vname)
+
+    # 2. Explicit metadata or multi-vendor SVI / subinterface VLAN ID extraction (rejects VLAN 0)
+    extracted_vid = extract_vlan_id_from_interface(iname, intf_meta=intf_meta, interfaces_detail=interfaces_detail)
+    if extracted_vid:
+        vinfo = vlans_map.get(extracted_vid) if isinstance(vlans_map.get(extracted_vid), dict) else {}
+        vname = str(vinfo.get("name") or "").strip().strip('"')
+        return extracted_vid, vname, _desc_for(vinfo, vname)
+
+    # 3. Named VLAN interfaces (e.g., HP ProCurve `DO`, `servers`, `Spectrun-VES`)
+    for vid, vinfo in vlans_map.items():
+        if not isinstance(vinfo, dict):
+            continue
+        vname = str(vinfo.get("name") or "").strip().strip('"')
         if vname and vname.lower() == iname_l:
             return str(vid), vname, _desc_for(vinfo, vname)
 
@@ -704,13 +719,16 @@ def _compute_stp_root_scopes(
     ]
     total_switches = len(switch_ids)
     stp_enabled_count = 0
+    root_claimant_count = 0
     rb_claims: dict[str, int] = {}
 
     for nid in switch_ids:
         stp = (dev_by_id[nid].get("stp") or {}) if nid in dev_by_id else {}
         if stp.get("enabled") is True:
             stp_enabled_count += 1
-        rb = str(stp.get("root_bridge") or "").strip().lower()
+        if stp.get("is_root") is True:
+            root_claimant_count += 1
+        rb = normalize_stp_bridge_id(str(stp.get("root_bridge") or ""))
         if rb:
             rb_claims[rb] = rb_claims.get(rb, 0) + 1
 
@@ -723,21 +741,20 @@ def _compute_stp_root_scopes(
             continue
 
         stp = (dev_by_id[nid].get("stp") or {}) if nid in dev_by_id else {}
-        rb = str(stp.get("root_bridge") or "").strip().lower()
+        rb = normalize_stp_bridge_id(str(stp.get("root_bridge") or ""))
         is_root = bool(stp.get("is_root"))
+        raw_scope = str(stp.get("root_scope") or "").strip().lower()
         scope: str
 
-        if stp.get("is_isolated_self_root") is True:
+        if stp.get("is_isolated_self_root") is True or raw_scope == "isolated_self_root":
             scope = "isolated_self_root"
-        elif stp.get("is_verified_campus_root") is True:
+        elif stp.get("is_verified_campus_root") is True or raw_scope == "campus_root":
             scope = "campus_root"
         elif is_root:
             if rb and rb_claims.get(rb, 0) >= 2:
                 scope = "campus_root"
-            elif total_switches == 2 and stp_enabled_count >= 2:
+            elif not rb and total_switches == 2 and stp_enabled_count >= 2 and root_claimant_count == 1:
                 scope = "campus_root"
-            elif total_switches > 2:
-                scope = "isolated_self_root"
             else:
                 scope = "isolated_self_root"
         elif stp.get("enabled") is True:
@@ -1237,25 +1254,25 @@ def _build_l3_graph(
     l3_conflicts: list[dict[str, Any]] = []
     seen_conflict_keys: set[tuple[str, str, str, tuple[str, ...]]] = set()
 
-    # 3a. Intra-device overlap (only within the SAME VRF on the same device)
+    # 3a. Intra-device overlap (only within the SAME VRF on the same device, explicit masks, distinct normalized interfaces)
     for l3_nid, ifaces in node_ifaces.items():
         vrf_name = l3_nodes_by_id[l3_nid]["vrf"]
         for i in range(len(ifaces)):
             for j in range(i + 1, len(ifaces)):
                 a, b = ifaces[i], ifaces[j]
-                if a["version"] != b["version"]:
+                if a["version"] != b["version"] or not (a["mask_known"] and b["mask_known"]):
                     continue
                 host_len = 128 if a["version"] == 6 else 32
                 if a["net"].prefixlen == host_len or b["net"].prefixlen == host_len:
                     continue
                 if a["net"] in b["net"] or b["net"] in a["net"]:
-                    if a["interface"] == b["interface"]:
+                    if _norm_iface(a["interface"]) == _norm_iface(b["interface"]):
                         continue
                     ck = (
                         "intra_device_overlap",
                         vrf_name,
                         a["cidr"],
-                        tuple(sorted((l3_nid, a["interface"], b["interface"]))),
+                        tuple(sorted((l3_nid, _norm_iface(a["interface"]), _norm_iface(b["interface"])))),
                     )
                     if ck not in seen_conflict_keys:
                         seen_conflict_keys.add(ck)
@@ -1276,7 +1293,12 @@ def _build_l3_graph(
                             }
                         )
 
-    # 3b. Cross-device duplicate gateway IPs & overlapping subnets (scoped per VRF)
+    # 3b. Cross-device duplicate gateway IPs & overlapping subnets (scoped per VRF, exempting shared FHRP VIPs)
+    fhrp_vips_by_l3_nid: dict[str, set[str]] = {}
+    for l3_nid, l3n in l3_nodes_by_id.items():
+        raw_d = dev_by_id.get(l3n.get("device_id") or l3_nid)
+        fhrp_vips_by_l3_nid[l3_nid] = _extract_device_fhrp_vips(raw_d) if isinstance(raw_d, dict) else set()
+
     dup_ip_groups: dict[tuple[str, str], list[tuple[str, dict[str, Any]]]] = {}
     for l3_nid, ifaces in node_ifaces.items():
         vrf_name = l3_nodes_by_id[l3_nid]["vrf"]
@@ -1287,6 +1309,8 @@ def _build_l3_graph(
     for (vrf_name, dup_ip), occs in sorted(dup_ip_groups.items()):
         distinct_nids = sorted({nid for nid, _ in occs})
         if len(distinct_nids) < 2:
+            continue
+        if all(dup_ip in fhrp_vips_by_l3_nid.get(nid, set()) for nid in distinct_nids):
             continue
         cidrs = sorted({it["cidr"] for _, it in occs})
         primary_cidr = cidrs[0]
@@ -1517,14 +1541,12 @@ def _build_l3_graph(
             shared_gw = default_route_target.get(nid_a) and default_route_target.get(nid_a) == default_route_target.get(
                 nid_b
             )
-            num_peers = len(cidr_participants.get((vrf_name, broad_cidr), set()))
             max_site_pfx = 64 if a["version"] == 6 else 24
             if (
                 not same_site
                 and not pair_l2
                 and not has_route_link
                 and not shared_gw
-                and num_peers <= 2
                 and a["net"].prefixlen == b["net"].prefixlen
                 and a["net"].prefixlen <= max_site_pfx
             ):
@@ -1553,9 +1575,6 @@ def _build_l3_graph(
     for (vrf_name, _broad_cidr), pairs in overlap_by_cidr.items():
         participants = sorted({nid for nid_a, _, nid_b, _ in pairs for nid in (nid_a, nid_b)})
         for nid_a, a, nid_b, b in pairs:
-            has_explicit_route = bool(routes_via_pair.get((nid_a, nid_b)) or routes_via_pair.get((nid_b, nid_a)))
-            if len(participants) >= 3 and not has_explicit_route:
-                continue
             if a["mask_known"] and not b["mask_known"]:
                 tight_cidr = a["cidr"]
             elif b["mask_known"] and not a["mask_known"]:
@@ -1575,6 +1594,8 @@ def _build_l3_graph(
                 ck = ("mask_mismatch", vrf_name, tight_cidr, tuple(sorted((nid_a, nid_b))))
                 if ck not in seen_conflict_keys:
                     seen_conflict_keys.add(ck)
+                    l3_nodes_by_id[nid_a]["has_conflict"] = True
+                    l3_nodes_by_id[nid_b]["has_conflict"] = True
                     l3_conflicts.append(
                         {
                             "conflict_type": "mask_mismatch",
@@ -1591,6 +1612,9 @@ def _build_l3_graph(
                     )
             else:
                 detail = ""
+            has_explicit_route = bool(routes_via_pair.get((nid_a, nid_b)) or routes_via_pair.get((nid_b, nid_a)))
+            if len(participants) >= 3 and not has_explicit_route:
+                continue
             vlan_id = a.get("vlan_id") or b.get("vlan_id") or ""
             _add_l3_link(
                 nid_a,
@@ -1836,6 +1860,7 @@ def build_topology_graph_model(
     crawled_hosts_lc: set[str] = set()
     crawled_ips: set[str] = set()
     crawled_macs: set[str] = set()
+    mac_to_node_id: dict[str, str] = {}
 
     # Count short hostnames across crawled infra to guard ambiguous generic defaults (e.g. dual MikroTik/OpenWrt)
     short_host_counts: dict[str, int] = {}
@@ -1897,7 +1922,9 @@ def build_topology_graph_model(
                 continue
             crawled_ips.add(clean_ip)
             cidr = f"{net.network}/{net.prefixlen}" if net else clean_ip
-            vid, vname, vdesc = _resolve_vlan_meta(intf_name, vlans_map, fallback_descs)
+            vid, vname, vdesc = _resolve_vlan_meta(
+                intf_name, vlans_map, fallback_descs, intf_meta=intf, interfaces_detail=ints
+            )
             l3_subs.append(
                 {
                     "interface": intf_name,
@@ -1922,10 +1949,14 @@ def build_topology_graph_model(
         base_mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
         if base_mac and not is_shared_or_virtual_mac(base_mac):
             crawled_macs.add(base_mac)
+            if not (is_locally_administered_mac(base_mac) and base_mac in mac_to_node_id):
+                mac_to_node_id.setdefault(base_mac, node_id)
         for istats in ints.values():
             imac = oui_lookup.normalize_mac(str((istats or {}).get("mac_address") or "")).lower().strip()
             if imac and not is_shared_or_virtual_mac(imac):
                 crawled_macs.add(imac)
+                if not (is_locally_administered_mac(imac) and imac in mac_to_node_id):
+                    mac_to_node_id.setdefault(imac, node_id)
 
         if not is_ambiguous_host:
             crawled_hosts_lc.add(short_lc)
@@ -2153,7 +2184,9 @@ def build_topology_graph_model(
                     dst_id = (
                         host_to_id.get(ap_host.lower())
                         or host_to_id.get(ap_ip)
-                        or host_to_id.get(remote_raw.lower(), "")
+                        or host_to_id.get(remote_raw.lower())
+                        or (mac_to_node_id.get(ap_mac) if ap_mac else "")
+                        or ""
                     )
                     if dst_id and dst_id in nodes_by_id:
                         c_ap = nodes_by_id[dst_id]
@@ -2225,15 +2258,16 @@ def build_topology_graph_model(
                         )
                 continue
 
-            # Resolve infra peer ID
+            # Resolve infra peer ID (matching hostname, IP, chassis MAC, and per-interface MAC)
             if cls == "crawled_infra":
                 r_short = _short_hostname(remote_raw).lower()
                 rip = str(n.get("remote_ip") or "").strip()
-                rmac = _extract_neighbor_mac(remote_raw, n)
+                rmac = _extract_neighbor_mac(remote_raw, n) or _extract_neighbor_mac(rp, {})
                 dst_id = (
                     host_to_id.get(r_short)
                     or host_to_id.get(remote_raw.lower())
                     or (host_to_id.get(rip) if rip else None)
+                    or (mac_to_node_id.get(rmac) if rmac else None)
                     or ""
                 )
                 if not dst_id and rmac:

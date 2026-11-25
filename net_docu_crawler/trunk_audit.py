@@ -142,6 +142,28 @@ _AP_PLATFORM_RE = re.compile(
 
 _INFRA_DEVICE_TYPES: frozenset[str] = frozenset({"switch", "router", "firewall", "wlc", "bridge"})
 
+_NON_TRUNK_L2_ACCURACY: frozenset[str] = frozenset(
+    {
+        "mac_inferred",
+        "l3_next_hop_egress",
+        "wan_carrier_arp_route",
+        "virtual_passthrough",
+        "multi_neighbor_port",
+    }
+)
+
+_NON_TRUNK_TRANSPORT_TYPES: frozenset[str] = frozenset(
+    {
+        "mac_inferred",
+        "l3_egress",
+        "metro_ethernet",
+        "wan_carrier",
+        "virtual_passthrough",
+    }
+)
+
+_FREEBSD_VLAN_IF_RE = re.compile(r"^([a-zA-Z0-9/_-]+)_vlan0*([1-9]\d{0,3})$", re.IGNORECASE)
+
 _SKIPPED_RECORD_CLASSES: frozenset[str] = frozenset(
     {"unauthenticated_infra", "unsupported_appliance", "passive_endpoint"}
 )
@@ -646,12 +668,60 @@ def _collect_raw_config_subinterfaces(
             grp["vlans"].add(vid)
 
 
+def _is_non_trunk_neighbor(nbr: dict) -> bool:
+    """Return True if a neighbor observation is synthetic/inferred/L3/WAN-mux rather than a direct L2 link."""
+    acc = str(nbr.get("l2_accuracy") or "").strip().lower()
+    if acc in _NON_TRUNK_L2_ACCURACY:
+        return True
+    tt = str(nbr.get("transport_type") or "").strip().lower()
+    return tt in _NON_TRUNK_TRANSPORT_TYPES
+
+
+def _collect_l3_and_detail_subinterfaces(
+    l3_interfaces: list[dict] | None,
+    interfaces_detail: dict | None,
+    merged: dict[str, dict],
+    sub_groups: dict[str, dict[str, object]],
+) -> None:
+    """Synthesize OPNsense/FreeBSD `_vlan<N>` and dot1Q `.N` subinterfaces from L3/interface tables."""
+    candidate_names: list[str] = []
+    for item in l3_interfaces or []:
+        if isinstance(item, dict) and item.get("interface"):
+            candidate_names.append(str(item["interface"]).strip())
+    for ik in (interfaces_detail or {}).keys():
+        if ik:
+            candidate_names.append(str(ik).strip())
+
+    for raw_name in candidate_names:
+        m_bsd = _FREEBSD_VLAN_IF_RE.match(raw_name)
+        if m_bsd:
+            parent_raw, vid_str = m_bsd.group(1), m_bsd.group(2)
+        else:
+            m_dot = re.match(r"^([a-zA-Z][a-zA-Z0-9/_-]*\d+)\.0*([1-9]\d{0,3})$", raw_name)
+            if not m_dot:
+                continue
+            parent_raw, vid_str = m_dot.group(1), m_dot.group(2)
+            if parent_raw.lower() in {"vlan", "vl", "irb", "bvi", "lo"}:
+                continue
+        vid = int(vid_str)
+        if not (1 <= vid <= 4094):
+            continue
+        parent = canonicalize_interface_full(parent_raw)
+        if not parent or _is_pseudo_or_svi_interface(parent) or _has_existing_subinterface_bundle(merged, parent):
+            continue
+        grp = sub_groups.setdefault(parent, {"vlans": set(), "native": None})
+        assert isinstance(grp["vlans"], set)
+        grp["vlans"].add(vid)
+
+
 def _synthesize_subinterface_profiles(
     raw_profiles: dict[str, dict],
     raw_config: str,
+    l3_interfaces: list[dict] | None = None,
+    interfaces_detail: dict | None = None,
 ) -> dict[str, dict]:
     """
-    Collapse 802.1Q router-on-a-stick subinterfaces (e.g. `Gi0/0.10`, `ge-0/0/1.10`)
+    Collapse 802.1Q router-on-a-stick subinterfaces (e.g. `Gi0/0.10`, `ge-0/0/1.10`, `vtnet0_vlan10`)
     into virtual parent port profiles (`is_subinterface_bundle=True`) if not already merged.
     """
     merged: dict[str, dict] = {k: dict(v) for k, v in raw_profiles.items() if isinstance(v, dict)}
@@ -659,6 +729,7 @@ def _synthesize_subinterface_profiles(
 
     _collect_profile_subinterfaces(merged, sub_groups)
     _collect_raw_config_subinterfaces(raw_config, merged, sub_groups)
+    _collect_l3_and_detail_subinterfaces(l3_interfaces, interfaces_detail, merged, sub_groups)
 
     for parent, grp in sub_groups.items():
         vlans_set = grp["vlans"]
@@ -754,6 +825,9 @@ def _resolve_native_vlan_and_tagging(
             return None, True if explicit_tagged is None else bool(explicit_tagged)
         return 1, tag_flag
 
+    if oper_mode == "routed" or admin_mode == "routed":
+        return None, False
+
     acc_str = str(prof.get("access_vlan") or "").strip()
     if acc_str.isdigit():
         return int(acc_str), False
@@ -825,7 +899,7 @@ def _canonicalize_device_port_maps(
 
     neighbors_by_port: dict[str, list[dict]] = {}
     for nbr in neighbors or []:
-        if not isinstance(nbr, dict):
+        if not isinstance(nbr, dict) or _is_non_trunk_neighbor(nbr):
             continue
         raw_lp = str(nbr.get("local_port") or "").strip()
         if not raw_lp:
@@ -844,6 +918,7 @@ def _resolve_port_modes_and_encap(
     stats: dict,
     member_ports: list[str],
     stats_by_canon: dict[str, dict],
+    is_l3_routed_port: bool = False,
 ) -> tuple[str, str, str, bool, bool]:
     """Determine `(admin_mode, oper_mode, encapsulation, qinq, is_sub_bundle)` for a switchport."""
     is_sub_bundle = bool(prof.get("is_subinterface_bundle", False))
@@ -858,7 +933,12 @@ def _resolve_port_modes_and_encap(
         admin_mode = "dynamic_desirable"
     elif raw_admin == "trunk" or is_sub_bundle:
         admin_mode = "trunk"
-    elif raw_admin == "routed":
+    elif raw_admin == "routed" or (
+        is_l3_routed_port
+        and raw_admin in {"", "unknown"}
+        and not prof.get("trunk_allowed_vlans")
+        and not prof.get("access_vlan")
+    ):
         admin_mode = "routed"
     else:
         admin_mode = "access"
@@ -1032,6 +1112,7 @@ def _build_base_port_state(
     configured_vlan_ids: set[int],
     vlan_name_map: dict[str, int],
     has_explicit_vlan_db: bool,
+    is_l3_routed_port: bool = False,
 ) -> TrunkPortState:
     """Build the unattached base `TrunkPortState` for a single canonical device port."""
     admin_mode, oper_mode, encapsulation, qinq, is_sub_bundle = _resolve_port_modes_and_encap(
@@ -1039,6 +1120,7 @@ def _build_base_port_state(
         stats=stats,
         member_ports=member_ports,
         stats_by_canon=stats_by_canon,
+        is_l3_routed_port=is_l3_routed_port,
     )
     native_vlan, native_vlan_tagged = _resolve_native_vlan_and_tagging(
         prof=prof,
@@ -1101,12 +1183,33 @@ def extract_device_trunk_states(dev: dict) -> list[TrunkPortState]:
     raw_config = str(dev.get("raw_config") or "")
 
     configured_vlan_ids, vlan_name_map, has_explicit_vlan_db = _parse_device_vlans(dev)
-    synthesized_profiles = _synthesize_subinterface_profiles(_extract_raw_port_profiles(dev), raw_config)
+    l3_interfaces = dev.get("l3_interfaces") or []
+    interfaces_detail = dev.get("interfaces_detail") or {}
+    synthesized_profiles = _synthesize_subinterface_profiles(
+        _extract_raw_port_profiles(dev),
+        raw_config,
+        l3_interfaces=l3_interfaces,
+        interfaces_detail=interfaces_detail,
+    )
     member_to_lag = _collect_device_lag_member_map({"port_profiles": synthesized_profiles})
+
+    l3_direct_ports: set[str] = set()
+    for l3_item in l3_interfaces:
+        if not isinstance(l3_item, dict):
+            continue
+        raw_if = str(l3_item.get("interface") or "").strip()
+        raw_ip = str(l3_item.get("ip_address") or "").strip()
+        if not raw_if or not raw_ip or raw_ip.lower() in {"unassigned", "unset", "n/a", "down", "up"}:
+            continue
+        if _FREEBSD_VLAN_IF_RE.match(raw_if) or re.match(r"^[^.\s]+\.[1-9]\d*$", raw_if):
+            continue
+        c_if = canonicalize_interface_full(raw_if)
+        if c_if and not _is_pseudo_or_svi_interface(c_if):
+            l3_direct_ports.add(c_if)
 
     profiles_by_canon, stats_by_canon, lag_members_by_parent, neighbors_by_port = _canonicalize_device_port_maps(
         synthesized_profiles=synthesized_profiles,
-        interfaces_detail=dev.get("interfaces_detail") or {},
+        interfaces_detail=interfaces_detail,
         neighbors=dev.get("neighbors") or [],
         member_to_lag=member_to_lag,
     )
@@ -1130,6 +1233,7 @@ def extract_device_trunk_states(dev: dict) -> list[TrunkPortState]:
             configured_vlan_ids=configured_vlan_ids,
             vlan_name_map=vlan_name_map,
             has_explicit_vlan_db=has_explicit_vlan_db,
+            is_l3_routed_port=port_canon in l3_direct_ports,
         )
         states.extend(_build_port_neighbor_states(base_state, neighbors_by_port.get(port_canon, [])))
 
@@ -1147,7 +1251,7 @@ def _is_trunk_like(state: TrunkPortState) -> bool:
 
 
 def _classify_neighbor_endpoint(nbr: dict, peer_dev: dict | None = None) -> str:
-    """Classify a neighbor into `'peripheral'`, `'ap'`, or `'infra'`."""
+    """Classify a neighbor into `'peripheral'`, `'ap'`, or `'infra'` aligned with `topology_renderer`."""
     if peer_dev is not None:
         p_dtype = str(peer_dev.get("device_type") or peer_dev.get("device_persona") or "").strip().lower()
         if p_dtype in _AP_TYPES:
@@ -1162,11 +1266,35 @@ def _classify_neighbor_endpoint(nbr: dict, peer_dev: dict | None = None) -> str:
 
     dtype = str(nbr.get("device_type") or "").strip().lower()
     plat = str(nbr.get("platform") or nbr.get("remote_platform") or "").strip().lower()
+    raw_name = str(nbr.get("remote_device") or nbr.get("remote_ip") or "").strip()
 
     if dtype in _EDGE_PERIPHERAL_TYPES or any(kw in plat for kw in _PERIPHERAL_PLATFORM_KEYWORDS):
         return "peripheral"
     if dtype in _AP_TYPES or _AP_PLATFORM_RE.search(plat):
         return "ap"
+
+    if raw_name or nbr:
+        from net_docu_crawler.topology_renderer import _HP_PRINTER_PC_RE, _is_explicit_endpoint, classify_neighbor_node
+
+        node_cls = classify_neighbor_node(raw_name, nbr)
+        if node_cls == "ap":
+            return "ap"
+        if node_cls in {"crawled_infra", "firewall", "router", "isp", "uncrawled_switch"}:
+            return "infra"
+        # node_cls == "endpoint": mark peripheral when explicit endpoint/OUI/hostname/port evidence exists
+        rport_l = str(nbr.get("remote_port") or "").strip().lower()
+        caps_l = str(nbr.get("capabilities") or nbr.get("system_capabilities") or "").strip().lower()
+        rmac = oui_lookup.normalize_mac(str(nbr.get("remote_mac") or "")).lower().strip()
+        oui_l = (oui_lookup.lookup_oui(rmac) or "").lower() if rmac else ""
+        if oui_l == "unknown":
+            oui_l = ""
+        hay = f"{raw_name.lower()} {plat} {oui_l}"
+        if _HP_PRINTER_PC_RE.search(hay) or _is_explicit_endpoint(raw_name.lower(), rport_l, hay, dtype, caps_l):
+            return "peripheral"
+        if oui_l and not any(
+            k in oui_l for k in ("cisco", "juniper", "arista", "fortinet", "palo alto", "hewlett", "aruba", "mikrotik")
+        ):
+            return "peripheral"
     return "infra"
 
 
@@ -1408,7 +1536,7 @@ def _collect_neighbor_observations(
         if not l_host:
             continue
         for nbr in dev.get("neighbors") or []:
-            if not isinstance(nbr, dict):
+            if not isinstance(nbr, dict) or _is_non_trunk_neighbor(nbr):
                 continue
             raw_lp = str(nbr.get("local_port") or "").strip()
             if not raw_lp:
