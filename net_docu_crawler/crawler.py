@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -31,9 +32,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+
+import paramiko
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 import oui_lookup
 import report_generator
@@ -43,6 +49,7 @@ from net_docu_crawler.drivers import (
     CiscoDriver,
     FortinetDriver,
     JuniperDriver,
+    canonicalize_vendor,
     resolve_driver_for_vendor,
     resolve_vendor_for_driver,
 )
@@ -53,10 +60,12 @@ from net_docu_crawler.drivers.detector import (
     get_arp_table_entries,
     get_mac_from_system_arp,
     infer_vendor_from_http,
+    inspect_prompt_os,
     is_hypervisor_mac,
     probe_appliance_ports,
     probe_http_fingerprint,
     probe_snmp_sysinfo,
+    resolve_prompt_vendor,
     scan_subnet_ports,
 )
 from net_docu_crawler.topology_resolver import DeviceRegistry
@@ -64,6 +73,35 @@ from net_docu_crawler.topology_resolver import DeviceRegistry
 logger = logging.getLogger(__name__)
 
 _VIRTUAL_IFACE_PREFIXES = ("lo", "docker", "br-", "veth", "virbr", "tun", "tap", "wg", "tailscale")
+
+
+def _parse_bsd_ifconfig_subnets(stdout: str) -> list[str]:
+    """Parse active non-virtual IPv4 subnets from macOS / BSD `ifconfig` output."""
+    subnets: list[str] = []
+    cur_iface = ""
+    for line in stdout.splitlines():
+        m_if = re.match(r"^([A-Za-z0-9_.-]+):\s+flags=", line)
+        if m_if:
+            cur_iface = m_if.group(1)
+            continue
+        if not cur_iface or cur_iface.startswith(_VIRTUAL_IFACE_PREFIXES):
+            continue
+        m_inet = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]{8}|\d+\.\d+\.\d+\.\d+)", line)
+        if not m_inet:
+            continue
+        ip_str, mask_raw = m_inet.group(1), m_inet.group(2)
+        try:
+            if mask_raw.lower().startswith("0x"):
+                mask_int = int(mask_raw, 16)
+                mask_str = str(ipaddress.IPv4Address(mask_int))
+            else:
+                mask_str = mask_raw
+            net = ipaddress.IPv4Interface(f"{ip_str}/{mask_str}").network
+            if 22 <= net.prefixlen <= 31 and not net.is_loopback and str(net) not in subnets:
+                subnets.append(str(net))
+        except ValueError as exc:
+            logger.debug("Skipping invalid BSD/macOS IPv4 interface %s/%s: %s", ip_str, mask_raw, exc)
+    return subnets
 
 
 def detect_local_subnets() -> list[str]:
@@ -86,7 +124,7 @@ def detect_local_subnets() -> list[str]:
                     if m_mask and cur_ip:
                         try:
                             net = ipaddress.IPv4Interface(f"{cur_ip}/{m_mask.group(1)}").network
-                            if 22 <= net.prefixlen <= 30 and not net.is_loopback and str(net) not in subnets:
+                            if 22 <= net.prefixlen <= 31 and not net.is_loopback and str(net) not in subnets:
                                 subnets.append(str(net))
                         except ValueError as exc:
                             logger.debug(
@@ -94,14 +132,17 @@ def detect_local_subnets() -> list[str]:
                             )
                         cur_ip = ""
         else:
-            proc = subprocess.run(
-                ["ip", "-o", "-4", "addr", "show", "scope", "global"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if proc.returncode == 0:
+            try:
+                proc = subprocess.run(
+                    ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except FileNotFoundError:
+                proc = None
+            if proc is not None and proc.returncode == 0:
                 for line in proc.stdout.splitlines():
                     parts = line.split()
                     if len(parts) < 4 or "inet" not in parts:
@@ -115,29 +156,97 @@ def detect_local_subnets() -> list[str]:
                     cidr = parts[inet_idx + 1]
                     try:
                         net = ipaddress.IPv4Interface(cidr).network
-                        if 22 <= net.prefixlen <= 30 and str(net) not in subnets:
+                        if 22 <= net.prefixlen <= 31 and str(net) not in subnets:
                             subnets.append(str(net))
                     except ValueError as exc:
                         logger.debug("Skipping invalid local IPv4 CIDR %r: %s", cidr, exc)
+            if not subnets:
+                ifc_proc = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=3, check=False)
+                if ifc_proc.returncode == 0:
+                    subnets.extend(_parse_bsd_ifconfig_subnets(ifc_proc.stdout))
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("Local subnet auto-detection failed: %s", exc)
     return subnets[:1] if subnets else ["192.168.1.0/24"]
 
 
-DEFAULT_TARGETS = (
-    [t.strip() for t in os.environ["NET_DOCU_TARGETS"].split(",") if t.strip()]
-    if os.environ.get("NET_DOCU_TARGETS")
-    else detect_local_subnets()
-)
+def get_default_targets() -> list[str]:
+    """Resolve default crawl targets from `NET_DOCU_TARGETS` or lazy local subnet detection."""
+    env_targets = os.environ.get("NET_DOCU_TARGETS", "")
+    if env_targets.strip():
+        return [t.strip() for t in env_targets.split(",") if t.strip()]
+    return detect_local_subnets()
 
 
-def expand_targets(targets: list[str], max_hosts_per_cidr: int = 256) -> list[str]:
+class _LazyDefaultTargets(list):
     """
-    Expands individual IP addresses, hostnames, and CIDR subnets (e.g., 172.16.1.0/24).
-    Prevents accidental explosion of large network masks (/16 or /8).
+    List subclass that defers `detect_local_subnets()` subprocess execution until
+    default targets are actually read, keeping module import side-effect-free.
     """
-    expanded = []
-    seen = set()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._loaded = False
+
+    def _ensure(self) -> None:
+        if not self._loaded:
+            self._loaded = True
+            super().clear()
+            super().extend(get_default_targets())
+
+    def __iter__(self):
+        self._ensure()
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        self._ensure()
+        return super().__len__()
+
+    def __getitem__(self, index):
+        self._ensure()
+        return super().__getitem__(index)
+
+    def __bool__(self) -> bool:
+        self._ensure()
+        return super().__len__() > 0
+
+    def __eq__(self, other: object) -> bool:
+        self._ensure()
+        return super().__eq__(other)
+
+    def __repr__(self) -> str:
+        self._ensure()
+        return super().__repr__()
+
+    def copy(self) -> list[str]:
+        self._ensure()
+        return list(super().__iter__())
+
+
+DEFAULT_TARGETS: list[str] = _LazyDefaultTargets()
+
+
+def _try_canonical_ip(raw_host: str) -> str | None:
+    """Return canonical IPv4/IPv6 literal string if `raw_host` is a valid IP address, else None."""
+    s = (raw_host or "").strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    if not s or "/" in s:
+        return None
+    base, sep, zone = s.partition("%")
+    try:
+        addr = ipaddress.ip_address(base)
+    except ValueError:
+        return None
+    return f"{addr}%{zone}" if sep and zone and addr.version == 6 else str(addr)
+
+
+def expand_targets(targets: list[str], max_hosts_per_cidr: int = 1024) -> list[str]:
+    """
+    Expands individual IP addresses, hostnames, and CIDR subnets (e.g., 172.16.1.0/24, /23, /22, /31, /32).
+    Prevents accidental explosion of large network masks (/16 or /8) and drops malformed CIDRs.
+    """
+    expanded: list[str] = []
+    seen: set[str] = set()
 
     for item in targets:
         item = item.strip()
@@ -162,15 +271,15 @@ def expand_targets(targets: list[str], max_hosts_per_cidr: int = 256) -> list[st
                         seen.add(ip_str)
                         expanded.append(ip_str)
                         count += 1
-            except Exception as e:
-                print(f"[!] Failed to parse CIDR {item}: {e}. Retaining as literal target.")
-                if item not in seen:
-                    seen.add(item)
-                    expanded.append(item)
+            except ValueError as e:
+                print(f"[!] Failed to parse CIDR {item}: {e}. Skipping invalid CIDR target.")
+                logger.warning("Skipping invalid CIDR target %r: %s", item, e)
         else:
-            if item not in seen:
-                seen.add(item)
-                expanded.append(item)
+            canon_ip = _try_canonical_ip(item)
+            target_val = canon_ip if canon_ip is not None else item
+            if target_val not in seen:
+                seen.add(target_val)
+                expanded.append(target_val)
 
     return expanded
 
@@ -180,6 +289,17 @@ def load_credentials(path: str = "credentials.json") -> list[dict]:
         return []
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _normalize_vendor_tag(raw_vendor: str | None) -> str:
+    """Resolve a vendor tag or alias to its canonical key in `VENDOR_DRIVER_MAP`, or `""` if unknown."""
+    norm = (raw_vendor or "").strip().lower()
+    if not norm:
+        return ""
+    if norm in VENDOR_DRIVER_MAP:
+        drv_cls = VENDOR_DRIVER_MAP[norm]
+        return resolve_vendor_for_driver(drv_cls) or norm
+    return canonicalize_vendor(norm)
 
 
 def validate_credentials(entries: object, source: str = "credentials.json") -> tuple[list[dict], list[str], list[str]]:
@@ -195,6 +315,7 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
         errors.append(f"{source}: top-level JSON must be a list of credential objects, got {type(entries).__name__}.")
         return valid_entries, warnings, errors
 
+    known_keys = {"name", "vendor", "username", "password", "secret", "enable_secret"}
     seen: dict[tuple[str, str, str, str], str] = {}
     for idx, item in enumerate(entries):
         label = f"{source}[{idx}]"
@@ -206,10 +327,17 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
         if not isinstance(name, str) or not name.strip():
             name = label
 
+        for extra_k in item:
+            if extra_k not in known_keys:
+                warnings.append(
+                    f"{name}: unrecognized key '{extra_k}' (expected name, vendor, username, password, secret)."
+                )
+
         username = item.get("username")
         if not isinstance(username, str) or not username.strip():
             errors.append(f"{name}: missing or empty 'username' string.")
             continue
+        username_clean = username.strip()
 
         password = item.get("password", "")
         if not isinstance(password, str):
@@ -223,31 +351,48 @@ def validate_credentials(entries: object, source: str = "credentials.json") -> t
             errors.append(f"{name}: 'secret' must be a string, got {type(secret).__name__}.")
             continue
 
+        has_legacy_enable_secret = "enable_secret" in item
+        legacy_secret = item.get("enable_secret", "")
+        if legacy_secret is None:
+            legacy_secret = ""
+        if not isinstance(legacy_secret, str):
+            errors.append(f"{name}: 'enable_secret' must be a string, got {type(legacy_secret).__name__}.")
+            continue
+        if has_legacy_enable_secret:
+            warnings.append(f"{name}: 'enable_secret' is deprecated; use canonical 'secret' instead.")
+        if secret and legacy_secret and secret != legacy_secret:
+            errors.append(f"{name}: conflicting 'secret' and 'enable_secret' values; use 'secret' only.")
+            continue
+        effective_secret = secret or legacy_secret
+
         vendor = item.get("vendor", "")
         if vendor is None:
             vendor = ""
         if not isinstance(vendor, str):
             errors.append(f"{name}: 'vendor' must be a string, got {type(vendor).__name__}.")
             continue
-        vendor_norm = vendor.strip().lower()
-        if vendor_norm and vendor_norm not in VENDOR_DRIVER_MAP:
+        vendor_raw = vendor.strip().lower()
+        vendor_canon = _normalize_vendor_tag(vendor_raw)
+        if vendor_raw and not vendor_canon:
             warnings.append(
                 f"{name}: unknown vendor tag '{vendor}' (not in VENDOR_DRIVER_MAP; will not get vendor-priority sorting)."
             )
+        vendor_norm = vendor_canon or vendor_raw
 
-        dedup_key = (vendor_norm, username, password, secret)
+        dedup_key = (vendor_norm, username_clean, password, effective_secret)
         if dedup_key in seen:
             warnings.append(
-                f"{name}: duplicate of '{seen[dedup_key]}' (vendor={vendor_norm or 'any'}, username={username!r}) — skipping."
+                f"{name}: duplicate of '{seen[dedup_key]}' (vendor={vendor_norm or 'any'}, username={username_clean!r}) — skipping."
             )
             continue
         seen[dedup_key] = name
 
         normalized = dict(item)
-        normalized["username"] = username
+        normalized.pop("enable_secret", None)
+        normalized["username"] = username_clean
         normalized["password"] = password
-        if "secret" in item or secret:
-            normalized["secret"] = secret
+        if "secret" in item or has_legacy_enable_secret or effective_secret:
+            normalized["secret"] = effective_secret
         if vendor_norm:
             normalized["vendor"] = vendor_norm
         valid_entries.append(normalized)
@@ -297,13 +442,37 @@ def load_and_validate_credentials(
     return all_raw, warnings, errors
 
 
-def _log_event(log_path: str, msg: str):
+_LOG_EVENT_LOCK = threading.Lock()
+_INLINE_SECRET_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|pwd|secret|enable_secret|passphrase|community|token|api[_-]?key|auth[_-]?pwd|priv[_-]?pwd|pre-shared-key)\s*[=:]\s*)(\S+)"
+)
+_PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def _scrub_log_message(msg: str, secrets: Iterable[str] = ()) -> str:
+    """Redact inline secret key/value pairs, private keys, and known credential literals from event logs."""
+    if not msg:
+        return ""
+    scrubbed = _PEM_BLOCK_RE.sub("<REDACTED_PRIVATE_KEY>", str(msg))
+    scrubbed = _INLINE_SECRET_RE.sub(r"\1<REDACTED>", scrubbed)
+    unique_secrets = sorted({s for s in secrets if isinstance(s, str) and s}, key=len, reverse=True)
+    for secret_val in unique_secrets:
+        scrubbed = scrubbed.replace(secret_val, "<REDACTED>")
+    return scrubbed
+
+
+def _log_event(log_path: str, msg: str, secrets: Iterable[str] = ()):
     if not log_path:
         return
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_msg = _scrub_log_message(msg, secrets=secrets)
     try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
+        with _LOG_EVENT_LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {safe_msg}\n")
     except OSError as exc:
         logger.debug("Failed to append crawler event to %s: %s", log_path, exc)
 
@@ -335,31 +504,90 @@ def parse_target_specs(
     telnet_ports: list[int] | None = None,
 ) -> tuple[list[str], dict[str, list[tuple[int, str]]]]:
     """
-    Parse target specifications supporting plain IPs, CIDRs, and `ip:port` syntax.
+    Parse target specifications supporting plain IPv4/IPv6 addresses, CIDRs,
+    `host:port`, and bracketed `[ipv6]:port` syntax. Validates ports in 1..65535.
     Returns `(expanded_ips, explicit_ports_by_ip)`.
     """
-    ssh_set = set(ssh_ports or [22])
-    telnet_set = set(telnet_ports or [23])
+    eff_ssh = ssh_ports if ssh_ports is not None else [22]
+    eff_telnet = telnet_ports if telnet_ports is not None else [23]
+    ssh_set = {p for p in eff_ssh if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535}
+    telnet_set = {p for p in eff_telnet if isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535}
+    default_telnet_23 = telnet_ports is None
     expanded_ips: list[str] = []
     seen_ips: set[str] = set()
     explicit_ports: dict[str, list[tuple[int, str]]] = {}
+
+    def _add_explicit(host_val: str, port_num: int) -> None:
+        transport = (
+            "telnet"
+            if (port_num in telnet_set or (default_telnet_23 and port_num == 23)) and port_num not in ssh_set
+            else "ssh"
+        )
+        if host_val not in seen_ips:
+            seen_ips.add(host_val)
+            expanded_ips.append(host_val)
+        explicit_ports.setdefault(host_val, [])
+        if (port_num, transport) not in explicit_ports[host_val]:
+            explicit_ports[host_val].append((port_num, transport))
 
     for raw in targets:
         t = raw.strip()
         if not t:
             continue
-        if ":" in t and "/" not in t:
-            host, port_str = t.rsplit(":", 1)
-            if port_str.isdigit():
+
+        # 1. Bracketed IPv6: `[2001:db8::1]:2222` or `[2001:db8::1]`
+        if t.startswith("["):
+            m_bport = re.fullmatch(r"\[([^\[\]]+)\]:(\d+)", t)
+            if m_bport:
+                host_inner, port_str = m_bport.group(1).strip(), m_bport.group(2)
                 port = int(port_str)
-                transport = "telnet" if (port in telnet_set or port == 23) and port not in ssh_set else "ssh"
-                if host not in seen_ips:
-                    seen_ips.add(host)
-                    expanded_ips.append(host)
-                explicit_ports.setdefault(host, [])
-                if (port, transport) not in explicit_ports[host]:
-                    explicit_ports[host].append((port, transport))
+                canon = _try_canonical_ip(host_inner)
+                if not canon or not (1 <= port <= 65535):
+                    logger.warning("Skipping invalid bracketed IPv6 target %r", t)
+                    continue
+                _add_explicit(canon, port)
                 continue
+            m_bonly = re.fullmatch(r"\[([^\[\]]+)\]", t)
+            if m_bonly:
+                canon = _try_canonical_ip(m_bonly.group(1).strip())
+                if not canon:
+                    logger.warning("Skipping invalid bracketed IPv6 target %r", t)
+                    continue
+                if canon not in seen_ips:
+                    seen_ips.add(canon)
+                    expanded_ips.append(canon)
+                continue
+            logger.warning("Skipping malformed bracketed target %r", t)
+            continue
+
+        # 2. Bare IPv4 / IPv6 literal (without port or CIDR)
+        if "/" not in t:
+            canon_ip = _try_canonical_ip(t)
+            if canon_ip is not None:
+                if canon_ip not in seen_ips:
+                    seen_ips.add(canon_ip)
+                    expanded_ips.append(canon_ip)
+                continue
+
+        # 3. Unbracketed `host:port` (single colon, no slash)
+        if ":" in t and "/" not in t:
+            if t.count(":") != 1:
+                logger.warning("Skipping invalid target specification %r", t)
+                continue
+            host, port_str = t.rsplit(":", 1)
+            host = host.strip()
+            if not host or not port_str.isdigit():
+                logger.warning("Skipping malformed host:port target %r", t)
+                continue
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                logger.warning("Skipping target %r with out-of-range TCP port %d (must be 1..65535)", t, port)
+                continue
+            canon_host = _try_canonical_ip(host) or host
+            _add_explicit(canon_host, port)
+            continue
+
+        # 4. CIDR subnet or hostname
         for ip in expand_targets([t]):
             if ip not in seen_ips:
                 seen_ips.add(ip)
@@ -501,13 +729,14 @@ def _sanitize_http_model_label(fp: dict | None) -> str:
 
 def _resolve_candidate_drivers(vendor_cand: str, credentials: list[dict]) -> list[type]:
     """Return ordered driver classes to try for a detected vendor or unknown target."""
-    if vendor_cand in VENDOR_DRIVER_MAP:
-        return [VENDOR_DRIVER_MAP[vendor_cand]]
-    cred_vendors = [
-        str(c.get("vendor") or "").strip().lower()
-        for c in credentials
-        if c.get("vendor") and str(c.get("vendor")).strip().lower() not in ("opnsense", "openwrt")
-    ]
+    cand_canon = _normalize_vendor_tag(vendor_cand) or (vendor_cand or "").strip().lower()
+    if cand_canon in VENDOR_DRIVER_MAP:
+        return [VENDOR_DRIVER_MAP[cand_canon]]
+    cred_vendors = []
+    for c in credentials:
+        cv = _normalize_vendor_tag(c.get("vendor")) or str(c.get("vendor") or "").strip().lower()
+        if cv and cv not in ("opnsense", "openwrt"):
+            cred_vendors.append(cv)
     preferred = [VENDOR_DRIVER_MAP[v] for v in cred_vendors if v in VENDOR_DRIVER_MAP]
     default_order = [CiscoDriver, AristaDriver, JuniperDriver, FortinetDriver]
     return list(dict.fromkeys(preferred + default_order))
@@ -521,38 +750,71 @@ def _sort_and_scope_credentials(
 ) -> list[dict]:
     """Order and filter candidate credentials for the detected vendor to prevent AAA lockouts."""
     sorted_creds = list(credentials)
-    if vendor_cand in ("opnsense", "frrouting", "openwrt"):
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "root" else 1)
-    elif vendor_cand == "cisco":
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") in ("Cisco", "admin") else 1)
-    elif vendor_cand == "juniper":
+    cand_canon = _normalize_vendor_tag(vendor_cand) or (vendor_cand or "").strip().lower()
+
+    if cand_canon in ("opnsense", "openwrt"):
+        sorted_creds.sort(key=lambda c: 0 if str(c.get("username") or "").lower() == "root" else 1)
+    elif cand_canon == "frrouting":
         sorted_creds.sort(
-            key=lambda c: 0 if c.get("username") == "root" else (1 if c.get("username") == "admin" else 2)
+            key=lambda c: (
+                0
+                if str(c.get("username") or "").lower() == "frr"
+                else (1 if str(c.get("username") or "").lower() == "root" else 2)
+            )
         )
-    elif vendor_cand == "hpprocurve":
+    elif cand_canon in ("cisco", "ciscosmb", "cisco_xr"):
         sorted_creds.sort(
-            key=lambda c: 0 if c.get("username") == "manager" else (1 if c.get("username") == "admin" else 2)
+            key=lambda c: (
+                0
+                if str(c.get("username") or "").lower() == "cisco"
+                else (1 if str(c.get("username") or "").lower() == "admin" else 2)
+            )
+        )
+    elif cand_canon == "juniper":
+        sorted_creds.sort(
+            key=lambda c: (
+                0
+                if str(c.get("username") or "").lower() == "root"
+                else (1 if str(c.get("username") or "").lower() == "admin" else 2)
+            )
+        )
+    elif cand_canon == "hpprocurve":
+        sorted_creds.sort(
+            key=lambda c: (
+                0
+                if str(c.get("username") or "").lower() == "manager"
+                else (1 if str(c.get("username") or "").lower() == "admin" else 2)
+            )
         )
     else:
-        sorted_creds.sort(key=lambda c: 0 if c.get("username") == "admin" else 1)
+        sorted_creds.sort(key=lambda c: 0 if str(c.get("username") or "").lower() == "admin" else 1)
 
-    if vendor_cand and vendor_cand != "unknown":
-        sorted_creds.sort(
-            key=lambda c: 0 if (not c.get("vendor") or c.get("vendor", "").lower() == vendor_cand.lower()) else 1
-        )
+    if cand_canon and cand_canon != "unknown":
+
+        def _vendor_priority(cred: dict) -> int:
+            cv = _normalize_vendor_tag(cred.get("vendor")) or str(cred.get("vendor") or "").strip().lower()
+            if cv == cand_canon:
+                return 0
+            if not cv:
+                return 1
+            return 2
+
+        sorted_creds.sort(key=_vendor_priority)
         if not try_all_creds:
             scoped_creds = [
                 c
                 for c in sorted_creds
-                if not c.get("vendor") or c.get("vendor", "").strip().lower() == vendor_cand.lower()
+                if not c.get("vendor")
+                or (_normalize_vendor_tag(c.get("vendor")) or str(c.get("vendor") or "").strip().lower()) == cand_canon
             ]
             if scoped_creds:
                 sorted_creds = scoped_creds
             else:
                 _log_event(
                     log_file,
-                    f"No credentials tagged '{vendor_cand}' or untagged; falling back to all {len(sorted_creds)} profiles.",
+                    f"No credentials tagged '{cand_canon}' or untagged (and --try-all-creds is disabled); skipping {len(sorted_creds)} unrelated profiles to prevent AAA lockout.",
                 )
+                return []
     return sorted_creds
 
 
@@ -567,6 +829,92 @@ def _remove_empty_session_log(session_log: str) -> None:
         logger.debug("Unable to remove empty session log %s: %s", session_log, exc)
 
 
+_HOST_KEY_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "bad host key",
+    "host key verification failed",
+    "host key for server",
+    "not found in known_hosts",
+)
+_TRANSPORT_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "incompatible",
+    "no acceptable host key",
+    "no acceptable kex",
+    "error reading ssh protocol banner",
+    "connection refused",
+    "connection reset",
+    "timed out",
+    "tcp connection to device failed",
+)
+_AUTH_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "auth",
+    "password",
+    "login",
+    "denied",
+    "permission",
+    "credential",
+    "invalid",
+    "userauth",
+    "too many authentication failures",
+)
+
+
+def _classify_connect_error(exc: Exception) -> str:
+    """Classify a `driver.connect()` exception into `auth_failed`, `transport_failed`, or `driver_failed`."""
+    if isinstance(exc, (NetmikoAuthenticationException, paramiko.AuthenticationException)):
+        return "auth_failed"
+    err_msg = str(exc).lower()
+    if isinstance(exc, paramiko.BadHostKeyException) or any(k in err_msg for k in _HOST_KEY_ERROR_SUBSTRINGS):
+        return "transport_failed"
+    if isinstance(exc, (NetmikoTimeoutException, TimeoutError, ConnectionError)) or any(
+        k in err_msg for k in _TRANSPORT_ERROR_SUBSTRINGS
+    ):
+        return "transport_failed"
+    if any(k in err_msg for k in _AUTH_ERROR_SUBSTRINGS):
+        return "auth_failed"
+    return "driver_failed"
+
+
+def _build_driver_instance(
+    driver_cls: type,
+    ip: str,
+    user: str,
+    pwd: str,
+    secret: str,
+    timeout: int,
+    session_log: str,
+    port: int,
+    transport: str,
+    *,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
+):
+    """Instantiate `driver_cls`, forwarding NETCONF/gNMI options when supported (e.g. CiscoXRDriver)."""
+    kwargs: dict[str, object] = {
+        "ip": ip,
+        "username": user,
+        "password": pwd,
+        "secret": secret,
+        "timeout": timeout,
+        "session_log": session_log,
+        "port": port,
+        "transport": transport,
+    }
+    if getattr(driver_cls, "__name__", "") == "CiscoXRDriver":
+        kwargs.update(
+            {
+                "use_netconf": netconf,
+                "netconf_port": netconf_port,
+                "use_gnmi": gnmi,
+                "gnmi_port": gnmi_port,
+                "gnmi_insecure": gnmi_insecure,
+            }
+        )
+    return driver_cls(**kwargs)
+
+
 def _connect_and_crawl_once(
     driver_cls: type,
     ip: str,
@@ -576,6 +924,11 @@ def _connect_and_crawl_once(
     timeout: int,
     session_log: str,
     log_file: str,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> tuple[dict | None, str]:
     """Execute a single driver connection and crawl attempt; returns `(data, outcome)`."""
     user = cred.get("username", "")
@@ -583,52 +936,111 @@ def _connect_and_crawl_once(
     secret = cred.get("secret", "")
     _log_event(log_file, f"Connecting to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})...")
     try:
-        driver = driver_cls(
-            ip=ip,
-            username=user,
-            password=pwd,
-            secret=secret,
-            timeout=timeout,
-            session_log=session_log,
-            port=port,
-            transport=transport,
+        driver = _build_driver_instance(
+            driver_cls,
+            ip,
+            user,
+            pwd,
+            secret,
+            timeout,
+            session_log,
+            port,
+            transport,
+            netconf=netconf,
+            netconf_port=netconf_port,
+            gnmi=gnmi,
+            gnmi_port=gnmi_port,
+            gnmi_insecure=gnmi_insecure,
         )
         conn = driver.connect()
-        try:
-            succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
-            print(f"[+] {succ_msg}")
-            _log_event(log_file, succ_msg)
-            data = driver.crawl(conn)
-        finally:
-            try:
-                conn.disconnect()
-            except Exception as disc_exc:
-                logger.debug("Disconnect cleanup failed for %s: %s", ip, disc_exc)
-        _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
-        return data, "success"
     except Exception as e:
         _remove_empty_session_log(session_log)
-        err_msg = str(e).lower()
+        safe_err = _scrub_log_message(str(e), secrets=(pwd, secret))
         _log_event(
             log_file,
-            f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {e}",
+            f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {safe_err}",
         )
-        if any(k in err_msg for k in ("auth", "password", "login", "denied", "permission", "credential", "invalid")):
-            return None, "auth_failed"
-        if any(
-            k in err_msg
-            for k in (
-                "incompatible",
-                "no acceptable host key",
-                "no acceptable kex",
-                "error reading ssh protocol banner",
-                "connection refused",
-                "timed out",
-                "tcp connection to device failed",
-            )
-        ):
-            return None, "transport_failed"
-        return None, "driver_failed"
+        return None, _classify_connect_error(e)
+
+    try:
+        succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
+        print(f"[+] {succ_msg}")
+        _log_event(log_file, succ_msg)
+
+        # Tier 3: Post-Auth Safe Prompt Inspection before sending vendor CLI commands
+        raw_prompt = ""
+        find_p = getattr(conn, "find_prompt", None)
+        if callable(find_p):
+            try:
+                p_val = find_p()
+                if isinstance(p_val, str):
+                    raw_prompt = p_val
+            except Exception:
+                raw_prompt = ""
+        if not raw_prompt:
+            bp = getattr(conn, "base_prompt", "")
+            if isinstance(bp, str):
+                raw_prompt = bp
+        if raw_prompt.strip():
+            prompt_os = inspect_prompt_os(raw_prompt)
+            prompt_vendor = resolve_prompt_vendor(raw_prompt)
+            if prompt_vendor != "unknown":
+                target_cls = resolve_driver_for_vendor(prompt_vendor)
+                if isinstance(target_cls, type) and target_cls is not driver_cls:
+                    _log_event(
+                        log_file,
+                        f"Tier 3 prompt inspection ({raw_prompt.strip()!r} -> {prompt_os}) switched driver "
+                        f"{driver_cls.__name__} -> {target_cls.__name__} on {ip}:{port}",
+                    )
+                    driver = _build_driver_instance(
+                        target_cls,
+                        ip,
+                        user,
+                        pwd,
+                        secret,
+                        timeout,
+                        session_log,
+                        port,
+                        transport,
+                        netconf=netconf,
+                        netconf_port=netconf_port,
+                        gnmi=gnmi,
+                        gnmi_port=gnmi_port,
+                        gnmi_insecure=gnmi_insecure,
+                    )
+                    paging_cmd = getattr(driver, "paging_cmd", "")
+                    if paging_cmd and hasattr(conn, "send_command"):
+                        try:
+                            conn.send_command(paging_cmd)
+                        except Exception as pg_exc:
+                            logger.debug("[%s] Tier 3 paging disable '%s' failed: %s", ip, paging_cmd, pg_exc)
+
+        data = driver.crawl(conn)
+        if netconf and callable(getattr(driver, "fetch_netconf_operational", None)):
+            nc_xml = driver.fetch_netconf_operational()
+            if nc_xml:
+                data["netconf_operational"] = nc_xml
+        if gnmi and callable(getattr(driver, "fetch_gnmi_operational", None)):
+            gnmi_data = driver.fetch_gnmi_operational()
+            if gnmi_data:
+                data["gnmi_operational"] = gnmi_data
+    except Exception as crawl_exc:
+        safe_err = _scrub_log_message(str(crawl_exc), secrets=(pwd, secret))
+        _log_event(
+            log_file,
+            f"Crawl failed after authentication on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {safe_err}",
+        )
+        return None, "crawl_failed"
+    finally:
+        try:
+            disconnect = getattr(conn, "disconnect", None) or getattr(conn, "close", None)
+            if callable(disconnect):
+                disconnect()
+        except Exception as disc_exc:
+            logger.debug("Disconnect cleanup failed for %s: %s", ip, disc_exc)
+
+    _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
+    return data, "success"
 
 
 def _try_driver_credentials(
@@ -642,10 +1054,21 @@ def _try_driver_credentials(
     timeout: int,
     session_log: str,
     log_file: str,
+    attempted_users: set[str] | None = None,
+    stop_host: list[bool] | None = None,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> tuple[dict | None, bool]:
-    """Attempt authentication and crawl across candidate driver classes and credentials."""
+    """Attempt authentication and crawl across candidate driver classes and credentials.
+
+    Enforces strict AAA lockout protection: at most ONE authentication attempt per
+    normalized username per target IP across passwords, drivers, and transports/ports.
+    """
     saw_auth_failure = False
-    failed_ssh_creds: set[tuple[str, str]] = set()
+    user_ledger: set[str] = attempted_users if attempted_users is not None else set()
     for driver_cls in driver_classes:
         if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
             continue
@@ -653,30 +1076,54 @@ def _try_driver_credentials(
         if vendor_cand == "unknown" and not try_all_creds:
             drv_vendor = resolve_vendor_for_driver(driver_cls)
             if drv_vendor:
-                filtered = [
-                    c for c in sorted_creds if not c.get("vendor") or c.get("vendor", "").strip().lower() == drv_vendor
+                driver_creds = [
+                    c
+                    for c in sorted_creds
+                    if not c.get("vendor")
+                    or (_normalize_vendor_tag(c.get("vendor")) or str(c.get("vendor") or "").strip().lower())
+                    == drv_vendor
                 ]
-                if filtered:
-                    driver_creds = filtered
         for cred in driver_creds:
             user = cred.get("username", "")
             if not user:
                 continue
-            cred_key = (user, cred.get("password", ""))
-            if transport == "ssh" and cred_key in failed_ssh_creds:
+            user_key = user.strip().lower()
+            if not user_key or user_key in user_ledger:
                 continue
+            telemetry_kwargs = {}
+            if netconf or gnmi or netconf_port != 830 or gnmi_port != 57400 or gnmi_insecure:
+                telemetry_kwargs = {
+                    "netconf": netconf,
+                    "netconf_port": netconf_port,
+                    "gnmi": gnmi,
+                    "gnmi_port": gnmi_port,
+                    "gnmi_insecure": gnmi_insecure,
+                }
             data, outcome = _connect_and_crawl_once(
-                driver_cls, ip, port, transport, cred, timeout, session_log, log_file
+                driver_cls,
+                ip,
+                port,
+                transport,
+                cred,
+                timeout,
+                session_log,
+                log_file,
+                **telemetry_kwargs,
             )
             if outcome == "success":
                 return data, saw_auth_failure
+            if outcome == "crawl_failed":
+                user_ledger.add(user_key)
+                if stop_host is not None:
+                    stop_host.append(True)
+                return None, saw_auth_failure
             if outcome == "auth_failed":
                 saw_auth_failure = True
-                if transport == "ssh":
-                    failed_ssh_creds.add(cred_key)
+                user_ledger.add(user_key)
                 continue
             if outcome == "transport_failed":
                 return None, saw_auth_failure
+            user_ledger.add(user_key)
             break
     return None, saw_auth_failure
 
@@ -698,15 +1145,23 @@ def _identify_port_vendor(
     vendor_cand, banner = detect_vendor_range(
         ip, mac=host_mac, port=port, timeout=min(float(timeout), 3.0), transport=transport
     )
+    hint_canon = _normalize_vendor_tag(hint_norm)
+    if hint_norm and not hint_canon:
+        logger.warning("Ignoring unrecognized vendor_hint %r for %s:%d", hint_norm, ip, port)
+    if hint_canon:
+        if vendor_cand != hint_canon:
+            _log_event(
+                log_file,
+                f"Target {ip}:{port} ({transport}) -> vendor_hint={hint_canon!r} overriding detected vendor={vendor_cand!r}",
+            )
+        return hint_canon, banner, None, http_probed, cached_http_fp
     if vendor_cand == "unsupported_appliance":
         _log_event(
             log_file,
             f"Target {ip}:{port} ({transport}) -> non-network appliance ({banner!r}); skipping SSH/Telnet login.",
         )
         return vendor_cand, banner, None, http_probed, cached_http_fp
-    if vendor_cand == "unknown" and hint_norm in VENDOR_DRIVER_MAP:
-        vendor_cand = hint_norm
-    elif vendor_cand == "unknown":
+    if vendor_cand == "unknown":
         if http_fingerprint and not http_probed:
             cached_http_fp = probe_http_fingerprint(ip, timeout=min(float(timeout), 1.5))
             http_probed = True
@@ -744,6 +1199,11 @@ def crawl_target_with_ports(
     http_fingerprint: bool = True,
     vendor_hint: str = "",
     try_all_creds: bool = False,
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
 ) -> dict | None:
     """Probe a target across its discovered open `(port, transport)` pairs and return normalized `device_data`."""
     ports_to_try = sorted(
@@ -756,6 +1216,8 @@ def crawl_target_with_ports(
     last_app_class: tuple[str, str] | None = None
     cached_http_fp: dict | None = None
     http_probed, saw_auth_failure = False, False
+    attempted_users: set[str] = set()
+    stop_host: list[bool] = []
 
     for port, transport in ports_to_try:
         vendor_cand, banner, app_class, http_probed, cached_http_fp = _identify_port_vendor(
@@ -792,11 +1254,20 @@ def crawl_target_with_ports(
             timeout,
             session_log,
             log_file,
+            attempted_users=attempted_users,
+            stop_host=stop_host,
+            netconf=netconf,
+            netconf_port=netconf_port,
+            gnmi=gnmi,
+            gnmi_port=gnmi_port,
+            gnmi_insecure=gnmi_insecure,
         )
         if port_auth_fail:
             saw_auth_failure = True
         if data is not None:
             return data
+        if stop_host:
+            break
 
     _remove_empty_session_log(session_log)
     status = "unauthenticated" if (last_vendor in VENDOR_DRIVER_MAP and saw_auth_failure) else "unsupported"
@@ -864,7 +1335,7 @@ def extract_followable_subnets(
     allow_public: bool = False,
     include_routes: bool = True,
     min_prefix: int = 22,
-    max_prefix: int = 30,
+    max_prefix: int = 31,
     mgmt_only: bool = False,
     subnet_include: list[str] | None = None,
     subnet_exclude: list[str] | None = None,
@@ -926,6 +1397,14 @@ def extract_followable_subnets(
     return discovered
 
 
+def _safe_ipv4_in_network(ip_str: str, net: ipaddress.IPv4Network) -> bool:
+    """Return True if `ip_str` is a valid IPv4 address inside `net` (ignoring IPv6 or malformed strings)."""
+    try:
+        return ipaddress.IPv4Address(ip_str) in net
+    except ValueError:
+        return False
+
+
 def _select_hop_targets_for_cidrs(
     cidrs: list[str],
     registry: DeviceRegistry,
@@ -938,7 +1417,7 @@ def _select_hop_targets_for_cidrs(
     When `arp_only=True`, never falls back to full CIDR sweeps and skips known
     non-infrastructure endpoint OUIs (Apple, printers, cameras, AV controllers).
     When `arp_only=False` and ARP tables exist, prunes empty `/24`–`/22` subnets
-    while still allowing `/29`–`/30` transit links.
+    while still allowing `/29`–`/31` transit links.
     """
     selected: list[str] = []
     seen: set[str] = set(scanned_ip_set)
@@ -951,7 +1430,7 @@ def _select_hop_targets_for_cidrs(
         except ValueError as exc:
             logger.debug("Skipping invalid hop CIDR %r: %s", cidr, exc)
             continue
-        arp_hits = [ip for ip in arp_ips if ipaddress.IPv4Address(ip) in net]
+        arp_hits = [ip for ip in arp_ips if _safe_ipv4_in_network(ip, net)]
         if arp_hits:
             for ip in arp_hits:
                 if ip in seen:
@@ -1101,6 +1580,11 @@ class CrawlOptions:
     save_baseline: str = ""
     compare_baseline: str = ""
     retry_failed: str = ""
+    netconf: bool = False
+    netconf_port: int = 830
+    gnmi: bool = False
+    gnmi_port: int = 57400
+    gnmi_insecure: bool = False
 
 
 # Alias for callers referencing either CrawlOptions or CrawlConfig
@@ -1136,6 +1620,11 @@ _CRAWL_OPTION_DEFAULTS: dict[str, object] = {
     "save_baseline": "",
     "compare_baseline": "",
     "retry_failed": "",
+    "netconf": False,
+    "netconf_port": 830,
+    "gnmi": False,
+    "gnmi_port": 57400,
+    "gnmi_insecure": False,
 }
 
 
@@ -1216,11 +1705,7 @@ def _load_retry_failed_targets(retry_failed: str) -> tuple[list[str], list[dict]
 def _resolve_run_output_dir(cfg: CrawlOptions, targets: list[str]) -> tuple[str, bool, str, str]:
     """Determine `(run_output_dir, is_organized, logs_dir, crawler_log)` and ensure directories exist."""
     if cfg.organize:
-        base = (
-            cfg.output_dir
-            if (cfg.output_dir and cfg.output_dir not in ("auto", "docs/net_docu_crawler"))
-            else "deliverables"
-        )
+        base = cfg.output_dir if (cfg.output_dir and cfg.output_dir != "auto") else "deliverables"
         run_output_dir = compute_organized_output_dir(targets, base_dir=base, site=cfg.site, domain=cfg.domain)
         is_organized = True
     elif not cfg.output_dir or cfg.output_dir == "auto":
@@ -1258,10 +1743,10 @@ def _crawl_target_batch(
     _log_event(crawler_log, f"Pre-scanning {len(batch_ips)} targets: {batch_ips}")
 
     scan_ips = [ip for ip in batch_ips if ip not in batch_explicit]
+    probe_timeout = min(max(float(cfg.timeout) * (0.25 if len(scan_ips) <= 4 else 0.15), 0.8), 3.0)
+    probe_workers = max(1, min(cfg.max_workers, len(scan_ips))) if scan_ips else 1
     open_ports_map = (
-        scan_subnet_ports(
-            scan_ips, eff_ssh, eff_telnet, timeout=min(float(cfg.timeout), 1.0), max_workers=max(cfg.max_workers, 32)
-        )
+        scan_subnet_ports(scan_ips, eff_ssh, eff_telnet, timeout=probe_timeout, max_workers=probe_workers)
         if scan_ips
         else {}
     )
@@ -1281,39 +1766,56 @@ def _crawl_target_batch(
     if not targets_to_crawl:
         return
 
-    with ThreadPoolExecutor(max_workers=max(1, min(cfg.max_workers, len(targets_to_crawl)))) as pool:
-        future_to_ip = {
-            pool.submit(
-                crawl_target_with_ports,
-                ip,
-                credentials,
-                timeout=cfg.timeout,
-                session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
-                log_file=crawler_log,
-                open_ports=open_ports_map.get(ip),
-                mac=registry.get_arp_mac(ip),
-                http_fingerprint=cfg.http_fingerprint,
-                vendor_hint=cfg.vendor_hint,
-                try_all_creds=cfg.try_all_creds,
-            ): ip
-            for ip in targets_to_crawl
-        }
-        results_by_ip: dict[str, dict | None] = {}
-        for fut in as_completed(future_to_ip):
-            ip = future_to_ip[fut]
-            try:
-                results_by_ip[ip] = fut.result()
-            except Exception as exc:
-                _log_event(crawler_log, f"Unhandled worker exception for {ip}: {exc}")
-                results_by_ip[ip] = None
+    batch_secrets = tuple(
+        s
+        for c in credentials
+        for s in (c.get("password", ""), c.get("secret", ""))
+        if isinstance(s, str) and len(s) >= 4
+    )
+    registered_ips: set[str] = set()
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(cfg.max_workers, len(targets_to_crawl)))) as pool:
+            future_to_ip = {
+                pool.submit(
+                    crawl_target_with_ports,
+                    ip,
+                    credentials,
+                    timeout=cfg.timeout,
+                    session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
+                    log_file=crawler_log,
+                    open_ports=open_ports_map.get(ip),
+                    mac=registry.get_arp_mac(ip),
+                    http_fingerprint=cfg.http_fingerprint,
+                    vendor_hint=cfg.vendor_hint,
+                    try_all_creds=cfg.try_all_creds,
+                    netconf=cfg.netconf,
+                    netconf_port=cfg.netconf_port,
+                    gnmi=cfg.gnmi,
+                    gnmi_port=cfg.gnmi_port,
+                    gnmi_insecure=cfg.gnmi_insecure,
+                ): ip
+                for ip in targets_to_crawl
+            }
+            results_by_ip: dict[str, dict | None] = {}
+            for fut in as_completed(future_to_ip):
+                ip = future_to_ip[fut]
+                try:
+                    results_by_ip[ip] = fut.result()
+                except Exception as exc:
+                    safe_exc = _scrub_log_message(str(exc), secrets=batch_secrets)
+                    _log_event(crawler_log, f"Unhandled worker exception for {ip}: {safe_exc}")
+                    results_by_ip[ip] = None
 
-    for ip in targets_to_crawl:
-        device_data = results_by_ip.get(ip)
-        if device_data:
-            registry.register_device(device_data)
-            raw_devices.append(device_data)
-        else:
-            registry.release_crawl(ip)
+        for ip in targets_to_crawl:
+            device_data = results_by_ip.get(ip)
+            if device_data:
+                registry.register_device(device_data)
+                registered_ips.add(ip)
+                raw_devices.append(device_data)
+    finally:
+        for ip in targets_to_crawl:
+            if ip not in registered_ips:
+                registry.release_crawl(ip)
 
 
 def _discover_neighbor_and_subnet_hops(
@@ -1389,17 +1891,21 @@ def _append_local_arp_inventory(
             continue
         if not registry.start_crawl(arp_ip):
             continue
-        arp_rec = build_partial_device_record(
-            ip=arp_ip,
-            mac=arp_mac,
-            vendor="Unknown",
-            banner="",
-            port=0,
-            transport="arp",
-            status="discovered",
-        )
-        registry.register_device(arp_rec)
-        raw_devices.append(arp_rec)
+        try:
+            arp_rec = build_partial_device_record(
+                ip=arp_ip,
+                mac=arp_mac,
+                vendor="Unknown",
+                banner="",
+                port=0,
+                transport="arp",
+                status="discovered",
+            )
+            registry.register_device(arp_rec)
+            raw_devices.append(arp_rec)
+        except BaseException:
+            registry.release_crawl(arp_ip)
+            raise
 
 
 def _enrich_partial_devices_http(raw_devices: list[dict], cfg: CrawlOptions) -> list[dict]:
@@ -1456,7 +1962,8 @@ def _enrich_partial_devices_snmp(partial_devs: list[dict], cfg: CrawlOptions) ->
             try:
                 info = fut.result()
             except Exception as exc:
-                logger.debug("SNMP sysinfo probe failed for %s: %s", dev.get("ip"), exc)
+                safe_exc = _scrub_log_message(str(exc), secrets=(cfg.snmp_community,))
+                logger.debug("SNMP sysinfo probe failed for %s: %s", dev.get("ip"), safe_exc)
                 info = None
             if not info:
                 continue
@@ -1485,7 +1992,8 @@ def _enrich_partial_devices_snmp(partial_devs: list[dict], cfg: CrawlOptions) ->
             try:
                 fb = fut.result() or {}
             except Exception as exc:
-                logger.debug("SNMPv2c fallback collection failed for %s: %s", dev.get("ip"), exc)
+                safe_exc = _scrub_log_message(str(exc), secrets=(cfg.snmp_community,))
+                logger.debug("SNMPv2c fallback collection failed for %s: %s", dev.get("ip"), safe_exc)
                 fb = {}
             if fb.get("interfaces_detail"):
                 dev["interfaces_detail"] = fb["interfaces_detail"]
@@ -1542,7 +2050,14 @@ def _execute_crawl(cfg: CrawlOptions) -> list[dict]:
     raw_devices: list[dict] = []
     registry = DeviceRegistry()
     scanned_ip_set: set[str] = set()
-    scanned_cidrs: set[str] = {t.strip() for t in targets if "/" in t}
+    scanned_cidrs: set[str] = set()
+    for t in targets:
+        if "/" in t:
+            t_clean = t.strip()
+            try:
+                scanned_cidrs.add(str(ipaddress.ip_network(t_clean, strict=False)))
+            except ValueError:
+                scanned_cidrs.add(t_clean)
 
     for prior_dev in prior_success_devices:
         registry.register_device(prior_dev)
@@ -1605,6 +2120,11 @@ def crawl_network(
     save_baseline: str = "",
     compare_baseline: str = "",
     retry_failed: str = "",
+    netconf: bool = False,
+    netconf_port: int = 830,
+    gnmi: bool = False,
+    gnmi_port: int = 57400,
+    gnmi_insecure: bool = False,
     config: CrawlOptions | None = None,
 ) -> list[dict]:
     """
@@ -1641,6 +2161,11 @@ def crawl_network(
         "save_baseline": save_baseline,
         "compare_baseline": compare_baseline,
         "retry_failed": retry_failed,
+        "netconf": netconf,
+        "netconf_port": netconf_port,
+        "gnmi": gnmi,
+        "gnmi_port": gnmi_port,
+        "gnmi_insecure": gnmi_insecure,
     }
     cfg = _resolve_crawl_options(targets=targets, config=config, overrides=overrides)
     return _execute_crawl(cfg)
@@ -2677,15 +3202,16 @@ def _add_core_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default="docs/net_docu_crawler",
-        help="Flat output directory when --no-organize is used, or custom base directory when organized (default base: deliverables/)",
+        default="",
+        help="Flat output directory when --no-organize is used (default: docs/net_docu_crawler), or custom base directory when organized (default: deliverables/)",
     )
-    parser.add_argument(
+    organize_group = parser.add_mutually_exclusive_group()
+    organize_group.add_argument(
         "--organize",
         action="store_true",
         help="(Default) Store deliverables in a structured folder: deliverables/<Subnet>_<TimeStamp>_<site>/",
     )
-    parser.add_argument(
+    organize_group.add_argument(
         "--no-organize",
         action="store_true",
         help="Write flat output directly to --output-dir without creating a <Subnet>_<TimeStamp>_<site> subfolder",
@@ -2802,12 +3328,12 @@ def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-vendor",
         default="",
-        help="Generate staged target-vendor migration CLI configs (cisco, juniper, arista, hpprocurve)",
+        help="Generate staged target-vendor migration CLI configs (cisco, juniper, arista, aruba, hpprocurve, meraki, or persona=vendor pairs such as switch=juniper,ap=aruba)",
     )
     parser.add_argument(
         "--vendor-hint",
         default="",
-        help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., fortinet, ciscosmb, cisco)",
+        help="Fallback vendor driver hint when OUI/SSH banner is unknown (e.g., cisco, cisco_xr, ciscosmb, juniper, arista, hpprocurve, aruba, fortinet, paloalto, mikrotik, opnsense, openwrt, frrouting)",
     )
     parser.add_argument(
         "--try-all-creds",
@@ -2874,6 +3400,11 @@ def _add_mode_cli_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip TLS verification for gNMI connections (lab/self-signed certs only)",
     )
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="Auto-install missing required Python dependencies on pre-flight startup (when invoked via net_crawler.py)",
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -2886,6 +3417,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main():
     args = _build_arg_parser().parse_args()
+
+    if args.install_deps:
+        from net_docu_crawler.dependency_checker import ensure_dependencies
+
+        if not ensure_dependencies(auto_install=True, prompt=False):
+            sys.exit(1)
 
     if args.validate_credentials:
         creds, warnings, errors = load_and_validate_credentials(args.credentials)
@@ -2957,6 +3494,11 @@ def main():
             save_baseline=args.save_baseline,
             compare_baseline=args.compare_baseline,
             retry_failed=args.retry_failed,
+            netconf=args.netconf,
+            netconf_port=args.netconf_port,
+            gnmi=args.gnmi,
+            gnmi_port=args.gnmi_port,
+            gnmi_insecure=args.gnmi_insecure,
         )
         crawl_network(config=options)
     except ValueError:

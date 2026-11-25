@@ -30,7 +30,9 @@ import subprocess
 logger = logging.getLogger(__name__)
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-_VALID_DOMAIN_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9-]+)+$")
+_VALID_DOMAIN_RE = re.compile(
+    r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+(?:[a-zA-Z]{2,63}|xn--[a-zA-Z0-9-]{2,59})$"
+)
 _IGNORED_DOMAINS = {"localdomain", "localhost", "local", "internal", "home.arpa", "invalid"}
 
 
@@ -99,6 +101,11 @@ def extract_device_dns_domains(devices: list[dict] | None) -> list[str]:
                 r"(?im)^\s*ip\s+domain[- ]name\s+(\S+)",
                 r"(?im)^\s*set\s+system\s+domain-name\s+(\S+)",
                 r"(?im)^\s*domain-name\s+([^\s;]+)",
+                r"(?im)^\s*set\s+domain\s+[\"']?([^\s\"';]+)",
+                r"(?im)^\s*option\s+domain\s+[\"']?([^\s\"';]+)",
+                r"(?im)^\s*set\s+deviceconfig\s+system\s+domain\s+[\"']?([^\s\"';]+)",
+                r"(?is)<system>.*?<domain>\s*([^<\s]+)\s*</domain>",
+                r"(?im)^\s*<domain>\s*([^<\s]+)\s*</domain>",
             ):
                 for m in re.finditer(pat, cfg):
                     dom = _clean_domain(m.group(1).strip("\"'"))

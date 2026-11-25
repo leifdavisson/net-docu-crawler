@@ -49,7 +49,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetmikoAuthenticationException
 from netmiko.session_log import SessionLog
 from paramiko.kex_curve25519 import KexCurve25519
 from paramiko.message import Message
@@ -110,16 +110,29 @@ _NEGOTIATION_ERROR_SUBSTRINGS: tuple[str, ...] = (
     "no acceptable mac",
     "key exchange failed",
     "unable to agree",
-    "bad host key",
     "invalid key",
     "signature verification",
+    "rsa-sha2",
     "unknown host key type",
+)
+
+_HOST_KEY_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "bad host key",
+    "host key verification failed",
+    "host key for server",
+    "not found in known_hosts",
 )
 
 _AUTH_ERROR_SUBSTRINGS: tuple[str, ...] = (
     "authentication failed",
     "authentication to device failed",
     "permission denied",
+    "too many authentication failures",
+    "no authentication methods",
+    "bad authentication type",
+    "all authentication methods failed",
+    "authentication timeout",
+    "userauth",
 )
 
 
@@ -338,21 +351,24 @@ def apply_legacy_algorithms_to_transport(transport: Transport) -> Transport:
     tuples strictly onto a single ``paramiko.Transport`` instance without mutating
     ``paramiko.Transport`` class-wide algorithm registries.
     """
-    transport._key_info = {
-        **Transport._key_info,
-        "ssh-dss": LegacyDSSKey,
-        "ssh-dss-cert-v01@openssh.com": LegacyDSSKey,
-    }
-    transport._preferred_keys = _append_missing_tuple_items(Transport._preferred_keys, ("ssh-dss",))
+    with _COMPAT_LOCK:
+        transport._key_info = {
+            **Transport._key_info,
+            "ssh-dss": LegacyDSSKey,
+            "ssh-dss-cert-v01@openssh.com": LegacyDSSKey,
+        }
+        transport._preferred_keys = _append_missing_tuple_items(Transport._preferred_keys, ("ssh-dss",))
 
-    supported_legacy_kex = [k for k in LEGACY_KEX_ALGORITHMS if k in Transport._kex_info]
-    transport._preferred_kex = _append_missing_tuple_items(Transport._preferred_kex, supported_legacy_kex)
+        supported_legacy_kex = [k for k in LEGACY_KEX_ALGORITHMS if k in Transport._kex_info]
+        transport._preferred_kex = _append_missing_tuple_items(Transport._preferred_kex, supported_legacy_kex)
 
-    supported_legacy_ciphers = [c for c in LEGACY_CIPHERS if c in Transport._cipher_info]
-    transport._preferred_ciphers = _append_missing_tuple_items(Transport._preferred_ciphers, supported_legacy_ciphers)
+        supported_legacy_ciphers = [c for c in LEGACY_CIPHERS if c in Transport._cipher_info]
+        transport._preferred_ciphers = _append_missing_tuple_items(
+            Transport._preferred_ciphers, supported_legacy_ciphers
+        )
 
-    supported_legacy_macs = [m for m in LEGACY_MACS if m in Transport._mac_info]
-    transport._preferred_macs = _append_missing_tuple_items(Transport._preferred_macs, supported_legacy_macs)
+        supported_legacy_macs = [m for m in LEGACY_MACS if m in Transport._mac_info]
+        transport._preferred_macs = _append_missing_tuple_items(Transport._preferred_macs, supported_legacy_macs)
     return transport
 
 
@@ -456,16 +472,27 @@ def _is_auth_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_host_key_error(exc: BaseException) -> bool:
+    for cur in _iter_exception_chain(exc):
+        if isinstance(cur, BadHostKeyException):
+            return True
+        msg = str(cur).lower()
+        if any(tok in msg for tok in _HOST_KEY_ERROR_SUBSTRINGS):
+            return True
+    return False
+
+
 def is_ssh_negotiation_error(exc: BaseException) -> bool:
     """
     Returns ``True`` when ``exc`` indicates an SSH cryptographic negotiation or host-key
-    incompatibility, and ``False`` for authentication failures, TCP timeouts, or socket errors.
+    algorithm incompatibility, and ``False`` for host-key mismatches (MITM/RejectPolicy),
+    authentication failures, TCP timeouts, or socket errors.
     """
-    if _is_auth_error(exc):
+    if _is_auth_error(exc) or _is_host_key_error(exc):
         return False
 
     for cur in _iter_exception_chain(exc):
-        if isinstance(cur, (IncompatiblePeer, BadHostKeyException)):
+        if isinstance(cur, IncompatiblePeer):
             return True
         msg = str(cur).lower()
         if any(sub in msg for sub in _NEGOTIATION_ERROR_SUBSTRINGS):
@@ -476,19 +503,14 @@ def is_ssh_negotiation_error(exc: BaseException) -> bool:
 def _should_retry_stage3(exc: BaseException) -> bool:
     """
     Determines whether a Stage 2 failure warrants Stage 3 (``rsa-sha2-256``/``512`` disablement).
-    Never retries authentication failures or TCP/socket reachability timeouts.
+    Never retries authentication failures, host-key verification mismatches, banner/socket errors,
+    or TCP reachability timeouts.
     """
-    if _is_auth_error(exc):
+    if _is_auth_error(exc) or _is_host_key_error(exc):
         return False
-    if is_ssh_negotiation_error(exc):
-        return True
     if isinstance(exc, (OSError, socket.error, EOFError)):
         return False
-    if isinstance(exc, NetmikoTimeoutException):
-        return "a paramiko sshexception occurred" in str(exc).lower()
-    if isinstance(exc, SSHException):
-        return True
-    return False
+    return is_ssh_negotiation_error(exc)
 
 
 def _close_paramiko_client_quietly(client: paramiko.SSHClient, target: str, stage: int) -> None:
@@ -520,16 +542,31 @@ class LazySessionLog(SessionLog):
         super()._flush_buffer(final=final)
 
 
+def _build_session_no_log(params: dict[str, Any]) -> dict[str, str]:
+    """Build Netmiko ``SessionLog.no_log`` mapping so passwords/secrets are always redacted."""
+    no_log: dict[str, str] = {}
+    for key in ("password", "secret", "passphrase"):
+        val = params.get(key)
+        if isinstance(val, str) and val:
+            no_log[key] = val
+    return no_log
+
+
 def _wrap_lazy_session_log(params: dict[str, Any]) -> dict[str, Any]:
-    """Wrap string ``session_log`` paths in a fresh ``LazySessionLog`` per connection stage."""
+    """Wrap string ``session_log`` paths in a fresh ``LazySessionLog`` with ``no_log`` redaction."""
     out = dict(params)
     slog = out.get("session_log")
+    no_log = _build_session_no_log(out)
     if isinstance(slog, str) and slog:
         out["session_log"] = LazySessionLog(
             file_name=slog,
             file_mode=str(out.get("session_log_file_mode", "write")),
+            no_log=no_log,
             record_writes=bool(out.get("session_log_record_writes", False)),
         )
+    elif isinstance(slog, SessionLog) and no_log:
+        for k, v in no_log.items():
+            slog.no_log.setdefault(k, v)
     return out
 
 
@@ -606,12 +643,12 @@ def connect_paramiko_with_fallback(client: paramiko.SSHClient, **connect_kwargs:
         client.connect(**stage1_kwargs)
         return
     except Exception as exc1:
+        _close_paramiko_client_quietly(client, target, stage=1)
         if not is_ssh_negotiation_error(exc1):
             raise
         logger.debug(
             "Paramiko Stage 1 SSH negotiation failed for %s; retrying Stage 2 scoped fallback: %s", target, exc1
         )
-        _close_paramiko_client_quietly(client, target, stage=1)
 
     stage2_kwargs = dict(connect_kwargs)
     stage2_kwargs["disabled_algorithms"] = {}
@@ -621,15 +658,19 @@ def connect_paramiko_with_fallback(client: paramiko.SSHClient, **connect_kwargs:
             client.connect(**stage2_kwargs)
         return
     except Exception as exc2:
+        _close_paramiko_client_quietly(client, target, stage=2)
         if not _should_retry_stage3(exc2):
             raise
         logger.debug(
             "Paramiko Stage 2 SSH negotiation failed for %s; retrying Stage 3 (RSA SHA-2 disabled): %s", target, exc2
         )
-        _close_paramiko_client_quietly(client, target, stage=2)
 
     stage3_kwargs = dict(connect_kwargs)
     stage3_kwargs["disabled_algorithms"] = {"pubkeys": list(RSA_SHA2_PUBKEYS)}
     stage3_kwargs.setdefault("transport_factory", build_legacy_transport)
-    with legacy_ssh_fallback_scope():
-        client.connect(**stage3_kwargs)
+    try:
+        with legacy_ssh_fallback_scope():
+            client.connect(**stage3_kwargs)
+    except Exception:
+        _close_paramiko_client_quietly(client, target, stage=3)
+        raise

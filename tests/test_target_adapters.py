@@ -28,6 +28,41 @@ def test_target_adapter_gate_blocking():
     assert any("BLOCKED: ge-0/0/2" in ln for ln in meraki_lines)
 
 
+def test_target_adapters_all_vendors_native_and_voice_vlan():
+    """DD-17 / CD-08: Verify Aruba AOS-CX, HP ProCurve, Fortinet, Cisco/Arista, and Juniper native_vlan & voice_vlan."""
+    dev = {
+        "hostname": "SW-CORE",
+        "ports": {
+            "1/1/1": {"mode": "access", "access_vlan": "10", "voice_vlan": "20"},
+            "1/1/24": {"mode": "trunk", "native_vlan": "99", "allowed_vlans": ["10", "20", "99"]},
+        },
+    }
+    junos = render_device_target_config(dev, "junos")
+    assert any("native-vlan-id 99" in ln for ln in junos)
+    assert any("voip interface 1/1/1.0 vlan 20" in ln for ln in junos)
+
+    cisco = render_device_target_config(dev, "cisco")
+    assert any("switchport voice vlan 20" in ln for ln in cisco)
+    assert any("switchport trunk native vlan 99" in ln for ln in cisco)
+
+    aruba = render_device_target_config(dev, "aruba")
+    assert any("vlan access 10" in ln for ln in aruba)
+    assert any("vlan trunk native 99" in ln for ln in aruba)
+    assert any("vlan trunk allowed 10,20,99" in ln for ln in aruba)
+    assert not any("switchport mode" in ln for ln in aruba)
+
+    hp = render_device_target_config(dev, "hpprocurve")
+    assert any("untagged vlan 10" in ln for ln in hp)
+    assert any("tagged vlan 20" in ln for ln in hp)
+    assert any("untagged vlan 99" in ln for ln in hp)
+    assert any("tagged vlan 10,20,99" in ln for ln in hp)
+
+    forti = render_device_target_config(dev, "fortinet")
+    assert any('edit "1/1/1"' in ln for ln in forti)
+    assert any("set native-vlan 99" in ln for ln in forti)
+    assert any("set allowed-vlans 10,20,99" in ln for ln in forti)
+
+
 def test_generate_target_migration_configs_and_dataset_baseline_diff(tmp_path):
     import json
 

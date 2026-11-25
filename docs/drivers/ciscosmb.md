@@ -1,5 +1,6 @@
 <!--
 Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -18,7 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 # Cisco Small Business Driver (`CiscoSMBDriver`)
 
 - **Driver Class**: [`CiscoSMBDriver`](../../net_docu_crawler/drivers/ciscosmb.py)
-- **Netmiko Device Type**: `cisco_s300` (SSH) / `cisco_s300_telnet` or `generic_telnet` (Telnet)
+- **Netmiko Device Type**: `cisco_s300` (SSH) / `cisco_s300_telnet` (Telnet) ([Netmiko](https://github.com/ktbyers/netmiko))
 - **Supported Models**: CLI-capable Cisco Small Business managed switches (`SG250`, `SG300`, `SG350`, `SG500`, `CBS250`, `CBS350`)
 - **Official Documentation**: [Cisco Small Business 300 Series Command Reference](https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html)
 
@@ -30,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 | System / Hostname / MAC | `show system` |
 | Model / Serial Number | `show system id`, `show version` |
 | L3 & Physical Interfaces | `show ip interface`, `show interfaces status` |
+| L2 Trunk & LAG Telemetry | `show interfaces switchport`, `show interfaces port-channel` |
 | Neighbors | `show lldp neighbors` |
 | Routing & ARP | `show ip route`, `show arp` |
 | Switching / STP / MACs | `show spanning-tree`, `show mac address-table` |

@@ -28,25 +28,26 @@ Welcome to the **Net-Docu-Crawler** driver subsystem. This document outlines the
 * `Cisco-Docu-Crawler` (Deprecated)
 * `Juniper-Docu-Crawler` (Deprecated)
 
-Rather than maintaining separate network crawlers for each hardware vendor, **Net-Docu-Crawler** provides a single modular architecture supporting Cisco, Juniper, Aruba, Palo Alto Networks, and Fortinet within a unified execution engine.
+Rather than maintaining separate network crawlers for each hardware vendor, **Net-Docu-Crawler** provides a single modular architecture supporting **13 read-only drivers** spanning Cisco (IOS/IOS-XE/NX-OS, IOS-XR, Small Business), Juniper Junos, HP ProCurve / ArubaOS-S, HPE Aruba (Instant AP & AOS-CX), Arista EOS, Palo Alto PAN-OS, Fortinet FortiOS, MikroTik RouterOS, OPNsense, OpenWrt, and FRRouting within a unified execution engine.
 
 ---
 
 ## 2. Vendor Comparison Matrix
 
-| Platform | Primary OS Families | Personas Supported | Paging Disable Command | Structured Output Native? | Default Device Type |
+| Platform | Primary OS Families | Personas Supported | Paging Suppression | Structured Output Native? | Driver Class |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| [**Cisco Systems**](cisco.md) | IOS, IOS-XE, NX-OS, IOS-XR | Switch, Router | `terminal length 0` | Regex Parsing / TextFSM | [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py) |
+| [**Cisco Systems**](cisco.md) | IOS, IOS-XE, NX-OS | Switch, Router | `terminal length 0` | Regex Parsing | [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py) |
+| [**Cisco IOS-XR**](cisco_xr.md) | IOS-XR (ASR 9000, NCS, CRS, XRv) | Router | `terminal length 0` | Regex Parsing *(optional NETCONF/gNMI)* | [`CiscoXRDriver`](../../net_docu_crawler/drivers/cisco_xr.py) |
 | [**Cisco Small Business**](ciscosmb.md) | SG250/SG300/SG350/SG500/CBS250/CBS350 | Switch | `terminal datadump` | Regex Parsing | [`CiscoSMBDriver`](../../net_docu_crawler/drivers/ciscosmb.py) |
 | [**Juniper Networks**](juniper.md) | JunOS (EX, QFX, MX, SRX) | Switch, Router, Firewall | `set cli screen-length 0` | Native JSON (`\| display json`) | [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) |
 | [**HP ProCurve / ArubaOS-S**](hpprocurve.md) | Provision / ArubaOS-S 14.x-16.x | Switch | `no page` | Regex Parsing / Fixed-width | [`HPProCurveDriver`](../../net_docu_crawler/drivers/hpprocurve.py) |
-| [**Aruba / HPE**](aruba.md) | ArubaOS (IAP), AOS-CX | Access Point, Switch | `no page` | Regex / CLI Parsing | [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py) |
-| [**Palo Alto Networks**](paloalto.md) | PAN-OS (PA-Series, Panorama) | Firewall | `set cli pager off` | Tabular / XML / CLI | [`PaloAltoDriver`](../../net_docu_crawler/drivers/paloalto.py) |
-| [**Fortinet**](fortinet.md) | FortiOS (FortiGate) | Firewall | `config system console`<br>`set output standard`<br>`end` | Tabular / CMDB | [`FortinetDriver`](../../net_docu_crawler/drivers/fortinet.py) |
-| [**Arista Networks**](arista.md) | EOS (vEOS, cEOS, Fixed) | Switch, Router | Native JSON | Native JSON (`\| json`) | [`AristaDriver`](../../net_docu_crawler/drivers/arista.py) |
+| [**Aruba / HPE**](aruba.md) | ArubaOS (IAP), AOS-CX | Access Point, Switch | `no page` / `no paging` | Regex / CLI Parsing | [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py) |
+| [**Palo Alto Networks**](paloalto.md) | PAN-OS (PA-Series, Panorama) | Firewall | `set cli pager off` | Tabular / CLI | [`PaloAltoDriver`](../../net_docu_crawler/drivers/paloalto.py) |
+| [**Fortinet**](fortinet.md) | FortiOS (FortiGate) | Firewall | Read-only bounded `--More--` pager drainer *(no config writes)* | Tabular / CMDB | [`FortinetDriver`](../../net_docu_crawler/drivers/fortinet.py) |
+| [**Arista Networks**](arista.md) | EOS (vEOS, cEOS, Fixed) | Switch, Router | `terminal length 0` | Native JSON (`\| json`) | [`AristaDriver`](../../net_docu_crawler/drivers/arista.py) |
 | [**MikroTik**](mikrotik.md) | RouterOS v6 / v7 (CHR, RB) | Router, Switch | `without-paging` | Key-value pairs (`detail`) | [`MikroTikDriver`](../../net_docu_crawler/drivers/mikrotik.py) |
-| [**FRRouting (FRR)**](frr.md) | Linux Daemons (Debian/Ubuntu) | Router, Gateway | Native CLI | Native JSON (`show ... json`) | [`FRRDriver`](../../net_docu_crawler/drivers/frr.py) |
-| [**OPNsense**](opnsense.md) | FreeBSD Firewall / Gateway | Firewall, Gateway | Non-interactive exec | XML / POSIX | [`OPNsenseDriver`](../../net_docu_crawler/drivers/opnsense.py) |
+| [**FRRouting (FRR)**](frr.md) | Linux Daemons (Debian/Ubuntu) | Router, Gateway | Non-interactive `vtysh -c` | Native JSON (`show ... json`) | [`FRRDriver`](../../net_docu_crawler/drivers/frr.py) |
+| [**OPNsense**](opnsense.md) | FreeBSD Firewall / Gateway | Firewall, Gateway | Non-interactive Paramiko `exec_command` | XML / POSIX | [`OPNsenseDriver`](../../net_docu_crawler/drivers/opnsense.py) |
 | [**OpenWrt**](openwrt.md) | Embedded Linux (ARM/MIPS/x86) | Router, Gateway, AP | Non-interactive / POSIX | Native JSON (`ubus`) / UCI | [`OpenWrtDriver`](../../net_docu_crawler/drivers/openwrt.py) |
 
 ---
@@ -129,12 +130,14 @@ To power cross-vendor **Trunk VLAN Mismatch Detection** ([`net_docu_crawler/trun
 | Platform | Read-Only Trunk Operational Command(s) | Read-Only LAG / STP / Auth Commands | Driver |
 | :--- | :--- | :--- | :--- |
 | **Cisco IOS / IOS-XE / NX-OS** | `show interfaces trunk` | `show etherchannel summary` | [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py) |
-| **Juniper Junos OS** | `show ethernet-switching interfaces \| display json` *(text fallback)* | `show lacp interfaces \| display json`, `show spanning-tree interface \| display json` | [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) |
+| **Cisco IOS-XR** | — | `show bundle` | [`CiscoXRDriver`](../../net_docu_crawler/drivers/cisco_xr.py) |
+| **Cisco Small Business** | `show interfaces switchport` | `show interfaces port-channel` | [`CiscoSMBDriver`](../../net_docu_crawler/drivers/ciscosmb.py) |
+| **Juniper Junos OS** | `show ethernet-switching interfaces \| display json` *(text fallback)* | `show lacp interfaces \| display json`, `show spanning-tree interface \| display json`, `show dot1x interface \| display json` | [`JuniperDriver`](../../net_docu_crawler/drivers/juniper.py) |
 | **HPE Aruba AOS-CX** | `show interface trunk` | `show lacp interfaces` | [`ArubaDriver`](../../net_docu_crawler/drivers/aruba.py) |
-| **HP ProCurve / ArubaOS-S** | `show trunks` | `show lacp`, `show spanning-tree detail`, `show port-access authenticator` | [`HPProCurveDriver`](../../net_docu_crawler/drivers/hpprocurve.py) |
+| **HP ProCurve / ArubaOS-S** | `show trunks`, `show vlans ports all` | `show lacp`, `show spanning-tree detail`, `show port-access authenticator` | [`HPProCurveDriver`](../../net_docu_crawler/drivers/hpprocurve.py) |
 | **Arista EOS** | `show interfaces trunk \| json` *(text fallback)* | `show port-channel summary \| json` *(text fallback)* | [`AristaDriver`](../../net_docu_crawler/drivers/arista.py) |
 
-All drivers preserve real physical/logical interface names inside `device_data["port_profiles"]` (never injecting synthetic metadata keys) so [`trunk_audit.py`](../../net_docu_crawler/trunk_audit.py) can collapse LAG members onto logical bundles (`Port-channel*`, `ae*`, `Trk*`, `lag*`) and evaluate `TRK-001`–`TRK-007` across mixed-vendor switch links.
+All drivers preserve real physical/logical interface names inside `device_data["port_profiles"]` (never injecting synthetic metadata keys) so [`trunk_audit.py`](../../net_docu_crawler/trunk_audit.py) can collapse LAG members onto logical bundles (`Port-channel*`, `Bundle-Ether*`, `ae*`, `Trk*`, `lag*`) and evaluate `TRK-001`–`TRK-007` across mixed-vendor switch links.
 
 ---
 
@@ -147,7 +150,7 @@ To preserve **zero blast radius** and truthful, low-maintenance discovery, **Net
 
 ### Explicitly Excluded Categories (Documented Passively Instead)
 
-Hosts in these categories are intentionally **not** assigned CLI drivers. Instead, they are documented passively via upstream switch LLDP/CDP, `/proc/net/arp` + OUI lookup, HTTP/HTTPS banner & TLS certificate fingerprinting, and opt-in read-only SNMP (`--snmp`) in `asset_inventory.csv` and `port_mac_endpoint_mapping.csv`:
+Hosts in these categories are intentionally **not** assigned CLI drivers. Instead, they are documented passively via upstream switch LLDP/CDP, `/proc/net/arp` + OUI lookup, HTTP/HTTPS banner & TLS certificate fingerprinting, and opt-in read-only SNMP (`--snmp`) in `00_manifest/failures.csv`, `failed_hosts.json`, and `port_mac_endpoint_mapping.csv`:
 
 - **Cloud-Only / Controller-Locked Platforms** *(Cisco Meraki, controller-managed Ubiquiti UniFi, Aruba Instant On, TP-Link Omada Cloud)*: No stable local read-only CLI; full extraction requires SaaS cloud API keys and outbound internet access.
 - **Web-Only "Smart" & Unmanaged Switches / Consumer ISP Combos** *(Netgear Plus/Smart web-only, D-Link EasySmart, unmanaged TP-Link, ISP-locked Arris/Sagemcom/Technicolor)*: No SSH/Telnet CLI; only proprietary HTML/CGI web forms without read-only separation.
@@ -167,6 +170,8 @@ Hosts in these categories are intentionally **not** assigned CLI drivers. Instea
 - **[pyca/cryptography Python Library](https://cryptography.io/)**
 - **[netaddr Python Network Address Library](https://netaddr.readthedocs.io/)**
 - **[Cisco IOS Software Configuration Guide](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html)**
+- **[Cisco IOS-XR Software Documentation](https://www.cisco.com/c/en/us/support/ios-nx-os-software/ios-xr-software/tsd-products-support-series-home.html)**
+- **[Cisco Small Business 300 Series Command Reference](https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html)**
 - **[Juniper JunOS Automation & CLI Documentation](https://www.juniper.net/documentation/product/us/en/junos-os/)**
 - **[HPE Aruba AOS-CX Documentation Portal](https://www.arubanetworks.com/techdocs/AOS-CX/help_portal/Content/home.htm)**
 - **[HPE ArubaOS-S 16.10 Management & Configuration Guide](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm)**

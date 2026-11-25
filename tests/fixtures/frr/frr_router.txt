@@ -1,0 +1,61 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from FRRouting 10.x on Debian Linux)
+# Vendor: FRRouting (Linux Router)
+# PROMPT: root@rtr-frr-01:~#
+# Official CLI Reference: https://docs.frrouting.org/
+
+--- COMMAND: hostname -s ---
+rtr-frr-01
+
+--- COMMAND: vtysh -c 'show version' ---
+FRRouting 10.2.1 (rtr-frr-01) on Linux(6.8.0).
+Copyright 1996-2005 Kunihiro Ishiguro, et al.
+
+--- COMMAND: vtysh -c 'show interface json' ---
+{
+  "eth0": {
+    "administrativeStatus": "up",
+    "operationalStatus": "up",
+    "hardwareAddress": "bc:24:11:aa:08:01",
+    "ipAddresses": [{"address": "10.10.4.1/24"}]
+  },
+  "lo": {
+    "administrativeStatus": "up",
+    "operationalStatus": "up",
+    "ipAddresses": [{"address": "127.0.0.1/8"}]
+  }
+}
+
+--- COMMAND: lldpcli show neighbors -f json ---
+{"lldp": {}}
+
+--- COMMAND: vtysh -c 'show ip route json' ---
+{
+  "0.0.0.0/0": [
+    {
+      "prefix": "0.0.0.0/0",
+      "protocol": "static",
+      "selected": true,
+      "nexthops": [{"ip": "10.10.4.254", "interfaceName": "eth0", "active": true}]
+    }
+  ],
+  "10.10.4.0/24": [
+    {
+      "prefix": "10.10.4.0/24",
+      "protocol": "connected",
+      "selected": true,
+      "nexthops": [{"interfaceName": "eth0", "active": true}]
+    }
+  ]
+}
+
+--- COMMAND: ip -j neigh show ---
+[
+  {"dst": "10.10.4.254", "dev": "eth0", "lladdr": "00:09:0f:aa:01:01", "state": ["REACHABLE"]}
+]
+
+--- COMMAND: vtysh -c 'show running-config' ---
+hostname rtr-frr-01
+!
+ip route 0.0.0.0/0 10.10.4.254
+!
+end

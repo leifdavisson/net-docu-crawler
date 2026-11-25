@@ -1,0 +1,288 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from Juniper EX2300-C-12P Junos 23.4R2)
+# Vendor: Juniper Networks (Junos EX Access Switch)
+# PROMPT: admin@sw-access-01>
+# Official CLI Reference: https://www.juniper.net/documentation/product/us/en/junos-os/
+
+--- COMMAND: show version | display json ---
+{
+  "software-information": [
+    {
+      "host-name": [{"data": "sw-access-01"}],
+      "product-model": [{"data": "ex2300-c-12p"}],
+      "junos-version": [{"data": "23.4R2.13"}]
+    }
+  ]
+}
+
+--- COMMAND: show chassis hardware | display json ---
+{
+  "chassis-inventory": [
+    {
+      "chassis": [
+        {
+          "name": [{"data": "Chassis"}],
+          "serial-number": [{"data": "CW02LAB00010"}],
+          "description": [{"data": "EX2300-C-12P"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show chassis mac-addresses ---
+MAC address information:
+  Public base address     fc:33:42:aa:10:10
+  Public count            64
+
+--- COMMAND: show interfaces terse | display json ---
+{
+  "interface-information": [
+    {
+      "physical-interface": [
+        {
+          "name": [{"data": "ge-0/0/0"}],
+          "admin-status": [{"data": "up"}],
+          "oper-status": [{"data": "up"}],
+          "logical-interface": [
+            {"name": [{"data": "ge-0/0/0.0"}], "oper-status": [{"data": "up"}]}
+          ]
+        },
+        {
+          "name": [{"data": "ge-0/0/3"}],
+          "admin-status": [{"data": "up"}],
+          "oper-status": [{"data": "up"}],
+          "logical-interface": [
+            {"name": [{"data": "ge-0/0/3.0"}], "oper-status": [{"data": "up"}]}
+          ]
+        },
+        {
+          "name": [{"data": "ge-0/0/4"}],
+          "admin-status": [{"data": "down"}],
+          "oper-status": [{"data": "down"}],
+          "logical-interface": []
+        },
+        {
+          "name": [{"data": "bme0"}],
+          "admin-status": [{"data": "up"}],
+          "oper-status": [{"data": "up"}],
+          "logical-interface": [
+            {
+              "name": [{"data": "bme0.0"}],
+              "oper-status": [{"data": "up"}],
+              "address-family": [
+                {
+                  "address-family-name": [{"data": "inet"}],
+                  "interface-address": [{"ifa-local": [{"data": "128.0.0.1/2"}]}]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": [{"data": "irb"}],
+          "admin-status": [{"data": "up"}],
+          "oper-status": [{"data": "up"}],
+          "logical-interface": [
+            {
+              "name": [{"data": "irb.0"}],
+              "oper-status": [{"data": "up"}],
+              "address-family": [
+                {
+                  "address-family-name": [{"data": "inet"}],
+                  "interface-address": [
+                    {
+                      "ifa-local": [{"data": "10.10.1.10"}],
+                      "ifa-destination": [{"data": "10.10.1.0/24"}]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show interfaces ---
+Physical interface: ge-0/0/0, Enabled, Physical link is Up
+  Description: Uplink to sw-core-01
+  Link-level type: Ethernet, MTU: 1514, Speed: 1000mbps, Duplex: Full-Duplex
+  Current address: fc:33:42:aa:10:11, Hardware address: fc:33:42:aa:10:11
+Physical interface: ge-0/0/3, Enabled, Physical link is Up
+  Description: Aruba AP ap-floor1-01
+  Link-level type: Ethernet, MTU: 1514, Speed: 1000mbps, Duplex: Full-Duplex
+  Current address: fc:33:42:aa:10:13, Hardware address: fc:33:42:aa:10:13
+
+--- COMMAND: show lldp neighbors detail | display json ---
+{
+  "lldp-neighbors-information": [
+    {
+      "lldp-neighbor-information": [
+        {
+          "lldp-local-port-id": [{"data": "512"}],
+          "lldp-local-interface": [{"data": "ge-0/0/0.0"}],
+          "lldp-remote-system-name": [{"data": "sw-core-01"}],
+          "lldp-remote-port-id": [{"data": "Gi1/0/24"}],
+          "lldp-remote-chassis-id": [{"data": "00:00:0c:aa:02:02"}],
+          "lldp-remote-system-description": [{"data": "Cisco IOS XE Software, WS-C3850-48P"}],
+          "lldp-remote-management-address": [{"data": "10.10.1.2"}]
+        },
+        {
+          "lldp-local-port-id": [{"data": "515"}],
+          "lldp-local-interface": [{"data": "ge-0/0/3.0"}],
+          "lldp-remote-system-name": [{"data": "ap-floor1-01"}],
+          "lldp-remote-port-id": [{"data": "eth0"}],
+          "lldp-remote-chassis-id": [{"data": "40:e3:d6:aa:20:20"}],
+          "lldp-remote-system-description": [{"data": "ArubaOS (MODEL: 215), Version 8.6.0.25"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show route | display json ---
+{
+  "route-information": [
+    {
+      "route-table": [
+        {
+          "table-name": [{"data": "inet.0"}],
+          "rt": [
+            {
+              "rt-destination": [{"data": "0.0.0.0/0"}],
+              "rt-entry": [
+                {
+                  "active-tag": [{"data": "*"}],
+                  "protocol-name": [{"data": "Static"}],
+                  "nh": [{"to": [{"data": "10.10.1.1"}], "via": [{"data": "irb.0"}]}]
+                }
+              ]
+            },
+            {
+              "rt-destination": [{"data": "10.10.1.0/24"}],
+              "rt-entry": [
+                {
+                  "active-tag": [{"data": "*"}],
+                  "protocol-name": [{"data": "Direct"}],
+                  "nh": [{"via": [{"data": "irb.0"}]}]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show arp no-resolve | display json ---
+{
+  "arp-table-information": [
+    {
+      "arp-table-entry": [
+        {
+          "mac-address": [{"data": "00:09:0f:aa:01:01"}],
+          "ip-address": [{"data": "10.10.1.1"}],
+          "interface-name": [{"data": "irb.0"}]
+        },
+        {
+          "mac-address": [{"data": "00:00:0c:aa:02:02"}],
+          "ip-address": [{"data": "10.10.1.2"}],
+          "interface-name": [{"data": "irb.0"}]
+        },
+        {
+          "mac-address": [{"data": "40:e3:d6:aa:20:20"}],
+          "ip-address": [{"data": "10.10.1.20"}],
+          "interface-name": [{"data": "irb.0"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show spanning-tree bridge | display json ---
+{
+  "stp-bridge-parameters-information": [
+    {
+      "stp-bridge-parameters": [
+        {
+          "stp-context-name": [{"data": "default"}],
+          "stp-bridge-root-id": [{"data": "4096.00:00:0c:aa:02:02"}],
+          "stp-bridge-id": [{"data": "32768.fc:33:42:aa:10:10"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show poe controller | display json ---
+{
+  "poe-controller-information": [
+    {
+      "poe-controller-status": [
+        {
+          "controller-maximum-power": [{"data": "124.00W"}],
+          "controller-power-consumption": [{"data": "9.80W"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show poe interface | display json ---
+{
+  "poe-interface-information": [
+    {
+      "poe-interface-status": [
+        {
+          "interface-name": [{"data": "ge-0/0/3"}],
+          "interface-status": [{"data": "ON"}],
+          "interface-power-consumption": [{"data": "9.8W"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show ethernet-switching table | display json ---
+{
+  "l2ng-l2ald-rt-entry-information": [
+    {
+      "l2ng-l2ald-mac-entry-vlan": [
+        {
+          "l2ng-l2-mac-vlan-name": [{"data": "Corp-LAN"}],
+          "l2ng-l2-mac-address": [{"data": "40:e3:d6:aa:20:20"}],
+          "l2ng-l2-mac-logical-interface": [{"data": "ge-0/0/3.0"}]
+        }
+      ]
+    }
+  ]
+}
+
+--- COMMAND: show interfaces diagnostics optics | display json ---
+{
+  "interface-information": [
+    {
+      "physical-interface": []
+    }
+  ]
+}
+
+--- COMMAND: show configuration | display set ---
+set system host-name sw-access-01
+set system name-server 9.9.9.9
+set system ntp server 10.10.99.50
+set vlans Corp-LAN vlan-id 10
+set vlans Corp-LAN l3-interface irb.0
+set vlans Voice vlan-id 20
+set vlans Management vlan-id 99
+set interfaces ge-0/0/0 description "Uplink to sw-core-01"
+set interfaces ge-0/0/0 unit 0 family ethernet-switching interface-mode trunk
+set interfaces ge-0/0/0 unit 0 family ethernet-switching vlan members [ Corp-LAN Voice Management ]
+set interfaces ge-0/0/3 description "Aruba AP ap-floor1-01"
+set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members Corp-LAN
+set interfaces irb unit 0 family inet address 10.10.1.10/24
+set routing-options static route 0.0.0.0/0 next-hop 10.10.1.1

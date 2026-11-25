@@ -69,19 +69,21 @@ def test_online_oui_lookup_cached(tmp_path, monkeypatch):
     from unittest.mock import patch
 
     cache_file = tmp_path / "oui_cache.json"
+    monkeypatch.delenv("NET_DOCU_OFFLINE_OUI", raising=False)
     monkeypatch.setattr(oui_lookup, "OUI_CACHE_FILE", str(cache_file))
     monkeypatch.setattr(oui_lookup, "_online_oui_cache", {})
     monkeypatch.setattr(oui_lookup, "_online_cache_loaded", False)
+    monkeypatch.setattr(oui_lookup, "_transient_failed_ouis", set())
 
     # Patch load_oui_file=False so test is independent of any local oui.txt on disk
     with (
         patch("oui_lookup.load_oui_file", return_value=False),
         patch("oui_lookup._fetch_oui_online", return_value="Fortinet, Inc.") as mock_fetch,
     ):
-        assert oui_lookup.get_vendor("08:5B:0E:11:22:33") == "Fortinet, Inc."
+        assert oui_lookup.get_vendor("08:5B:0E:11:22:33", online=True) == "Fortinet, Inc."
         assert mock_fetch.call_count == 1
         # Second call for same OUI must hit cache, not network
-        assert oui_lookup.get_vendor("08:5B:0E:99:88:77") == "Fortinet, Inc."
+        assert oui_lookup.get_vendor("08:5B:0E:99:88:77", online=True) == "Fortinet, Inc."
         assert mock_fetch.call_count == 1
 
     # Reload from disk cache in a fresh in-memory state
@@ -91,5 +93,5 @@ def test_online_oui_lookup_cached(tmp_path, monkeypatch):
         patch("oui_lookup.load_oui_file", return_value=False),
         patch("oui_lookup._fetch_oui_online") as mock_fetch_2,
     ):
-        assert oui_lookup.get_vendor("08:5B:0E:44:55:66") == "Fortinet, Inc."
+        assert oui_lookup.get_vendor("08:5B:0E:44:55:66", online=True) == "Fortinet, Inc."
         assert mock_fetch_2.call_count == 0

@@ -1,0 +1,94 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from FortiGate-VM64-KVM FortiOS v7.4.9, zero config-mode writes)
+# Vendor: Fortinet (FortiGate Firewall)
+# PROMPT: fw-edge-01 #
+# Official CLI Reference: https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference
+
+--- COMMAND: get system status ---
+Version: FortiGate-60F v7.4.9,build2829,250924 (GA.M)
+Serial-Number: FGT60FLAB000001
+Hostname: fw-edge-01
+Virtual domain configuration: disable
+Operation Mode: NAT
+
+--- COMMAND: show system interface ---
+config system interface
+    edit "wan1"
+        set vdom "root"
+        set ip 198.51.100.2 255.255.255.252
+        set allowaccess ping
+        set type physical
+        set alias "ISP-Uplink"
+    next
+    edit "port1"
+        set vdom "root"
+        set ip 10.10.1.1 255.255.255.0
+        set allowaccess ping https ssh
+        set type physical
+        set description "LAN Uplink to sw-core-01"
+    next
+    edit "naf.root"
+        set vdom "root"
+        set type tunnel
+    next
+    edit "ssl.root"
+        set vdom "root"
+        set type tunnel
+    next
+end
+
+--- COMMAND: diagnose snmp sysinfo lldp neighbor ---
+Port: port1
+Chassis ID: 00:00:0c:aa:02:02
+Port ID: Gi1/0/1
+System Name: sw-core-01
+System Description: Cisco IOS XE Software, WS-C3850-48P
+Management Address: 10.10.1.2
+
+--- COMMAND: get router info routing-table all ---
+Routing table for VRF=0
+S*      0.0.0.0/0 [10/0] via 198.51.100.1, wan1, [1/0]
+C       198.51.100.0/30 is directly connected, wan1
+C       10.10.1.0/24 is directly connected, port1
+S       10.10.20.0/24 [10/0] via 10.10.1.2, port1
+
+--- COMMAND: get system arp ---
+Address           Age(min)   Hardware Addr      Interface
+10.10.1.2         0          00:00:0c:aa:02:02  port1
+10.10.1.10        1          fc:33:42:aa:10:10  port1
+10.10.1.20        2          40:e3:d6:aa:20:20  port1
+198.51.100.1      0          02:00:5e:aa:99:01  wan1
+
+--- COMMAND: get system interface transceiver ---
+command parse error before 'transceiver'
+Command fail. Return code -61
+
+--- COMMAND: show full-configuration ---
+#config-version=FGT60F-7.4.9-FW-build2829:opmode=0:vdom=0:user=readonly
+config system global
+    set hostname "fw-edge-01"
+end
+config system dns
+    set primary 9.9.9.9
+    set secondary 1.1.1.1
+end
+config system ntp
+    set ntpsync enable
+    set type custom
+    config ntpserver
+        edit 1
+            set server "10.10.99.50"
+        next
+    end
+end
+config firewall policy
+    edit 1
+        set name "LAN-to-WAN"
+        set srcintf "port1"
+        set dstintf "wan1"
+        set action accept
+        set srcaddr "all"
+        set dstaddr "all"
+        set service "ALL"
+        set nat enable
+    next
+end

@@ -1,0 +1,94 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from HP J9727A 2920-24G-PoE+ WB.16.10.0025)
+# Vendor: HP ProCurve / ArubaOS-S
+# PROMPT: sw-procurve-01#
+# Official CLI Reference: https://www.arubanetworks.com/techdocs/AOS-Switch/16.10/
+
+--- COMMAND: show system ---
+ Status and Counters - General System Information
+
+  System Name        : sw-procurve-01
+  System Contact     :
+  System Location    : Lab-Rack-1
+  MAC Age Time (sec) : 300
+  Time Zone          : 0
+  Software revision  : WB.16.10.0025        Base MAC Addr      : 1458d0-aa0606
+  ROM Version        : WB.16.03             Serial Number      : SG45LAB0006
+
+--- COMMAND: show modules ---
+ Status and Counters - Module Information
+  Chassis: 2920-24G-PoE+ J9727A         Serial Number:   SG45LAB0006
+
+--- COMMAND: show ip ---
+ Internet (IP) Service
+  IP Routing : Disabled
+  Default Gateway : 10.10.1.1
+
+  VLAN                 | IP Config  IP Address      Subnet Mask     Proxy ARP
+  -------------------- + ---------- --------------- --------------- ---------
+  DEFAULT_VLAN         | Manual     10.10.1.30      255.255.255.0   No
+
+--- COMMAND: show interfaces brief ---
+ Status and Counters - Port Status
+                  | Intrusion                           MDI  Flow Bcast
+  Port  Type      | Alert     Enabled Status Mode       Mode Ctrl Limit
+  ----- --------- + --------- ------- ------ ---------- ---- ---- -----
+  1     100/1000T | No        Yes     Up     1000FDx    MDIX off  0
+  2     100/1000T | No        Yes     Down   1000FDx    Auto off  0
+
+--- COMMAND: show lldp info remote-device ---
+ LLDP Remote Devices Information
+
+  LocalPort | ChassisId                 PortId PortDescr SysName
+  --------- + ------------------------- ------ --------- ----------------------
+  1         | 00 00 0c aa 02 02         Gi1/0/5 Uplink   sw-core-01
+
+--- COMMAND: show ip route ---
+                                IP Route Entries
+
+  Destination        Gateway         VLAN Type      Sub-Type   Metric     Dist.
+  ------------------ --------------- ---- --------- ---------- ---------- -----
+  0.0.0.0/0          10.10.1.1       1    static               1          1
+  10.10.1.0/24       DEFAULT_VLAN    1    connected            1          0
+
+--- COMMAND: show arp ---
+ IP ARP table
+
+  IP Address       MAC Address       Type    Port
+  ---------------  ----------------- ------- ----
+  10.10.1.1        00090f-aa0101     dynamic 1
+  10.10.1.2        00000c-aa0202     dynamic 1
+
+--- COMMAND: show spanning-tree ---
+ Multiple Spanning Tree (MST) Information
+  STP Enabled   : Yes
+  Force Version : RSTP-operation
+  IST Mapped VLANs : 1-4094
+  Switch MAC Address : 1458d0-aa0606
+  Switch Priority    : 32768
+  Root MAC Address   : 00000c-aa0202
+  Root Priority      : 4096
+
+--- COMMAND: show power-over-ethernet brief ---
+ Status and Counters - PoE Power Status
+  Available: 370 W  Used: 15 W  Remaining: 355 W
+ PoE   | Power  Power  Alloc   Actual  Configured
+ Port  | Enable Alloc  By      Power   Type
+ ----- + ------ ------ ------- ------- -----------
+ 1     | Yes    15.4 W usage   15.0 W
+
+--- COMMAND: show mac-address ---
+ Status and Counters - Address Table
+  MAC Address   Port     VLAN
+  ------------- -------- ----
+  00000c-aa0202 1        1
+
+--- COMMAND: show running-config ---
+hostname "sw-procurve-01"
+vlan 1
+   name "DEFAULT_VLAN"
+   untagged 1-24
+   ip address 10.10.1.30 255.255.255.0
+   exit
+ip default-gateway 10.10.1.1
+ip dns server-address priority 1 9.9.9.9
+sntp server priority 1 10.10.99.50

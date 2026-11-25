@@ -1,0 +1,64 @@
+# Fixture provenance: SYNTHETIC-DOC-BACKED (NEEDS-DEVICE-DATA for live Cisco SMB hardware)
+# Vendor: Cisco Small Business (SG350 / CBS)
+# PROMPT: sw-smb-01#
+# Official CLI Reference: https://www.cisco.com/c/en/us/support/switches/small-business-350-series-managed-switches/series.html
+
+--- COMMAND: show system ---
+System Description:                       SG350-28P 28-Port Gigabit PoE Managed Switch
+System Up Time (days,hour:min:sec):       10,04:12:00
+System Contact:
+System Name:                              sw-smb-01
+System Location:                          Lab-IDF
+System MAC Address:                       00:00:0c:aa:09:09
+
+--- COMMAND: show system id ---
+Unit    Serial number     PID
+----    ----------------  ----------------
+1       DNI22LAB0009      SG350-28P-K9
+
+--- COMMAND: show version ---
+Active-image: flash://system/images/image1.bin
+  Version: 2.5.9.16
+
+--- COMMAND: show ip interface ---
+IP Address         I/F       I/F Status  Type    Directed Broadcast  Precedence  Status
+------------------ --------- ----------- ------- ------------------- ----------- --------
+10.10.7.10/24      vlan 10   UP          Static  disable             No          Valid
+
+--- COMMAND: show interfaces status ---
+Port      Type         Duplex  Speed Neg      ctrl State       Pressure Mode
+--------  ------------ ------  ----- -------- ---- ----------- -------- -------
+gi1       1G-Copper    Full    1000  Enabled  Off  Up          Disabled None
+gi2       1G-Copper    --      --    --       --   Down        --       --
+
+--- COMMAND: show lldp neighbors ---
+Port       Device ID          Port ID        System Name     Capabilities  TTL
+---------  -----------------  -------------  --------------  ------------  ---
+gi1        00:00:0c:aa:02:02  Gi1/0/15       sw-core-01      B, R          110
+
+--- COMMAND: show ip route ---
+S   0.0.0.0/0 [1/1] via 10.10.7.1, 10:00:00, vlan 10
+C   10.10.7.0/24 is directly connected, vlan 10
+
+--- COMMAND: show arp ---
+VLAN  Interface  IP Address       MAC Address        Status
+----- ---------- ---------------- ------------------ --------
+10    gi1        10.10.7.1        00:09:0f:aa:01:01  Dynamic
+
+--- COMMAND: show running-config ---
+hostname sw-smb-01
+ip name-server 9.9.9.9
+!
+vlan database
+vlan 10
+exit
+!
+interface vlan 10
+ ip address 10.10.7.10 255.255.255.0
+!
+interface GigabitEthernet1
+ description Uplink to sw-core-01
+ switchport mode trunk
+ switchport trunk allowed vlan add 10
+!
+end

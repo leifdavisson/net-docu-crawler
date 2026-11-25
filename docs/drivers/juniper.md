@@ -48,14 +48,22 @@ JunOS natively supports serialized JSON output across all operational commands. 
 ```junos
 show version | display json
 show chassis hardware | display json
+show chassis mac-addresses
 show interfaces terse | display json
+show interfaces
 show lldp neighbors detail | display json
 show ethernet-switching interfaces | display json
 show lacp interfaces | display json
+show spanning-tree bridge | display json
 show spanning-tree interface | display json
+show dot1x interface | display json
 show route | display json
 show arp no-resolve | display json
+show poe controller | display json
+show poe interface | display json
 show ethernet-switching table | display json
+show interfaces diagnostics optics | display json
+show configuration | display set
 ```
 
 If a legacy JunOS release (e.g., JunOS < 14.2) does not support JSON serialization on a specific command, the driver automatically catches the exception and falls back to regular expression parsing (including text fallback for `show ethernet-switching interfaces`).
