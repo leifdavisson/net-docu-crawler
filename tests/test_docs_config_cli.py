@@ -176,7 +176,7 @@ def test_target_vendor_help_and_organize_output_dir_flags(tmp_path):
     with patch("os.makedirs"):
         run_dir, is_org, _, _ = _resolve_run_output_dir(cfg, ["192.0.2.1"])
     assert is_org is True
-    assert run_dir.startswith("docs/net_docu_crawler/")
+    assert run_dir.replace("\\", "/").startswith("docs/net_docu_crawler/")
 
     # When output_dir is empty (CLI default), organized mode uses deliverables/
     args_def = parser.parse_args([])
@@ -185,7 +185,7 @@ def test_target_vendor_help_and_organize_output_dir_flags(tmp_path):
     with patch("os.makedirs"):
         run_dir_def, is_org_def, _, _ = _resolve_run_output_dir(cfg_def, ["192.0.2.1"])
     assert is_org_def is True
-    assert run_dir_def.startswith("deliverables/")
+    assert run_dir_def.replace("\\", "/").startswith("deliverables/")
     assert custom_base  # keep tmp_path used cleanly
 
 
@@ -217,6 +217,7 @@ def test_wrapper_scripts_prefer_dot_venv():
     assert r".\.venv\Scripts\python.exe" in run_ps1
     assert r".\venv\Scripts\python.exe" in run_ps1
 
-    # Syntax-check run.sh with bash -n
-    proc = subprocess.run(["bash", "-n", str(REPO_ROOT / "run.sh")], capture_output=True, text=True)
-    assert proc.returncode == 0, proc.stderr
+    # Syntax-check run.sh with bash -n (skip on Windows where System32\bash.exe is WSL stub)
+    if sys.platform != "win32":
+        proc = subprocess.run(["bash", "-n", str(REPO_ROOT / "run.sh")], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr

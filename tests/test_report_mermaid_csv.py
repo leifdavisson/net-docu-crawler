@@ -252,9 +252,10 @@ def test_cutover_scripts_prevent_bash_and_powershell_injection(tmp_path):
     sh_code = sh_path.read_text(encoding="utf-8")
     ps1_code = (tmp_path / "validate_cutover.ps1").read_text(encoding="utf-8")
 
-    # Bash script must pass `bash -n` syntax check and contain zero unescaped $() / backticks / raw newlines
-    proc = subprocess.run(["bash", "-n", str(sh_path)], capture_output=True, text=True, check=False)
-    assert proc.returncode == 0, f"bash -n failed: {proc.stderr}"
+    # Bash script must pass `bash -n` syntax check on POSIX and contain zero unescaped $() / backticks / raw newlines
+    if sys.platform != "win32":
+        proc = subprocess.run(["bash", "-n", str(sh_path)], capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, f"bash -n failed: {proc.stderr}"
     assert "\necho INJECTED" not in sh_code
     assert 'check_port "192.168.1.1" 22 "' in sh_code
     phase3_sh = sh_code.split("Phase 3:")[1].split("Validation Summary")[0]
