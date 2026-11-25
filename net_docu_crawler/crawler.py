@@ -31,9 +31,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+
+import paramiko
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 import oui_lookup
 import report_generator
@@ -297,13 +302,37 @@ def load_and_validate_credentials(
     return all_raw, warnings, errors
 
 
-def _log_event(log_path: str, msg: str):
+_LOG_EVENT_LOCK = threading.Lock()
+_INLINE_SECRET_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|pwd|secret|enable_secret|passphrase|community|token|api[_-]?key|auth[_-]?pwd|priv[_-]?pwd|pre-shared-key)\s*[=:]\s*)(\S+)"
+)
+_PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def _scrub_log_message(msg: str, secrets: Iterable[str] = ()) -> str:
+    """Redact inline secret key/value pairs, private keys, and known credential literals from event logs."""
+    if not msg:
+        return ""
+    scrubbed = _PEM_BLOCK_RE.sub("<REDACTED_PRIVATE_KEY>", str(msg))
+    scrubbed = _INLINE_SECRET_RE.sub(r"\1<REDACTED>", scrubbed)
+    unique_secrets = sorted({s for s in secrets if isinstance(s, str) and s}, key=len, reverse=True)
+    for secret_val in unique_secrets:
+        scrubbed = scrubbed.replace(secret_val, "<REDACTED>")
+    return scrubbed
+
+
+def _log_event(log_path: str, msg: str, secrets: Iterable[str] = ()):
     if not log_path:
         return
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_msg = _scrub_log_message(msg, secrets=secrets)
     try:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
+        with _LOG_EVENT_LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {safe_msg}\n")
     except OSError as exc:
         logger.debug("Failed to append crawler event to %s: %s", log_path, exc)
 
@@ -567,6 +596,51 @@ def _remove_empty_session_log(session_log: str) -> None:
         logger.debug("Unable to remove empty session log %s: %s", session_log, exc)
 
 
+_HOST_KEY_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "bad host key",
+    "host key verification failed",
+    "host key for server",
+    "not found in known_hosts",
+)
+_TRANSPORT_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "incompatible",
+    "no acceptable host key",
+    "no acceptable kex",
+    "error reading ssh protocol banner",
+    "connection refused",
+    "connection reset",
+    "timed out",
+    "tcp connection to device failed",
+)
+_AUTH_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "auth",
+    "password",
+    "login",
+    "denied",
+    "permission",
+    "credential",
+    "invalid",
+    "userauth",
+    "too many authentication failures",
+)
+
+
+def _classify_connect_error(exc: Exception) -> str:
+    """Classify a `driver.connect()` exception into `auth_failed`, `transport_failed`, or `driver_failed`."""
+    if isinstance(exc, (NetmikoAuthenticationException, paramiko.AuthenticationException)):
+        return "auth_failed"
+    err_msg = str(exc).lower()
+    if isinstance(exc, paramiko.BadHostKeyException) or any(k in err_msg for k in _HOST_KEY_ERROR_SUBSTRINGS):
+        return "transport_failed"
+    if isinstance(exc, (NetmikoTimeoutException, TimeoutError, ConnectionError)) or any(
+        k in err_msg for k in _TRANSPORT_ERROR_SUBSTRINGS
+    ):
+        return "transport_failed"
+    if any(k in err_msg for k in _AUTH_ERROR_SUBSTRINGS):
+        return "auth_failed"
+    return "driver_failed"
+
+
 def _connect_and_crawl_once(
     driver_cls: type,
     ip: str,
@@ -594,41 +668,37 @@ def _connect_and_crawl_once(
             transport=transport,
         )
         conn = driver.connect()
-        try:
-            succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
-            print(f"[+] {succ_msg}")
-            _log_event(log_file, succ_msg)
-            data = driver.crawl(conn)
-        finally:
-            try:
-                conn.disconnect()
-            except Exception as disc_exc:
-                logger.debug("Disconnect cleanup failed for %s: %s", ip, disc_exc)
-        _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
-        return data, "success"
     except Exception as e:
         _remove_empty_session_log(session_log)
-        err_msg = str(e).lower()
+        safe_err = _scrub_log_message(str(e), secrets=(pwd, secret))
         _log_event(
             log_file,
-            f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {e}",
+            f"Connection attempt failed on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {safe_err}",
         )
-        if any(k in err_msg for k in ("auth", "password", "login", "denied", "permission", "credential", "invalid")):
-            return None, "auth_failed"
-        if any(
-            k in err_msg
-            for k in (
-                "incompatible",
-                "no acceptable host key",
-                "no acceptable kex",
-                "error reading ssh protocol banner",
-                "connection refused",
-                "timed out",
-                "tcp connection to device failed",
-            )
-        ):
-            return None, "transport_failed"
-        return None, "driver_failed"
+        return None, _classify_connect_error(e)
+
+    try:
+        succ_msg = f"Successfully connected to {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user})"
+        print(f"[+] {succ_msg}")
+        _log_event(log_file, succ_msg)
+        data = driver.crawl(conn)
+    except Exception as crawl_exc:
+        safe_err = _scrub_log_message(str(crawl_exc), secrets=(pwd, secret))
+        _log_event(
+            log_file,
+            f"Crawl failed after authentication on {ip}:{port} ({transport}) with {driver_cls.__name__} (User: {user}): {safe_err}",
+        )
+        return None, "crawl_failed"
+    finally:
+        try:
+            disconnect = getattr(conn, "disconnect", None) or getattr(conn, "close", None)
+            if callable(disconnect):
+                disconnect()
+        except Exception as disc_exc:
+            logger.debug("Disconnect cleanup failed for %s: %s", ip, disc_exc)
+
+    _log_event(log_file, f"Crawl completed successfully for {ip} (Hostname: {data.get('hostname')})")
+    return data, "success"
 
 
 def _try_driver_credentials(
@@ -642,10 +712,16 @@ def _try_driver_credentials(
     timeout: int,
     session_log: str,
     log_file: str,
+    attempted_users: set[str] | None = None,
+    stop_host: list[bool] | None = None,
 ) -> tuple[dict | None, bool]:
-    """Attempt authentication and crawl across candidate driver classes and credentials."""
+    """Attempt authentication and crawl across candidate driver classes and credentials.
+
+    Enforces strict AAA lockout protection: at most ONE authentication attempt per
+    normalized username per target IP across passwords, drivers, and transports/ports.
+    """
     saw_auth_failure = False
-    failed_ssh_creds: set[tuple[str, str]] = set()
+    user_ledger: set[str] = attempted_users if attempted_users is not None else set()
     for driver_cls in driver_classes:
         if transport == "telnet" and not getattr(driver_cls, "supports_telnet", True):
             continue
@@ -662,21 +738,26 @@ def _try_driver_credentials(
             user = cred.get("username", "")
             if not user:
                 continue
-            cred_key = (user, cred.get("password", ""))
-            if transport == "ssh" and cred_key in failed_ssh_creds:
+            user_key = user.strip().lower()
+            if not user_key or user_key in user_ledger:
                 continue
             data, outcome = _connect_and_crawl_once(
                 driver_cls, ip, port, transport, cred, timeout, session_log, log_file
             )
             if outcome == "success":
                 return data, saw_auth_failure
+            if outcome == "crawl_failed":
+                user_ledger.add(user_key)
+                if stop_host is not None:
+                    stop_host.append(True)
+                return None, saw_auth_failure
             if outcome == "auth_failed":
                 saw_auth_failure = True
-                if transport == "ssh":
-                    failed_ssh_creds.add(cred_key)
+                user_ledger.add(user_key)
                 continue
             if outcome == "transport_failed":
                 return None, saw_auth_failure
+            user_ledger.add(user_key)
             break
     return None, saw_auth_failure
 
@@ -756,6 +837,8 @@ def crawl_target_with_ports(
     last_app_class: tuple[str, str] | None = None
     cached_http_fp: dict | None = None
     http_probed, saw_auth_failure = False, False
+    attempted_users: set[str] = set()
+    stop_host: list[bool] = []
 
     for port, transport in ports_to_try:
         vendor_cand, banner, app_class, http_probed, cached_http_fp = _identify_port_vendor(
@@ -792,11 +875,15 @@ def crawl_target_with_ports(
             timeout,
             session_log,
             log_file,
+            attempted_users=attempted_users,
+            stop_host=stop_host,
         )
         if port_auth_fail:
             saw_auth_failure = True
         if data is not None:
             return data
+        if stop_host:
+            break
 
     _remove_empty_session_log(session_log)
     status = "unauthenticated" if (last_vendor in VENDOR_DRIVER_MAP and saw_auth_failure) else "unsupported"
@@ -1281,39 +1368,51 @@ def _crawl_target_batch(
     if not targets_to_crawl:
         return
 
-    with ThreadPoolExecutor(max_workers=max(1, min(cfg.max_workers, len(targets_to_crawl)))) as pool:
-        future_to_ip = {
-            pool.submit(
-                crawl_target_with_ports,
-                ip,
-                credentials,
-                timeout=cfg.timeout,
-                session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
-                log_file=crawler_log,
-                open_ports=open_ports_map.get(ip),
-                mac=registry.get_arp_mac(ip),
-                http_fingerprint=cfg.http_fingerprint,
-                vendor_hint=cfg.vendor_hint,
-                try_all_creds=cfg.try_all_creds,
-            ): ip
-            for ip in targets_to_crawl
-        }
-        results_by_ip: dict[str, dict | None] = {}
-        for fut in as_completed(future_to_ip):
-            ip = future_to_ip[fut]
-            try:
-                results_by_ip[ip] = fut.result()
-            except Exception as exc:
-                _log_event(crawler_log, f"Unhandled worker exception for {ip}: {exc}")
-                results_by_ip[ip] = None
+    batch_secrets = tuple(
+        s
+        for c in credentials
+        for s in (c.get("password", ""), c.get("secret", ""))
+        if isinstance(s, str) and len(s) >= 4
+    )
+    registered_ips: set[str] = set()
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(cfg.max_workers, len(targets_to_crawl)))) as pool:
+            future_to_ip = {
+                pool.submit(
+                    crawl_target_with_ports,
+                    ip,
+                    credentials,
+                    timeout=cfg.timeout,
+                    session_log=os.path.join(logs_dir, f"{ip.replace(':', '_')}_raw_session.log"),
+                    log_file=crawler_log,
+                    open_ports=open_ports_map.get(ip),
+                    mac=registry.get_arp_mac(ip),
+                    http_fingerprint=cfg.http_fingerprint,
+                    vendor_hint=cfg.vendor_hint,
+                    try_all_creds=cfg.try_all_creds,
+                ): ip
+                for ip in targets_to_crawl
+            }
+            results_by_ip: dict[str, dict | None] = {}
+            for fut in as_completed(future_to_ip):
+                ip = future_to_ip[fut]
+                try:
+                    results_by_ip[ip] = fut.result()
+                except Exception as exc:
+                    safe_exc = _scrub_log_message(str(exc), secrets=batch_secrets)
+                    _log_event(crawler_log, f"Unhandled worker exception for {ip}: {safe_exc}")
+                    results_by_ip[ip] = None
 
-    for ip in targets_to_crawl:
-        device_data = results_by_ip.get(ip)
-        if device_data:
-            registry.register_device(device_data)
-            raw_devices.append(device_data)
-        else:
-            registry.release_crawl(ip)
+        for ip in targets_to_crawl:
+            device_data = results_by_ip.get(ip)
+            if device_data:
+                registry.register_device(device_data)
+                registered_ips.add(ip)
+                raw_devices.append(device_data)
+    finally:
+        for ip in targets_to_crawl:
+            if ip not in registered_ips:
+                registry.release_crawl(ip)
 
 
 def _discover_neighbor_and_subnet_hops(
@@ -1389,17 +1488,21 @@ def _append_local_arp_inventory(
             continue
         if not registry.start_crawl(arp_ip):
             continue
-        arp_rec = build_partial_device_record(
-            ip=arp_ip,
-            mac=arp_mac,
-            vendor="Unknown",
-            banner="",
-            port=0,
-            transport="arp",
-            status="discovered",
-        )
-        registry.register_device(arp_rec)
-        raw_devices.append(arp_rec)
+        try:
+            arp_rec = build_partial_device_record(
+                ip=arp_ip,
+                mac=arp_mac,
+                vendor="Unknown",
+                banner="",
+                port=0,
+                transport="arp",
+                status="discovered",
+            )
+            registry.register_device(arp_rec)
+            raw_devices.append(arp_rec)
+        except BaseException:
+            registry.release_crawl(arp_ip)
+            raise
 
 
 def _enrich_partial_devices_http(raw_devices: list[dict], cfg: CrawlOptions) -> list[dict]:
@@ -1456,7 +1559,8 @@ def _enrich_partial_devices_snmp(partial_devs: list[dict], cfg: CrawlOptions) ->
             try:
                 info = fut.result()
             except Exception as exc:
-                logger.debug("SNMP sysinfo probe failed for %s: %s", dev.get("ip"), exc)
+                safe_exc = _scrub_log_message(str(exc), secrets=(cfg.snmp_community,))
+                logger.debug("SNMP sysinfo probe failed for %s: %s", dev.get("ip"), safe_exc)
                 info = None
             if not info:
                 continue
@@ -1485,7 +1589,8 @@ def _enrich_partial_devices_snmp(partial_devs: list[dict], cfg: CrawlOptions) ->
             try:
                 fb = fut.result() or {}
             except Exception as exc:
-                logger.debug("SNMPv2c fallback collection failed for %s: %s", dev.get("ip"), exc)
+                safe_exc = _scrub_log_message(str(exc), secrets=(cfg.snmp_community,))
+                logger.debug("SNMPv2c fallback collection failed for %s: %s", dev.get("ip"), safe_exc)
                 fb = {}
             if fb.get("interfaces_detail"):
                 dev["interfaces_detail"] = fb["interfaces_detail"]

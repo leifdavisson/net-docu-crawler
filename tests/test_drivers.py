@@ -979,21 +979,21 @@ def test_multi_credential_defaults_then_actual():
             "password": "real-cisco-pw",
             "secret": "real",
         },
-        {"name": "Actual-HP", "vendor": "hpprocurve", "username": "admin", "password": "real-hp-pw"},
-        {"name": "Actual-Juniper", "vendor": "juniper", "username": "root", "password": "real-junos-pw"},
-        {"name": "Actual-FortiGate", "vendor": "fortinet", "username": "admin", "password": "real-forti-pw"},
-        {"name": "Actual-MikroTik", "vendor": "mikrotik", "username": "admin", "password": "real-mt-pw"},
-        {"name": "Actual-OPNsense", "vendor": "opnsense", "username": "root", "password": "real-opn-pw"},
+        {"name": "Actual-HP", "vendor": "hpprocurve", "username": "hpadmin", "password": "real-hp-pw"},
+        {"name": "Actual-Juniper", "vendor": "juniper", "username": "junadmin", "password": "real-junos-pw"},
+        {"name": "Actual-FortiGate", "vendor": "fortinet", "username": "fgadmin", "password": "real-forti-pw"},
+        {"name": "Actual-MikroTik", "vendor": "mikrotik", "username": "mtadmin", "password": "real-mt-pw"},
+        {"name": "Actual-OPNsense", "vendor": "opnsense", "username": "opnadmin", "password": "real-opn-pw"},
     ]
     combined_creds = default_creds + actual_creds
 
     cases = [
         ("cisco", CiscoDriver, "10.0.1.10", ("netadmin", "real-cisco-pw")),
-        ("hpprocurve", HPProCurveDriver, "10.0.1.11", ("admin", "real-hp-pw")),
-        ("juniper", JuniperDriver, "10.0.1.12", ("root", "real-junos-pw")),
-        ("fortinet", FortinetDriver, "10.0.1.13", ("admin", "real-forti-pw")),
-        ("mikrotik", MikroTikDriver, "10.0.1.14", ("admin", "real-mt-pw")),
-        ("opnsense", OPNsenseDriver, "10.0.1.15", ("root", "real-opn-pw")),
+        ("hpprocurve", HPProCurveDriver, "10.0.1.11", ("hpadmin", "real-hp-pw")),
+        ("juniper", JuniperDriver, "10.0.1.12", ("junadmin", "real-junos-pw")),
+        ("fortinet", FortinetDriver, "10.0.1.13", ("fgadmin", "real-forti-pw")),
+        ("mikrotik", MikroTikDriver, "10.0.1.14", ("mtadmin", "real-mt-pw")),
+        ("opnsense", OPNsenseDriver, "10.0.1.15", ("opnadmin", "real-opn-pw")),
     ]
 
     for vendor_key, driver_cls, ip, expected_pair in cases:
@@ -1026,9 +1026,10 @@ def test_multi_credential_defaults_then_actual():
             assert result is not None
             assert result["status"] == "success"
             assert result["hostname"] == f"host-{vendor_key}"
-            # Must have tried multiple defaults before succeeding on the actual (last) credential
+            # Must try distinct default usernames before succeeding on the actual credential (<=1 attempt per username)
             assert len(attempts) >= 2
             assert attempts[-1] == expected_pair
+            assert len({u.strip().lower() for u, _ in attempts}) == len(attempts)
 
 
 def test_detect_local_subnets_and_default_ssh_2222():
