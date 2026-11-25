@@ -31,24 +31,51 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import oui_lookup
 
 logger = logging.getLogger(__name__)
 
-# Virtual NIC OUIs assigned by hypervisors (Proxmox, QEMU/KVM, VMware, VirtualBox, Hyper-V, Xen).
+# Virtual NIC OUIs assigned by hypervisors and container runtimes.
 # A virtual NIC MAC identifies the hypervisor, NOT the guest network OS, so Tier 1 must cascade to Tier 2.
-HYPERVISOR_OUI_PREFIXES = {
+_DEFAULT_HYPERVISOR_OUI_PREFIXES = {
     "BC:24:11",  # Proxmox Server Solutions GmbH
     "52:54:00",  # QEMU / KVM VirtIO
+    "52:54:AB",  # QEMU / KVM variant
+    "54:52:00",  # QEMU / KVM / libvirt variant
     "00:50:56",  # VMware ESX / vSphere
     "00:0C:29",  # VMware Workstation / ESXi
     "00:05:69",  # VMware Legacy
+    "00:1C:14",  # VMware ESXi / NSX
+    "00:1C:42",  # Parallels / Virtuozzo
+    "00:1A:4A",  # Qumranet / Red Hat oVirt / KVM
+    "00:03:FF",  # Microsoft Virtual PC / Hyper-V legacy
+    "00:0F:4B",  # Oracle Virtual Iron / VirtualBox
     "08:00:27",  # Oracle VirtualBox
+    "0A:00:27",  # Oracle VirtualBox Host-Only
     "00:15:5D",  # Microsoft Hyper-V
     "00:16:3E",  # Xen / XCP-ng
+    "50:6B:8D",  # Nutanix AHV
+    "02:42:AC",  # Docker bridge default
 }
+HYPERVISOR_OUI_PREFIXES = set(getattr(oui_lookup, "HYPERVISOR_OUI_PREFIXES", ())) | _DEFAULT_HYPERVISOR_OUI_PREFIXES
+
+
+def _normalize_arp_mac(mac: str) -> str:
+    """Normalize colon/dash MACs (including BSD/macOS short-octet `0:0:c:12:34:56`) to lowercase `aa:bb:cc:dd:ee:ff`."""
+    if not mac:
+        return ""
+    s = mac.strip()
+    m = re.fullmatch(
+        r"([0-9a-fA-F]{1,2})([:-])([0-9a-fA-F]{1,2})\2([0-9a-fA-F]{1,2})\2"
+        r"([0-9a-fA-F]{1,2})\2([0-9a-fA-F]{1,2})\2([0-9a-fA-F]{1,2})",
+        s,
+    )
+    if m:
+        return ":".join(m.group(i).zfill(2).lower() for i in (1, 3, 4, 5, 6, 7))
+    return oui_lookup.normalize_mac(s).lower()
 
 
 def is_hypervisor_mac(mac: str) -> bool:
@@ -59,13 +86,113 @@ def is_hypervisor_mac(mac: str) -> bool:
     return prefix in HYPERVISOR_OUI_PREFIXES
 
 
-def probe_tcp_port(ip: str, port: int, timeout: float = 0.8) -> bool:
-    """Fast, zero-blast TCP connect check to verify if a management port is open."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+def is_fhrp_mac(mac: str) -> bool:
+    """Returns True if `mac` is a recognized FHRP/HA virtual gateway MAC (VRRP, CARP, HSRP, GLBP, FGCP)."""
+    if not mac:
+        return False
+    helper = getattr(oui_lookup, "is_fhrp_mac", None)
+    if callable(helper):
+        return bool(helper(mac))
+    norm = _normalize_arp_mac(mac).upper()
+    parts = norm.split(":")
+    if len(parts) != 6:
+        return False
+    o0, o1, o2, o3, o4, _o5 = parts
+    if (o0, o1, o2, o3) == ("00", "00", "5E", "00") and o4 in ("01", "02"):
+        return True
+    if (o0, o1, o2, o3, o4) == ("00", "00", "0C", "07", "AC"):
+        return True
+    if (o0, o1, o2, o3) == ("00", "00", "0C", "9F") and o4.startswith("F"):
+        return True
+    if (o0, o1, o2, o3) == ("00", "07", "B4", "00"):
+        return True
+    if (o0, o1, o2, o3) == ("00", "09", "0F", "09"):
+        return True
+    return False
+
+
+def is_locally_administered_mac(mac: str) -> bool:
+    """Returns True if the IEEE U/L (locally administered) bit is set on the MAC address."""
+    if not mac:
+        return False
+    helper = getattr(oui_lookup, "is_locally_administered_mac", None)
+    if callable(helper):
+        return bool(helper(mac))
+    prefix = oui_lookup.get_oui_prefix(mac)
+    if len(prefix) < 2:
+        return False
     try:
-        return s.connect_ex((ip, port)) == 0
-    except OSError as exc:
+        return (int(prefix[:2], 16) & 0x02) != 0
+    except ValueError:
+        return False
+
+
+def is_multicast_mac(mac: str) -> bool:
+    """Returns True if the IEEE I/G (multicast/broadcast) bit is set on the MAC address."""
+    if not mac:
+        return False
+    helper = getattr(oui_lookup, "is_multicast_mac", None)
+    if callable(helper):
+        return bool(helper(mac))
+    prefix = oui_lookup.get_oui_prefix(mac)
+    if len(prefix) < 2:
+        return False
+    try:
+        return (int(prefix[:2], 16) & 0x01) != 0
+    except ValueError:
+        return False
+
+
+def _validate_port(port: int) -> int:
+    """Validate TCP/UDP port range (1..65535), raising ValueError on invalid or boolean ports."""
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ValueError(f"Port must be an integer between 1 and 65535, got {port!r}")
+    return port
+
+
+def _resolve_socket_target(ip: str, port: int, socktype: int) -> tuple[int, tuple]:
+    """
+    Resolve an IPv4 literal, IPv6 literal (bare or bracketed), or hostname into a
+    `(address_family, sockaddr)` pair after validating `port` in 1..65535.
+    """
+    valid_port = _validate_port(port)
+    host = (ip or "").strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1].strip()
+    if not host:
+        raise ValueError("Target host/IP must not be empty")
+
+    zone_base = host.split("%", 1)[0]
+    try:
+        addr_obj = ipaddress.ip_address(zone_base)
+    except ValueError:
+        infos = socket.getaddrinfo(host, valid_port, socket.AF_UNSPEC, socktype)
+        if not infos:
+            raise OSError(f"Unable to resolve target host {host!r}") from None
+        return infos[0][0], infos[0][4]
+
+    if addr_obj.version == 4:
+        return socket.AF_INET, (str(addr_obj), valid_port)
+    if "%" in host:
+        infos = socket.getaddrinfo(host, valid_port, socket.AF_INET6, socktype)
+        if infos:
+            return infos[0][0], infos[0][4]
+    return socket.AF_INET6, (str(addr_obj), valid_port, 0, 0)
+
+
+def probe_tcp_port(ip: str, port: int, timeout: float = 0.8) -> bool:
+    """Fast, zero-blast dual-stack TCP connect check to verify if a management port is open."""
+    try:
+        family, sockaddr = _resolve_socket_target(ip, port, socket.SOCK_STREAM)
+    except (OSError, ValueError) as exc:
+        logger.debug("Invalid TCP probe target %s:%r: %s", ip, port, exc)
+        return False
+
+    s = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        return s.connect_ex(sockaddr) == 0
+    except (OSError, ValueError, OverflowError) as exc:
         logger.debug("TCP port probe failed for %s:%d: %s", ip, port, exc)
         return False
     finally:
@@ -131,8 +258,8 @@ def _is_valid_arp_unicast_ipv4(ip_addr: str) -> bool:
 
 def get_arp_table_entries() -> dict[str, str]:
     """
-    Read the local OS ARP cache (`/proc/net/arp` on Linux) and return `{ip: mac}`
-    for complete unicast entries (excluding 00:00:00:00:00:00 and multicast/broadcast).
+    Read the local OS ARP cache (`/proc/net/arp` on Linux, `arp -a` on Windows,
+    `arp -an` on macOS/BSD) and return `{ip: mac}` for complete unicast entries.
     """
     entries: dict[str, str] = {}
     if os.path.exists("/proc/net/arp"):
@@ -142,8 +269,11 @@ def get_arp_table_entries() -> dict[str, str]:
                     parts = line.split()
                     if len(parts) < 4:
                         continue
-                    ip_addr, mac = parts[0], parts[3].lower()
-                    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                    # Skip incomplete / failed ARP entries (flags == 0x0)
+                    if parts[2].lower() == "0x0":
+                        continue
+                    ip_addr, mac = parts[0], _normalize_arp_mac(parts[3])
+                    if not mac or mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                         continue
                     if not _is_valid_arp_unicast_ipv4(ip_addr):
                         continue
@@ -157,14 +287,32 @@ def get_arp_table_entries() -> dict[str, str]:
                 m = re.match(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+\S+", line)
                 if not m:
                     continue
-                ip_addr, mac = m.group(1), m.group(2).replace("-", ":").lower()
-                if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                ip_addr, mac = m.group(1), _normalize_arp_mac(m.group(2))
+                if not mac or mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
                     continue
                 if not _is_valid_arp_unicast_ipv4(ip_addr):
                     continue
                 entries[ip_addr] = mac
         except (OSError, subprocess.SubprocessError) as exc:
             logger.debug("Windows arp -a cache lookup failed: %s", exc)
+    else:
+        try:
+            out = subprocess.check_output(["arp", "-an"], text=True, timeout=3, errors="ignore")
+            for line in out.splitlines():
+                m = re.search(
+                    r"\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\b",
+                    line,
+                )
+                if not m:
+                    continue
+                ip_addr, mac = m.group(1), _normalize_arp_mac(m.group(2))
+                if not mac or mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                    continue
+                if not _is_valid_arp_unicast_ipv4(ip_addr):
+                    continue
+                entries[ip_addr] = mac
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("BSD/macOS arp -an cache lookup failed: %s", exc)
     return entries
 
 
@@ -213,29 +361,41 @@ def probe_http_fingerprint(
     Read-only HTTP/HTTPS banner and TLS certificate probe for headless/web-managed
     devices (switches, APs, printers, NAS, iDRAC/iLO). Returns fingerprint dict or None.
     """
+    host_clean = (ip or "").strip().strip("[]")
+    host_hdr = f"[{host_clean}]" if ":" in host_clean else host_clean
     for port in ports:
         if not probe_tcp_port(ip, port, timeout=min(timeout, 0.7)):
+            continue
+        try:
+            family, sockaddr = _resolve_socket_target(ip, port, socket.SOCK_STREAM)
+        except (OSError, ValueError) as exc:
+            logger.debug("Invalid HTTP probe target %s:%r: %s", ip, port, exc)
             continue
         scheme = "https" if port in (443, 8443) else "http"
         server_hdr = ""
         title = ""
         cert_cn = ""
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.settimeout(timeout)
+        raw_sock = socket.socket(family, socket.SOCK_STREAM)
         conn_sock: socket.socket = raw_sock
         try:
-            raw_sock.connect((ip, port))
+            raw_sock.settimeout(timeout)
+            raw_sock.connect(sockaddr)
             if scheme == "https":
                 logger.debug("Performing unverified read-only HTTPS fingerprint probe on %s:%d", ip, port)
                 ctx = _build_unverified_probe_tls_context()
-                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=ip)
+                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host_clean)
                 conn_sock = tls_sock
                 cert_cn = _extract_peer_cert_cn(tls_sock, ip, port)
-            req = f"GET / HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode("ascii")
+            req = f"GET / HTTP/1.0\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n".encode("ascii", errors="ignore")
             conn_sock.sendall(req)
             chunks = []
             total = 0
+            deadline = time.monotonic() + max(float(timeout), 0.1)
             while total < 8192:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                conn_sock.settimeout(remaining)
                 try:
                     data = conn_sock.recv(2048)
                 except TimeoutError as exc:
@@ -259,7 +419,7 @@ def probe_http_fingerprint(
                 "title": title,
                 "cert_cn": cert_cn,
             }
-        except (OSError, ssl.SSLError) as exc:
+        except (OSError, ssl.SSLError, ValueError, OverflowError) as exc:
             logger.debug("HTTP/HTTPS fingerprint probe failed on %s:%d: %s", ip, port, exc)
         finally:
             try:
@@ -316,21 +476,14 @@ APPLIANCE_PROBE_PORTS: tuple[int, ...] = (41794, 41795, 7236, 7000, 5000, 8008, 
 
 def probe_appliance_ports(ip: str, timeout: float = 0.25) -> list[int]:
     """
-    Lightweight, read-only TCP connect probe for common AV/display/camera/printer appliance ports:
+    Lightweight, read-only dual-stack TCP connect probe for common AV/display/camera/printer appliance ports:
     41794/41795 (Crestron CIP/CTP), 7236 (Miracast/Airtame), 7000/5000 (AirPlay),
     8008 (Google Cast), 8000 (Newline/Hikvision SDK), 554 (RTSP Camera), 9100 (JetDirect Printer).
     """
     open_ports: list[int] = []
     for port in APPLIANCE_PROBE_PORTS:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        try:
-            if sock.connect_ex((ip, port)) == 0:
-                open_ports.append(port)
-        except OSError as exc:
-            logger.debug("Appliance port probe failed for %s:%d: %s", ip, port, exc)
-        finally:
-            sock.close()
+        if probe_tcp_port(ip, port, timeout=timeout):
+            open_ports.append(port)
     return open_ports
 
 
@@ -469,10 +622,15 @@ def probe_snmp_sysinfo(
         + _ber_tlv(0x04, community.encode("utf-8"))
         + pdu,
     )
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
     try:
-        sock.sendto(pkt, (ip, port))
+        family, sockaddr = _resolve_socket_target(ip, port, socket.SOCK_DGRAM)
+    except (OSError, ValueError) as exc:
+        logger.debug("Invalid SNMP probe target %s:%r: %s", ip, port, exc)
+        return None
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(pkt, sockaddr)
         resp, _addr = sock.recvfrom(4096)
         octet_strings = _decode_snmp_strings(resp)
         # First octet string is community echo; subsequent are sysDescr, sysName
@@ -483,25 +641,71 @@ def probe_snmp_sysinfo(
             "sysDescr": values[0] if len(values) >= 1 else "",
             "sysName": values[1] if len(values) >= 2 else "",
         }
-    except OSError as exc:
+    except (OSError, ValueError, OverflowError) as exc:
         logger.debug("SNMPv2c sysinfo probe failed on %s:%d: %s", ip, port, exc)
         return None
     finally:
         sock.close()
 
 
+def _extract_ssh_identification_line(buf: bytes) -> str:
+    """
+    Extract the RFC 4253 Section 4.2 SSH identification line (`SSH-...`) from a raw buffer,
+    ignoring any server pre-banner lines and discarding trailing binary KEXINIT bytes.
+    """
+    for raw_line in buf.splitlines():
+        clean = raw_line.split(b"\r", 1)[0]
+        if clean.startswith(b"SSH-"):
+            return clean.decode("utf-8", errors="ignore").strip()
+    return ""
+
+
 def get_ssh_banner(ip: str, port: int = 22, timeout: float = 3.0) -> str:
-    """Reads the SSH transport identification string directly from the remote server without authenticating."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    """
+    Reads the RFC 4253 SSH transport identification string without authenticating.
+    Scans past optional pre-banner lines and fragmented reads within a strict deadline.
+    """
+    try:
+        family, sockaddr = _resolve_socket_target(ip, port, socket.SOCK_STREAM)
+    except (OSError, ValueError) as exc:
+        logger.debug("Invalid SSH banner target %s:%r: %s", ip, port, exc)
+        return ""
+
+    s = socket.socket(family, socket.SOCK_STREAM)
     banner = ""
     try:
-        s.connect((ip, port))
-        raw = s.recv(1024)
-        # Keep only the RFC 4253 SSH identification line; discard trailing binary KEXINIT bytes.
-        raw_line = raw.split(b"\n", 1)[0].split(b"\r", 1)[0]
-        banner = raw_line.decode("utf-8", errors="ignore").strip()
-    except OSError as exc:
+        s.settimeout(timeout)
+        s.connect(sockaddr)
+        buf = b""
+        deadline = time.monotonic() + max(float(timeout), 0.1)
+        for _ in range(8):
+            if len(buf) >= 4096:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            s.settimeout(remaining)
+            try:
+                chunk = s.recv(1024)
+            except TimeoutError as exc:
+                logger.debug("SSH pre-auth banner read timed out on %s:%d: %s", ip, port, exc)
+                break
+            if not chunk:
+                break
+            buf += chunk
+            # Check complete lines (terminated by newline) for an RFC 4253 SSH-... identification string
+            if b"\n" in buf:
+                complete_part = buf.rsplit(b"\n", 1)[0]
+                ssh_line = _extract_ssh_identification_line(complete_part)
+                if ssh_line:
+                    return ssh_line
+        ssh_line = _extract_ssh_identification_line(buf)
+        if ssh_line:
+            return ssh_line
+        if buf:
+            raw_line = buf.split(b"\n", 1)[0].split(b"\r", 1)[0]
+            banner = raw_line.decode("utf-8", errors="ignore").strip()[:256]
+    except (OSError, ValueError, OverflowError) as exc:
         logger.debug("SSH pre-auth banner read failed on %s:%d: %s", ip, port, exc)
     finally:
         s.close()
@@ -513,14 +717,25 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
     Reads the initial Telnet login banner without authenticating, stripping Telnet IAC
     negotiation sequences (0xFF <cmd> <opt>) cleanly.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    try:
+        family, sockaddr = _resolve_socket_target(ip, port, socket.SOCK_STREAM)
+    except (OSError, ValueError) as exc:
+        logger.debug("Invalid Telnet banner target %s:%r: %s", ip, port, exc)
+        return ""
+
+    s = socket.socket(family, socket.SOCK_STREAM)
     banner = ""
     try:
-        s.connect((ip, port))
+        s.settimeout(timeout)
+        s.connect(sockaddr)
         raw = b""
+        deadline = time.monotonic() + max(float(timeout), 0.1)
         # Read initial negotiation + banner chunks
         for _ in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            s.settimeout(remaining)
             try:
                 chunk = s.recv(1024)
                 if not chunk:
@@ -547,7 +762,7 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
                 i += 1
         banner = cleaned.decode("utf-8", errors="ignore")
         banner = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", banner).strip()
-    except OSError as exc:
+    except (OSError, ValueError, OverflowError) as exc:
         logger.debug("Telnet banner probe failed on %s:%d: %s", ip, port, exc)
     finally:
         s.close()
@@ -555,62 +770,99 @@ def get_telnet_banner(ip: str, port: int = 23, timeout: float = 3.0) -> str:
 
 
 def get_mac_from_system_arp(ip: str) -> str:
-    """Reads the local host ARP cache (/proc/net/arp on Linux, or system `arp -a` on Windows/macOS) with 0 packet overhead."""
+    """Reads the local host ARP cache (/proc/net/arp on Linux, or system `arp` on Windows/macOS/BSD) with 0 packet overhead."""
+    target_ip = (ip or "").strip()
+    if not target_ip:
+        return ""
+
     # 1. Linux /proc/net/arp (fast zero-packet file read)
     if os.path.exists("/proc/net/arp"):
         try:
             with open("/proc/net/arp", encoding="utf-8") as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) >= 4 and parts[0] == ip:
-                        mac = parts[3]
-                        if mac != "00:00:00:00:00:00":
-                            return mac.lower()
+                    if len(parts) >= 4 and parts[0] == target_ip:
+                        if parts[2].lower() == "0x0":
+                            continue
+                        mac = _normalize_arp_mac(parts[3])
+                        if mac and mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                            return mac
         except OSError as exc:
-            logger.debug("Failed reading /proc/net/arp for %s: %s", ip, exc)
+            logger.debug("Failed reading /proc/net/arp for %s: %s", target_ip, exc)
 
     # 2. Windows / macOS / BSD system ARP cache table
+    ip_boundary_re = re.compile(rf"(?<![0-9a-fA-F.:]){re.escape(target_ip)}(?![0-9a-fA-F.:])")
+    mac_re = re.compile(r"(?<![0-9a-fA-F:-])([0-9a-fA-F]{1,2}(?:[:-][0-9a-fA-F]{1,2}){5})(?![0-9a-fA-F:-])")
     try:
-        cmd = ["arp", "-a", ip] if sys.platform.startswith("win") else ["arp", "-n", ip]
+        cmd = ["arp", "-a", target_ip] if sys.platform.startswith("win") else ["arp", "-n", target_ip]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
-                if ip in line:
-                    m = re.search(
-                        r"([0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2})",
-                        line,
-                    )
-                    if m:
-                        return oui_lookup.normalize_mac(m.group(1)).lower()
+                if not ip_boundary_re.search(line):
+                    continue
+                m = mac_re.search(line)
+                if m:
+                    mac = _normalize_arp_mac(m.group(1))
+                    if mac and mac not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+                        return mac
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("System arp command lookup failed for %s: %s", ip, exc)
+        logger.debug("System arp command lookup failed for %s: %s", target_ip, exc)
 
     return ""
 
 
 def _match_vendor_from_oui(vendor_oui: str) -> str:
     """Maps a normalized IEEE OUI vendor name string to a canonical driver candidate key."""
-    if "cisco" in vendor_oui:
+    v = (vendor_oui or "").strip().lower()
+    if not v or v == "unknown":
+        return "unknown"
+    # Excluded cloud-only platform: never misclassify Meraki as CLI Cisco IOS
+    if "meraki" in v:
+        return "unknown"
+    if "cisco" in v:
         return "cisco"
-    if "juniper" in vendor_oui:
+    if "juniper" in v:
         return "juniper"
-    if any(h in vendor_oui for h in ("hewlett packard", "procurve")):
-        return "hpprocurve"
-    if any(h in vendor_oui for h in ("aruba", "hpe")):
+    # Official IEEE Aruba OUI name is "Aruba, a Hewlett Packard Enterprise Company" -> check Aruba before HP
+    if "aruba" in v:
         return "aruba"
-    if "palo alto" in vendor_oui:
+    # "Hewlett Packard Enterprise" spans Aruba AOS-CX switches and HPE ProLiant/iLO servers -> cascade to Tier 2
+    if "hewlett packard enterprise" in v:
+        return "unknown"
+    if any(h in v for h in ("hewlett packard", "procurve")):
+        return "hpprocurve"
+    if "hpe" in v:
+        return "aruba"
+    if "palo alto" in v:
         return "paloalto"
-    if "fortinet" in vendor_oui:
+    if "fortinet" in v:
         return "fortinet"
-    if "arista" in vendor_oui:
+    if "arista" in v:
         return "arista"
-    if "mikrotik" in vendor_oui:
+    if "mikrotik" in v:
         return "mikrotik"
     return "unknown"
 
 
-def _match_vendor_from_banner(banner_lower: str, current_candidate: str) -> str:
+_MOCANA_NON_HP_OUI_KEYWORDS: tuple[str, ...] = (
+    "cisco",
+    "ruckus",
+    "brocade",
+    "netgear",
+    "d-link",
+    "avaya",
+)
+
+
+def _match_vendor_from_banner(banner_lower: str, current_candidate: str, oui_vendor: str = "") -> str:
     """Refines or classifies a vendor candidate from a lowercase SSH/Telnet banner string."""
+    if not banner_lower:
+        return current_candidate
+
+    # Non-network appliances must override even a prior OUI guess
+    if "crestron" in banner_lower or "openssh_for_windows" in banner_lower:
+        return "unsupported_appliance"
+
     if any(
         k in banner_lower
         for k in (
@@ -626,13 +878,9 @@ def _match_vendor_from_banner(banner_lower: str, current_candidate: str) -> str:
     ) or banner_lower.endswith(".rl"):
         return "ciscosmb"
 
-    if current_candidate != "unknown":
-        return current_candidate
-
-    if any(k in banner_lower for k in ("mocana", "procurve", "hewlett packard", "hp j")):
+    # Explicit vendor-specific SSH/Telnet banner tokens refine both "unknown" and generic "cisco"
+    if any(k in banner_lower for k in ("procurve", "hewlett packard", "hp j")):
         return "hpprocurve"
-    if "cisco" in banner_lower or "user access verification" in banner_lower:
-        return "cisco"
     if "aruba" in banner_lower:
         return "aruba"
     if "fortissh" in banner_lower or "fortigate" in banner_lower or "vb-mt" in banner_lower:
@@ -645,14 +893,27 @@ def _match_vendor_from_banner(banner_lower: str, current_candidate: str) -> str:
         return "mikrotik"
     if "arista" in banner_lower:
         return "arista"
-    if "debian" in banner_lower or "ubuntu" in banner_lower:
+    if "frrouting" in banner_lower:
         return "frrouting"
-    if "freebsd" in banner_lower or "opnsense" in banner_lower:
+    if "opnsense" in banner_lower:
         return "opnsense"
-    if "dropbear" in banner_lower or "openwrt" in banner_lower:
+    if "openwrt" in banner_lower:
         return "openwrt"
-    if "crestron" in banner_lower or "openssh_for_windows" in banner_lower:
-        return "unsupported_appliance"
+
+    if current_candidate != "unknown":
+        return current_candidate
+
+    if "mocana" in banner_lower:
+        oui_l = (oui_vendor or "").lower()
+        if oui_l and any(k in oui_l for k in _MOCANA_NON_HP_OUI_KEYWORDS):
+            return "unknown"
+        return "hpprocurve"
+    if "cisco" in banner_lower or "user access verification" in banner_lower:
+        return "cisco"
+
+    # Generic OpenSSH OS strings (Debian/Ubuntu/FreeBSD) and Dropbear are shared by
+    # Linux servers, Juniper Junos, pfSense, TrueNAS, UniFi, cameras, and phones -> leave "unknown"
+    # so HTTP/TLS fingerprinting, appliance guards, Tier 3 prompt inspection, or --vendor-hint resolve safely.
     return "unknown"
 
 
@@ -668,75 +929,115 @@ def detect_vendor_range(
     Returns: (vendor_candidate, banner_string)
     """
     candidate = "unknown"
+    oui_vendor = ""
 
-    # Tier 1: MAC Address OUI check (instant, 0 network packets; bypassed for hypervisor virtual NICs)
+    # Tier 1: MAC Address OUI check (instant, 0 network packets; bypassed for hypervisor,
+    # FHRP/HA virtual gateway, locally-administered, and multicast MACs).
     if not mac:
         mac = get_mac_from_system_arp(ip)
 
-    if mac and not is_hypervisor_mac(mac):
-        candidate = _match_vendor_from_oui(oui_lookup.lookup_oui(mac).lower())
+    if mac and not (
+        is_hypervisor_mac(mac) or is_fhrp_mac(mac) or is_locally_administered_mac(mac) or is_multicast_mac(mac)
+    ):
+        oui_vendor = oui_lookup.lookup_oui(mac).lower()
+        candidate = _match_vendor_from_oui(oui_vendor)
 
     # Tier 2: Transport Banner inspection (runs when MAC is unknown, across an L3 gateway,
-    # on a VM NIC, or to refine generic Cisco OUI matches into Cisco Small Business)
+    # on a VM/FHRP/LAA NIC, or to refine generic Cisco OUI matches into Cisco Small Business)
     banner = ""
     if candidate in ("unknown", "cisco"):
         if transport == "telnet":
             banner = get_telnet_banner(ip, port=port, timeout=timeout)
         else:
             banner = get_ssh_banner(ip, port=port, timeout=timeout)
-        candidate = _match_vendor_from_banner(banner.lower(), candidate)
+        candidate = _match_vendor_from_banner(banner.lower(), candidate, oui_vendor=oui_vendor)
 
     return candidate, banner
+
+
+PROMPT_OS_TO_VENDOR: dict[str, str] = {
+    "cisco_ios": "cisco",
+    "cisco_nxos": "cisco",
+    "cisco_xr": "cisco_xr",
+    "juniper_junos": "juniper",
+    "aruba_os": "aruba",
+    "paloalto_panos": "paloalto",
+    "fortinet": "fortinet",
+    "mikrotik": "mikrotik",
+    "arista": "arista",
+    "hpprocurve": "hpprocurve",
+    "openwrt": "openwrt",
+    "opnsense": "opnsense",
+}
 
 
 def inspect_prompt_os(prompt: str) -> str:
     """
     Tier 3: Analyzes the raw CLI prompt string to detect the target OS before sending commands.
     Returns: 'cisco_ios' | 'cisco_nxos' | 'cisco_xr' | 'juniper_junos' | 'aruba_os' | 'paloalto_panos'
-             | 'fortinet' | 'mikrotik' | 'arista' | 'openwrt' | 'opnsense' | 'prompt_switch_standard' | 'unknown'
+             | 'fortinet' | 'mikrotik' | 'arista' | 'hpprocurve' | 'openwrt' | 'opnsense'
+             | 'prompt_switch_standard' | 'unknown'
     """
-    prompt = prompt.strip()
+    if not prompt:
+        return "unknown"
+    # Strip ANSI escape sequences and inspect the final non-empty prompt line (handles Junos `{master:0}\nuser@host>`)
+    cleaned = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", prompt)
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    if not lines:
+        return "unknown"
+    line = lines[-1]
 
-    # MikroTik RouterOS prompt: [admin@MikroTik] > or [admin@MikroTik] /ip>
-    if re.search(r"^\[.+@.+\]\s*[>/#]", prompt):
+    # MikroTik RouterOS prompt: [admin@MikroTik] > or [admin@MikroTik] /ip address> (never Linux `[root@host ~]#`)
+    if re.search(r"^\[[^\[\]\s@]+@[^\[\]\s]+\]\s*(?:/[^>]*)?>\s*$", line):
         return "mikrotik"
 
-    # Cisco XR prompt format: RP/0/0/CPU0:hostname# or LC/0/0/CPU0:line-card#
-    if re.search(r"^(?:RP|LC)/\d+/\d+/CPU\d+:[A-Za-z0-9_-]+[#>]", prompt):
+    # Cisco IOS-XR prompt format: RP/0/0/CPU0:hostname#, RP/0/RSP0/CPU0:asr9k#, RP/0/RP0/CPU0:ncs.nyc#, LC/0/0/CPU0:lc#
+    if re.search(r"^(?:RP|LC)/\d+/(?:(?:RSP|RP|LC)?\d+)/CPU\d+:[A-Za-z0-9_.-]+(?:\([^)]*\))?[#>]\s*$", line):
         return "cisco_xr"
 
-    # Palo Alto prompt format: admin@PA-220> or admin@hostname#
-    if re.search(r"^[A-Za-z0-9_.-]+@PA-[A-Za-z0-9_.-]+[>#]\s*$", prompt, re.IGNORECASE):
+    # Palo Alto PAN-OS prompt format: admin@PA-220>, admin@PA-5220(active)>, admin@hq-fw01(active)>
+    if re.search(
+        r"^[A-Za-z0-9_.-]+@(?:PA-[A-Za-z0-9_.-]+(?:\([A-Za-z0-9_-]+\))?|"
+        r"[A-Za-z0-9_.-]+\((?:active|passive|active-primary|active-secondary|suspended|initial)\))[>#]\s*$",
+        line,
+        re.IGNORECASE,
+    ):
         return "paloalto_panos"
 
-    # OpenWrt prompt format: root@OpenWrt:~# or root@gateway:/#
-    if re.search(r"^[A-Za-z0-9_.-]+@OpenWrt[~/#:]", prompt, re.IGNORECASE) or ("openwrt" in prompt.lower()):
+    # OpenWrt prompt format: root@OpenWrt:~# or root@OpenWrt:/#
+    if re.search(r"^[A-Za-z0-9_.-]+@OpenWrt[~/#:]", line, re.IGNORECASE) or ("openwrt" in line.lower()):
         return "openwrt"
 
-    # OPNsense prompt format: root@opnsense:~ # or root@gateway:~%
-    if "opnsense" in prompt.lower():
+    # OPNsense prompt format: root@opnsense:~ #
+    if "opnsense" in line.lower():
         return "opnsense"
 
     # Juniper JunOS prompt format: username@hostname> or username@hostname# or username@hostname%
-    if re.search(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+[>%#]\s*$", prompt):
+    if re.search(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+[>%#]\s*$", line):
         return "juniper_junos"
 
-    # Fortinet FortiOS prompt format: FortiGate-60F # or FG-01 (vdom) #
+    # HP ProCurve / ArubaOS-S switch prompt format (checked before Fortinet so `ProCurve #` isn't stolen)
+    if re.search(r"^(?:procurve|hp-)[A-Za-z0-9_.-]*(?:\s*\(config[^\)]*\))?\s*[>#]\s*$", line, re.IGNORECASE):
+        return "hpprocurve"
+
+    # Fortinet FortiOS prompt format: FortiGate-60F #, FortiGate-60F $ (read-only), FG-01 (vdom) #, fw1.corp #
     if (
-        re.search(r"^(?:Forti|FG)[A-Za-z0-9_-]+.*#\s*$", prompt, re.IGNORECASE)
-        or re.search(r"^[A-Za-z0-9_-]+\s+\([A-Za-z0-9_-]+\)\s*#\s*$", prompt)
-        or re.search(r"^[A-Za-z0-9_-]+\s+#\s*$", prompt)
+        re.search(r"^(?:Forti|FG)[A-Za-z0-9_.-]+(?:\s+\([A-Za-z0-9_.-]+\))?\s*[#$]\s*$", line, re.IGNORECASE)
+        or re.search(r"^[A-Za-z0-9_.-]+\s+\((?!config\b)[A-Za-z0-9_.-]+\)\s*[#$]\s*$", line, re.IGNORECASE)
+        or re.search(r"^[A-Za-z0-9_.-]+\s+[#$]\s*$", line)
     ):
         return "fortinet"
 
-    # HP ProCurve / ArubaOS-S switch prompt format: ProCurve# or HP-2920#
-    if re.search(r"^(?:procurve|hp-)[A-Za-z0-9_-]*(?:\s*\(config[^\)]*\))?[>#]\s*$", prompt, re.IGNORECASE):
-        return "hpprocurve"
-
-    # Arista / Cisco switch prompt format: hostname> or hostname#
-    if re.search(r"^[A-Za-z0-9_-]+(?:\s*\(config[^\)]*\))?[>#]\s*$", prompt):
-        if "arista" in prompt.lower():
+    # Arista / Cisco / NX-OS VDC / Aruba switch prompt format: hostname> or hostname# (supports dotted FQDNs)
+    if re.search(r"^[A-Za-z0-9_.-]+(?:\s*\(config[^\)]*\))?[>#]\s*$", line):
+        if "arista" in line.lower():
             return "arista"
         return "prompt_switch_standard"
 
     return "unknown"
+
+
+def resolve_prompt_vendor(prompt: str) -> str:
+    """Maps a raw post-auth CLI prompt string to a canonical `DRIVER_REGISTRY` vendor key or `'unknown'`."""
+    os_token = inspect_prompt_os(prompt)
+    return PROMPT_OS_TO_VENDOR.get(os_token, "unknown")

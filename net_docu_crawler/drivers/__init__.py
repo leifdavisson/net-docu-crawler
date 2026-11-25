@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -18,6 +19,8 @@ Driver Registry and Factory Dispatch for Net-Docu-Crawler.
 Instantiates verified, zero-blast-radius multi-vendor drivers.
 """
 
+import logging
+
 from net_docu_crawler.drivers.arista import AristaDriver
 from net_docu_crawler.drivers.aruba import ArubaDriver
 from net_docu_crawler.drivers.base import BaseDriver
@@ -34,26 +37,61 @@ from net_docu_crawler.drivers.openwrt import OpenWrtDriver
 from net_docu_crawler.drivers.opnsense import OPNsenseDriver
 from net_docu_crawler.drivers.paloalto import PaloAltoDriver
 
-# Registry mapping vendor string to driver class (single source of truth)
+logger = logging.getLogger(__name__)
+
+# Registry mapping vendor string and common aliases to driver class (single source of truth)
 DRIVER_REGISTRY: dict[str, type[BaseDriver]] = {
     "cisco": CiscoDriver,
+    "cisco_ios": CiscoDriver,
+    "cisco_xe": CiscoDriver,
+    "cisco_nxos": CiscoDriver,
+    "ios": CiscoDriver,
+    "ios-xe": CiscoDriver,
+    "nxos": CiscoDriver,
+    "nx-os": CiscoDriver,
     "cisco_xr": CiscoXRDriver,
     "iosxr": CiscoXRDriver,
+    "ios-xr": CiscoXRDriver,
     "xr": CiscoXRDriver,
     "ciscosmb": CiscoSMBDriver,
+    "cisco_smb": CiscoSMBDriver,
     "cisco_s300": CiscoSMBDriver,
     "cbs": CiscoSMBDriver,
+    "cbs250": CiscoSMBDriver,
+    "cbs350": CiscoSMBDriver,
+    "sg250": CiscoSMBDriver,
     "sg300": CiscoSMBDriver,
     "sg350": CiscoSMBDriver,
+    "sg500": CiscoSMBDriver,
     "juniper": JuniperDriver,
+    "juniper_junos": JuniperDriver,
+    "junos": JuniperDriver,
     "aruba": ArubaDriver,
+    "aruba_os": ArubaDriver,
+    "aruba_cx": ArubaDriver,
+    "arubaos": ArubaDriver,
+    "aos-cx": ArubaDriver,
+    "aoscx": ArubaDriver,
     "hpprocurve": HPProCurveDriver,
+    "hp_procurve": HPProCurveDriver,
     "procurve": HPProCurveDriver,
     "hp": HPProCurveDriver,
+    "arubaos-s": HPProCurveDriver,
+    "aos-s": HPProCurveDriver,
     "paloalto": PaloAltoDriver,
+    "paloalto_panos": PaloAltoDriver,
+    "palo_alto": PaloAltoDriver,
+    "panos": PaloAltoDriver,
+    "pan-os": PaloAltoDriver,
     "fortinet": FortinetDriver,
+    "fortigate": FortinetDriver,
+    "fortios": FortinetDriver,
     "arista": AristaDriver,
+    "arista_eos": AristaDriver,
+    "eos": AristaDriver,
     "mikrotik": MikroTikDriver,
+    "mikrotik_routeros": MikroTikDriver,
+    "routeros": MikroTikDriver,
     "frrouting": FRRDriver,
     "frr": FRRDriver,
     "opnsense": OPNsenseDriver,
@@ -97,6 +135,14 @@ def resolve_vendor_for_driver(driver_cls: type[BaseDriver]) -> str:
     return DRIVER_VENDOR_MAP.get(driver_cls, "")
 
 
+def canonicalize_vendor(vendor: str | None) -> str:
+    """Resolve any vendor name or alias (e.g. `junos`, `hp`, `frr`, `fortigate`) to its canonical key or `""`."""
+    driver_cls = resolve_driver_for_vendor(vendor)
+    if driver_cls is None:
+        return ""
+    return resolve_vendor_for_driver(driver_cls)
+
+
 def get_driver(
     ip: str,
     mac: str = "",
@@ -110,11 +156,14 @@ def get_driver(
 ) -> BaseDriver:
     """
     Factory function returning the appropriate vendor driver instance.
-    If vendor_hint is provided, uses it directly; otherwise executes the Zero-Blast Detection cascade.
+    If vendor_hint is provided and recognized, uses it directly; otherwise executes the Zero-Blast Detection cascade.
     """
-    vendor = vendor_hint.lower() if vendor_hint else ""
+    vendor = (vendor_hint or "").strip().lower()
+    if vendor and vendor not in DRIVER_REGISTRY:
+        logger.warning("Unrecognized vendor_hint %r for %s; falling back to auto-detection.", vendor_hint, ip)
+        vendor = ""
 
-    if not vendor or vendor not in DRIVER_REGISTRY:
+    if not vendor:
         probe_port = port if port is not None else (23 if transport == "telnet" else 22)
         detected_vendor, _banner = detect_vendor_range(
             ip, mac=mac, port=probe_port, timeout=float(timeout), transport=transport
@@ -137,6 +186,7 @@ def get_driver(
 __all__ = [
     "BaseDriver",
     "CiscoDriver",
+    "CiscoXRDriver",
     "CiscoSMBDriver",
     "JuniperDriver",
     "ArubaDriver",
@@ -153,5 +203,6 @@ __all__ = [
     "DRIVER_VENDOR_MAP",
     "resolve_driver_for_vendor",
     "resolve_vendor_for_driver",
+    "canonicalize_vendor",
     "get_driver",
 ]
