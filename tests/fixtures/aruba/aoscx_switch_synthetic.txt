@@ -1,0 +1,61 @@
+# Fixture provenance: SYNTHETIC-DOC-BACKED (NEEDS-DEVICE-DATA for live ArubaOS-CX switch)
+# Vendor: Aruba Networks / HPE (ArubaOS-CX Switch)
+# PROMPT: sw-aoscx-01#
+# Official CLI Reference: https://www.arubanetworks.com/techdocs/AOS-CX/
+
+--- COMMAND: show version ---
+ArubaOS-CX
+Version      : FL.10.13.1000
+Build Date   : 2024-06-15
+
+--- COMMAND: show system ---
+Hostname               : sw-aoscx-01
+Product Name           : JL663A 6300M 48G CL4 PoE 4SFP56 Swch
+Chassis Serial Nbr     : SG24LAB0011
+Base MAC Address       : 40:e3:d6:aa:11:11
+ArubaOS-CX Version     : FL.10.13.1000
+
+--- COMMAND: show interface brief ---
+Port        Native  Mode   Type           Enabled Status  Reason       Speed   Description
+            VLAN                                                       (Mb/s)
+----------------------------------------------------------------------------------------
+1/1/1       10      access 1GbT           yes     up                   1000    Uplink to sw-core-01
+1/1/2       10      access 1GbT           yes     down    Waiting      --      Unused
+
+--- COMMAND: show ip interface brief ---
+Interface         IP Address          Status   VRF
+----------------------------------------------------
+vlan10            10.10.1.35/24       up       default
+
+--- COMMAND: show lldp neighbor-info detail ---
+Port                           : 1/1/1
+Neighbor Chassis-ID            : 00:00:0c:aa:02:02
+Neighbor Port-ID               : Gi1/0/18
+Neighbor System-Name           : sw-core-01
+Neighbor System-Description    : Cisco IOS XE Software, WS-C3850-48P
+Neighbor Management-Address    : 10.10.1.2
+
+--- COMMAND: show ip route ---
+0.0.0.0/0,  vrf default
+    via  10.10.1.1,  [1/0],  static
+10.10.1.0/24,  vrf default
+    via  vlan10,  [0/0],  connected
+
+--- COMMAND: show arp ---
+IPv4 Address     MAC                 Port       Physical Port  State
+10.10.1.1        00:09:0f:aa:01:01   vlan10     1/1/1          reachable
+
+--- COMMAND: show running-config ---
+hostname sw-aoscx-01
+ip dns server-address 9.9.9.9
+ntp server 10.10.99.50
+!
+vlan 10
+    name Corp-LAN
+interface 1/1/1
+    no shutdown
+    vlan trunk native 10
+    vlan trunk allowed 10,20
+interface vlan 10
+    ip address 10.10.1.35/24
+ip route 0.0.0.0/0 10.10.1.1

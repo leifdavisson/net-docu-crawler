@@ -1,0 +1,59 @@
+# Fixture provenance: SYNTHETIC-DOC-BACKED (NEEDS-DEVICE-DATA for live OpenWrt hardware)
+# Vendor: OpenWrt (Linux Router)
+# PROMPT: root@rtr-openwrt-01:~#
+# Official CLI Reference: https://openwrt.org/docs/start
+
+--- COMMAND: ubus call system board 2>/dev/null ---
+{
+  "kernel": "6.6.54",
+  "hostname": "rtr-openwrt-01",
+  "model": "GL.iNet GL-MT6000",
+  "board_name": "glinet,gl-mt6000",
+  "release": {
+    "distribution": "OpenWrt",
+    "version": "24.10.0"
+  }
+}
+
+--- COMMAND: ubus call network.interface dump 2>/dev/null ---
+{
+  "interface": [
+    {
+      "interface": "lan",
+      "up": true,
+      "device": "br-lan",
+      "ipv4-address": [{"address": "10.10.6.1", "mask": 24}]
+    }
+  ]
+}
+
+--- COMMAND: ip -d address show 2>/dev/null || ip address show 2>/dev/null ---
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
+    inet 127.0.0.1/8 scope host lo
+2: br-lan: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    link/ether 02:00:5e:aa:06:01 brd ff:ff:ff:ff:ff:ff
+    inet 10.10.6.1/24 brd 10.10.6.255 scope global br-lan
+
+--- COMMAND: lldpcli show neighbors -f json 2>/dev/null ---
+{"lldp": {}}
+
+--- COMMAND: ip route show 2>/dev/null || route -n 2>/dev/null ---
+default via 10.10.6.254 dev eth1
+10.10.6.0/24 dev br-lan proto kernel scope link src 10.10.6.1
+
+--- COMMAND: cat /proc/net/arp 2>/dev/null ---
+IP address       HW type     Flags       HW address            Mask     Device
+10.10.6.254      0x1         0x2         00:09:0f:aa:01:01     *        eth1
+
+--- COMMAND: uci export 2>/dev/null ---
+package system
+config system
+	option hostname 'rtr-openwrt-01'
+config timeserver 'ntp'
+	list server '0.openwrt.pool.ntp.org'
+package network
+config interface 'lan'
+	option proto 'static'
+	option ipaddr '10.10.6.1'
+	option netmask '255.255.255.0'
+	list dns '9.9.9.9'

@@ -1,0 +1,65 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from OPNsense 24.7 FreeBSD, Paramiko exec_command)
+# Vendor: OPNsense (FreeBSD Firewall / Gateway)
+# PROMPT: root@gw-opnsense-01:~ #
+# Official CLI Reference: https://docs.opnsense.org/
+
+--- COMMAND: hostname ---
+gw-opnsense-01.lab.example.invalid
+
+--- COMMAND: opnsense-version ---
+OPNsense 24.7.10 (amd64)
+
+--- COMMAND: kenv smbios.system.product 2>/dev/null ---
+OPNsense-Lab-Appliance
+
+--- COMMAND: kenv smbios.system.serial 2>/dev/null ---
+OPNLAB00007
+
+--- COMMAND: ifconfig -a ---
+vtnet0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+	ether bc:24:11:aa:07:01
+	inet 10.10.3.1 netmask 0xffffff00 broadcast 10.10.3.255
+	media: Ethernet autoselect (10Gbase-T <full-duplex>)
+	status: active
+vtnet1: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> metric 0 mtu 1500
+	ether bc:24:11:aa:07:02
+	inet 100.64.224.70 netmask 0xffffe000 broadcast 100.64.255.255
+	media: Ethernet autoselect (10Gbase-T <full-duplex>)
+	status: active
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> metric 0 mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+pflog0: flags=141<UP,RUNNING,PROMISC> metric 0 mtu 33152
+pfsync0: flags=0<> metric 0 mtu 1500
+
+--- COMMAND: lldpctl -f json 2>/dev/null ---
+{"lldp": {"interface": []}}
+
+--- COMMAND: command -v lldpctl >/dev/null 2>&1 || echo __NO_LLDPD__ ---
+
+--- COMMAND: netstat -rnW -f inet ---
+Routing tables
+
+Internet:
+Destination        Gateway            Flags   Nhop#    Mtu      Netif Expire
+default            100.64.224.1       UGS         1   1500     vtnet1
+10.10.3.0/24       link#1             U           2   1500     vtnet0
+100.64.224.0/19    link#2             U           3   1500     vtnet1
+
+--- COMMAND: arp -an ---
+? (10.10.3.10) at 00:00:0c:aa:02:02 on vtnet0 expires in 1180 seconds [ethernet]
+? (100.64.224.1) at 02:00:5e:aa:99:02 on vtnet1 expires in 900 seconds [ethernet]
+
+--- COMMAND: cat /conf/config.xml ---
+<?xml version="1.0"?>
+<opnsense>
+  <system>
+    <hostname>gw-opnsense-01</hostname>
+    <domain>lab.example.invalid</domain>
+    <dnsserver>9.9.9.9</dnsserver>
+    <timeservers>0.opnsense.pool.ntp.org</timeservers>
+  </system>
+  <interfaces>
+    <lan><if>vtnet0</if><ipaddr>10.10.3.1</ipaddr><subnet>24</subnet></lan>
+    <wan><if>vtnet1</if><ipaddr>100.64.224.70</ipaddr><subnet>19</subnet></wan>
+  </interfaces>
+</opnsense>

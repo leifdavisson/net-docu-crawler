@@ -1,0 +1,54 @@
+# Fixture provenance: SCRUBBED-FROM-LAB-CAPTURE (derived from Aruba Instant AP-215 ArubaOS 8.6.0.25)
+# Vendor: Aruba Networks / HPE (Aruba Instant AP)
+# PROMPT: ap-floor1-01#
+# Official CLI Reference: https://www.arubanetworks.com/techdocs/ArubaDocPortal/content/cons-instant-home.htm
+
+--- COMMAND: show version ---
+Aruba Operating System Software.
+ArubaOS (MODEL: 215), Version 8.6.0.25
+Website: http://www.arubanetworks.com
+(c) Copyright 2024 Hewlett Packard Enterprise Development LP.
+Compiled on 2024-08-01 at 12:00:00 UTC (build 90001)
+AP uptime is 12 days 4 hours 10 minutes 5 seconds
+
+--- COMMAND: show aps ---
+1 Access Point
+--------------
+Name          IP Address  Mode    Spectrum  Clients  Type         IPv6 Address  Mesh Role  Zone  Serial #    Paperwork
+----          ----------  ----    --------  -------  ----         ------------  ---------  ----  --------    ---------
+ap-floor1-01  10.10.1.20  access  disable   2        215(indoor)  --            N/A        -     CN01LAB215  -
+
+--- COMMAND: show ap debug lldp info ---
+Interface: eth0
+  Chassis ID: fc:33:42:aa:10:10
+  Port ID: ge-0/0/3
+  System Name: sw-access-01
+  System Description: Juniper Networks, Inc. ex2300-c-12p Ethernet Switch, kernel JUNOS 23.4R2
+  Management Address: 10.10.1.10
+
+--- COMMAND: show clients ---
+Client List
+-----------
+Name            IP Address    MAC Address        OS      Network    Access Point  Channel  Type  Role       IPv6 Address  Signal    Speed (mbps)
+----            ----------    -----------        --      -------    ------------  -------  ----  ----       ------------  ------    ------------
+lab-laptop-01   10.10.1.101   02:00:5e:aa:01:01  Linux   Corp-WiFi  ap-floor1-01  36       AC    Corp-WiFi  --            42(good)  173(good)
+
+--- COMMAND: show interface transceiver ---
+% Parse error
+
+--- COMMAND: show configuration ---
+version 8.6.0-8.6.0
+virtual-controller-country US
+virtual-controller-key <REDACTED>
+name ap-floor1-01
+ntp-server 10.10.99.50
+wlan ssid-profile Corp-WiFi
+ essid Corp-WiFi
+ vlan 10
+!
+wired-port-profile default_wired_port_profile
+ switchport-mode access
+ allowed-vlan all
+ native-vlan 10
+!
+enet0-port-profile default_wired_port_profile

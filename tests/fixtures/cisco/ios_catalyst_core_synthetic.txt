@@ -1,0 +1,209 @@
+# Fixture provenance: SYNTHETIC-DOC-BACKED (NEEDS-DEVICE-DATA for live Catalyst IOS-XE switch)
+# Vendor: Cisco Systems (IOS-XE Catalyst Core Switch)
+# PROMPT: sw-core-01#
+# Official CLI Reference: https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html
+
+--- COMMAND: show version ---
+Cisco IOS XE Software, Version 17.09.04a
+Cisco IOS Software [Cupertino], Catalyst L3 Switch Software (CAT3K_CAA-UNIVERSALK9-M), Version 17.9.4a, RELEASE SOFTWARE (fc3)
+sw-core-01 uptime is 42 days, 6 hours, 15 minutes
+cisco WS-C3850-48P (MIPS) processor with 4194304K bytes of physical memory.
+Processor board ID FCW21LAB0002
+Base Ethernet MAC Address          : 00:00:0c:aa:02:02
+Model Number                       : WS-C3850-48P
+System Serial Number               : FCW21LAB0002
+
+--- COMMAND: show inventory ---
+NAME: "Switch 1", DESCR: "WS-C3850-48P"
+PID: WS-C3850-48P      , VID: V07  , SN: FCW21LAB0002
+
+NAME: "Gi1/0/24", DESCR: "1000BaseSX SFP"
+PID: GLC-SX-MMD        , VID: V01  , SN: AGM21LAB0024
+
+--- COMMAND: show ip interface brief ---
+Interface              IP-Address      OK? Method Status                Protocol
+Vlan10                 10.10.1.2       YES NVRAM  up                    up
+Vlan20                 10.10.20.2      YES NVRAM  up                    up
+GigabitEthernet1/0/1   unassigned      YES unset  up                    up
+GigabitEthernet1/0/2   unassigned      YES unset  administratively down down
+GigabitEthernet1/0/24  unassigned      YES unset  up                    up
+
+--- COMMAND: show interfaces ---
+Vlan10 is up, line protocol is up
+  Hardware is Ethernet SVI, address is 0000.0caa.0202 (bia 0000.0caa.0202)
+  Description: Corp-LAN-SVI
+  Internet address is 10.10.1.2/24
+  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+Vlan20 is up, line protocol is up
+  Hardware is Ethernet SVI, address is 0000.0caa.0202 (bia 0000.0caa.0202)
+  Description: Voice-VLAN-SVI
+  Internet address is 10.10.20.2/24
+  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+GigabitEthernet1/0/1 is up, line protocol is up (connected)
+  Hardware is Gigabit Ethernet, address is 0000.0caa.0211 (bia 0000.0caa.0211)
+  Description: Uplink to fw-edge-01
+  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+  Full-duplex, 1000Mb/s, media type is 10/100/1000BaseTX
+GigabitEthernet1/0/2 is administratively down, line protocol is down (disabled)
+  Hardware is Gigabit Ethernet, address is 0000.0caa.0212 (bia 0000.0caa.0212)
+  Description: Unused-Port
+  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+  Auto-duplex, Auto-speed, media type is 10/100/1000BaseTX
+GigabitEthernet1/0/24 is up, line protocol is up (connected)
+  Hardware is Gigabit Ethernet, address is 0000.0caa.0224 (bia 0000.0caa.0224)
+  Description: Trunk to sw-access-01
+  MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec,
+  Full-duplex, 1000Mb/s, media type is 1000BaseSX SFP
+
+--- COMMAND: show cdp neighbors detail ---
+-------------------------
+Device ID: sw-access-01
+Entry address(es):
+  IP address: 10.10.1.10
+Platform: Juniper EX2300-C-12P,  Capabilities: Switch IGMP
+Interface: GigabitEthernet1/0/24,  Port ID (outgoing port): ge-0/0/0
+Holdtime : 140 sec
+
+--- COMMAND: show lldp neighbors detail ---
+------------------------------------------------
+Local Intf: Gi1/0/1
+Chassis id: 0009.0faa.0101
+Port id: port1
+Port Description: LAN-Port1
+System Name: fw-edge-01
+System Description: FortiGate-60F v7.4.5
+Time remaining: 110 seconds
+System Capabilities: B,R
+Enabled Capabilities: R
+Management Addresses:
+    IP: 10.10.1.1
+
+------------------------------------------------
+Local Intf: Gi1/0/24
+Chassis id: fc33.42aa.1010
+Port id: ge-0/0/0
+Port Description: Uplink to sw-core-01
+System Name: sw-access-01
+System Description: Juniper Networks, Inc. ex2300-c-12p Ethernet Switch, kernel JUNOS 23.4R2
+Time remaining: 112 seconds
+System Capabilities: B,R
+Enabled Capabilities: B,R
+Management Addresses:
+    IP: 10.10.1.10
+
+--- COMMAND: show ip route ---
+Codes: L - local, C - connected, S - static, O - OSPF, B - BGP
+Gateway of last resort is 10.10.1.1 to network 0.0.0.0
+
+S*    0.0.0.0/0 [1/0] via 10.10.1.1
+      10.10.0.0/16 is variably subnetted, 4 subnets, 2 masks
+C        10.10.1.0/24 is directly connected, Vlan10
+L        10.10.1.2/32 is directly connected, Vlan10
+C        10.10.20.0/24 is directly connected, Vlan20
+L        10.10.20.2/32 is directly connected, Vlan20
+
+--- COMMAND: show ip arp ---
+Protocol  Address          Age (min)  Hardware Addr   Type   Interface
+Internet  10.10.1.1               1   0009.0faa.0101  ARPA   Vlan10
+Internet  10.10.1.2               -   0000.0caa.0202  ARPA   Vlan10
+Internet  10.10.1.10              2   fc33.42aa.1010  ARPA   Vlan10
+Internet  10.10.1.20              3   40e3.d6aa.2020  ARPA   Vlan10
+
+--- COMMAND: show spanning-tree ---
+VLAN0010
+  Spanning tree enabled protocol rstp
+  Root ID    Priority    4106
+             Address     0000.0caa.0202
+             This bridge is the root
+             Hello Time   2 sec  Max Age 20 sec  Forward Delay 15 sec
+
+  Bridge ID  Priority    4106   (priority 4096 sys-id-ext 10)
+             Address     0000.0caa.0202
+             Hello Time   2 sec  Max Age 20 sec  Forward Delay 15 sec
+
+Interface           Role Sts Cost      Prio.Nbr Type
+------------------- ---- --- --------- -------- --------------------------------
+Gi1/0/1             Desg FWD 4         128.1    P2p
+Gi1/0/24            Desg FWD 4         128.24   P2p
+
+--- COMMAND: show power inline ---
+Module   Available     Used     Remaining
+          (Watts)     (Watts)    (Watts)
+------   ---------   --------   ---------
+1           715.0       30.4       684.6
+Interface Admin  Oper       Power   Device              Class Max
+                            (Watts)
+--------- ------ ---------- ------- ------------------- ----- ----
+Gi1/0/1   auto   off        0.0     n/a                 n/a   30.0
+Gi1/0/24  auto   off        0.0     n/a                 n/a   30.0
+
+--- COMMAND: show mac address-table ---
+          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+  10    0009.0faa.0101    DYNAMIC     Gi1/0/1
+  10    fc33.42aa.1010    DYNAMIC     Gi1/0/24
+  10    40e3.d6aa.2020    DYNAMIC     Gi1/0/24
+
+--- COMMAND: show interfaces transceiver ---
+Port       Temp       Voltage    Current    Optical    Optical
+           (Celsius)  (Volts)    (mA)       Tx Power   Rx Power
+                                            (dBm)      (dBm)
+---------  ---------  ---------  ---------  ---------  ---------
+Gi1/0/24    34.2       3.29       6.1        -5.4       -6.1
+
+--- COMMAND: show interfaces trunk ---
+Port        Mode             Encapsulation  Status        Native vlan
+Gi1/0/24    on               802.1q         trunking      10
+
+Port        Vlans allowed on trunk
+Gi1/0/24    10,20,99
+
+Port        Vlans in spanning tree forwarding state and not pruned
+Gi1/0/24    10,20,99
+
+--- COMMAND: show running-config ---
+hostname sw-core-01
+!
+vlan 10
+ name Corp-LAN
+vlan 20
+ name Voice
+vlan 99
+ name Management
+!
+ip name-server 9.9.9.9
+ntp server 10.10.99.50
+logging host 10.10.99.51
+!
+interface GigabitEthernet1/0/1
+ description Uplink to fw-edge-01
+ switchport access vlan 10
+ switchport mode access
+!
+interface GigabitEthernet1/0/2
+ description Unused-Port
+ shutdown
+!
+interface GigabitEthernet1/0/24
+ description Trunk to sw-access-01
+ switchport trunk native vlan 10
+ switchport trunk allowed vlan 10,20,99
+ switchport mode trunk
+!
+interface Vlan10
+ description Corp-LAN-SVI
+ ip address 10.10.1.2 255.255.255.0
+ ip helper-address 10.10.99.50
+ standby 10 ip 10.10.1.254
+ standby 10 priority 110
+!
+interface Vlan20
+ description Voice-VLAN-SVI
+ ip address 10.10.20.2 255.255.255.0
+ ip helper-address 10.10.99.50
+!
+ip route 0.0.0.0 0.0.0.0 10.10.1.1
+end

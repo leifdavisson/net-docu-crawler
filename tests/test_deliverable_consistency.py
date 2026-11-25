@@ -280,6 +280,9 @@ def test_expand_targets_cidr_routed_subnets():
     capped = expand_targets(["10.0.0.0/16"], max_hosts_per_cidr=16)
     assert len(capped) == 16
 
+    dedup = expand_targets(["192.168.1.1", "192.168.1.1", "172.16.1.1"])
+    assert dedup == ["192.168.1.1", "172.16.1.1"]
+
 
 @requires_live_dataset
 def test_layered_deliverables_structure():
@@ -308,6 +311,3 @@ def test_layered_deliverables_structure():
         pytest.skip("Legacy non-layered output directory")
     for rel in required:
         assert os.path.isfile(os.path.join(base_dir, rel)), f"Missing layered deliverable: {rel}"
-
-    dedup = expand_targets(["192.168.1.1", "192.168.1.1", "172.16.1.1"])
-    assert dedup == ["192.168.1.1", "172.16.1.1"]
