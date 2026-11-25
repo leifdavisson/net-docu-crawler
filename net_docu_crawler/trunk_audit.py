@@ -40,8 +40,14 @@ from dataclasses import dataclass, field, replace
 
 from netaddr import valid_ipv4
 
+import oui_lookup
 from net_docu_crawler.migration_parsers import extract_vlans
-from net_docu_crawler.topology_resolver import normalize_hostname
+from net_docu_crawler.topology_resolver import (
+    is_generic_hostname,
+    is_placeholder_serial,
+    is_shared_or_virtual_mac,
+    normalize_hostname,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +146,6 @@ _SKIPPED_RECORD_CLASSES: frozenset[str] = frozenset(
     {"unauthenticated_infra", "unsupported_appliance", "passive_endpoint"}
 )
 
-_PLACEHOLDER_SERIALS: frozenset[str] = frozenset({"unknown", "0", "n/a", "none", "not specified", "default string"})
-
 _DOWN_PORT_STATUSES: frozenset[str] = frozenset(
     {"down", "administratively down", "admin-down", "notconnect", "disabled", "err-disabled"}
 )
@@ -163,7 +167,7 @@ _LAG_INHERITED_KEYS: tuple[str, ...] = (
 
 _INTERFACE_PREFIX_RULES: tuple[tuple[str, str], ...] = (
     (r"^(?:twentyfivegigabitethernet|twentyfivegige|twe|25ge)\s*(?=\d)", "TwentyFiveGigE"),
-    (r"^(?:twopointfivegigabitethernet|tw)\s*(?=\d)", "TwoPointFiveGigabitEthernet"),
+    (r"^(?:twopointfivegigabitethernet|twopointfivegige|tw)\s*(?=\d)", "TwoPointFiveGigabitEthernet"),
     (r"^(?:hundredgigabitethernet|hundredgige|hun|hu)\s*(?=\d)", "HundredGigE"),
     (r"^(?:fortygigabitethernet|fortygige|fo)\s*(?=\d)", "FortyGigabitEthernet"),
     (r"^(?:tengigabitethernet|tengige|ten|te)\s*(?=\d)", "TenGigabitEthernet"),
@@ -250,6 +254,7 @@ class _PeerLookupIndex:
     """Lookup index resolving crawled hostnames, management/L3 IPv4s, MACs, and LAG members."""
 
     dev_by_host: dict[str, dict] = field(default_factory=dict)
+    dev_id_to_host: dict[int, str] = field(default_factory=dict)
     ip_to_host: dict[str, str] = field(default_factory=dict)
     mac_to_host: dict[str, str] = field(default_factory=dict)
     global_member_to_lag: dict[tuple[str, str], str] = field(default_factory=dict)
@@ -258,8 +263,10 @@ class _PeerLookupIndex:
         """Resolve a neighbor identifier to a canonical crawled hostname when possible."""
         if remote_ip and remote_ip in self.ip_to_host:
             return self.ip_to_host[remote_ip]
-        if remote_mac and remote_mac.lower() in self.mac_to_host:
-            return self.mac_to_host[remote_mac.lower()]
+        if remote_mac:
+            mac_norm = oui_lookup.normalize_mac(remote_mac).lower().strip()
+            if mac_norm and not is_shared_or_virtual_mac(mac_norm) and mac_norm in self.mac_to_host:
+                return self.mac_to_host[mac_norm]
         short_r, _ = normalize_hostname(raw_name)
         r_low = short_r.lower()
         if r_low in self.dev_by_host:
@@ -353,6 +360,10 @@ def canonicalize_interface_full(intf: str) -> str:
     m_junos = re.match(r"^(ge-|mge-|xe-|et-|fe-|ae(?=\d)|reth(?=\d))(.*)$", name, flags=re.IGNORECASE)
     if m_junos:
         return f"{m_junos.group(1).lower()}{m_junos.group(2)}"
+
+    # Preserve lowercase Linux/appliance ethN[.V] NICs (do not synthesize Cisco/Arista Ethernet0)
+    if re.fullmatch(r"eth\d+(?:\.\d+)?", name):
+        return name
 
     m_trk = re.match(r"^trk\s*(\d+)$", name, flags=re.IGNORECASE)
     if m_trk:
@@ -1212,7 +1223,7 @@ def _deduplicate_crawled_infra(raw_devices: list[dict]) -> list[dict]:
         )
         if cid:
             dedup_k = f"cid:{cid}"
-        elif serial and serial not in _PLACEHOLDER_SERIALS:
+        elif not is_placeholder_serial(serial):
             dedup_k = f"ser:{serial}"
         elif short_h:
             dedup_k = f"host:{short_h.lower()}:{dev.get('ip', '')}"
@@ -1225,45 +1236,68 @@ def _deduplicate_crawled_infra(raw_devices: list[dict]) -> list[dict]:
 
 
 def _build_peer_lookup_index(crawled_devs: list[dict]) -> _PeerLookupIndex:
-    """Build hostname, management/L3 IPv4, chassis MAC, and LAG member lookup tables."""
+    """Build hostname, management/L3 IPv4, chassis/interface MAC, and LAG member lookup tables."""
     index = _PeerLookupIndex()
+    host_counts: dict[str, int] = {}
     for dev in crawled_devs:
         short_h, _ = normalize_hostname(
             str(dev.get("hostname") or dev.get("canonical_hostname") or dev.get("ip") or "")
         )
+        if short_h:
+            hl = short_h.lower()
+            host_counts[hl] = host_counts.get(hl, 0) + 1
+
+    for dev in crawled_devs:
+        short_h, _ = normalize_hostname(
+            str(dev.get("hostname") or dev.get("canonical_hostname") or dev.get("ip") or "")
+        )
+        mgmt_ip = str(dev.get("ip") or "").strip()
         h_low = short_h.lower()
         if not h_low:
             continue
-        index.dev_by_host[h_low] = dev
+        if is_generic_hostname(short_h) and host_counts.get(h_low, 0) > 1 and mgmt_ip:
+            h_key = f"{h_low}_{mgmt_ip}"
+        else:
+            h_key = h_low
+        index.dev_by_host[h_key] = dev
+        index.dev_id_to_host[id(dev)] = h_key
 
-        mgmt_ip = str(dev.get("ip") or "").strip()
         if mgmt_ip and valid_ipv4(mgmt_ip):
-            index.ip_to_host[mgmt_ip] = h_low
+            index.ip_to_host[mgmt_ip] = h_key
 
         for l3 in dev.get("l3_interfaces") or []:
             if isinstance(l3, dict):
                 ip_tok = str(l3.get("ip_address") or "").split("/")[0].split()[0].strip()
                 if ip_tok and valid_ipv4(ip_tok) and not ip_tok.startswith("127."):
-                    index.ip_to_host[ip_tok] = h_low
+                    index.ip_to_host[ip_tok] = h_key
 
-        base_mac = str(dev.get("mac_address") or "").strip().lower()
-        if base_mac and base_mac != "00:00:00:00:00:00":
-            index.mac_to_host[base_mac] = h_low
+        base_mac = oui_lookup.normalize_mac(str(dev.get("mac_address") or "")).lower().strip()
+        if base_mac and not is_shared_or_virtual_mac(base_mac):
+            index.mac_to_host[base_mac] = h_key
+        for stats in (dev.get("interfaces_detail") or {}).values():
+            if isinstance(stats, dict):
+                imac = oui_lookup.normalize_mac(str(stats.get("mac_address") or "")).lower().strip()
+                if imac and not is_shared_or_virtual_mac(imac):
+                    index.mac_to_host.setdefault(imac, h_key)
 
         for m_port, p_lag in _collect_device_lag_member_map(dev).items():
-            index.global_member_to_lag[(h_low, m_port)] = p_lag
+            index.global_member_to_lag[(h_key, m_port)] = p_lag
 
     return index
 
 
 def _collect_all_trunk_states(
     crawled_devs: list[dict],
+    peer_index: _PeerLookupIndex | None = None,
 ) -> tuple[dict[tuple[str, str], TrunkPortState], list[TrunkPortState], int]:
     """Extract normalized `TrunkPortState` records across all crawled infrastructure devices."""
     states_by_dev_port: dict[tuple[str, str], TrunkPortState] = {}
     all_states: list[TrunkPortState] = []
     for dev in crawled_devs:
+        h_override = peer_index.dev_id_to_host.get(id(dev)) if peer_index is not None else None
         for st in extract_device_trunk_states(dev):
+            if h_override:
+                st.device_hostname = h_override
             st.interface_name = canonicalize_interface_full(st.lag_parent or st.interface_name)
             all_states.append(st)
             key = (st.device_hostname, st.interface_name)
@@ -1322,10 +1356,26 @@ def _append_synthetic_state_observations(
 ) -> None:
     """Append synthetic neighbor pointers present on `TrunkPortState` without raw `dev['neighbors']`."""
     observed_pairs = {(obs.local_host, obs.local_port, obs.remote_host) for obs in observations}
+    observed_raw_pairs: set[tuple[str, str, str]] = set()
+    for obs in observations:
+        if obs.raw_neighbor:
+            raw_short, _ = normalize_hostname(
+                str(obs.raw_neighbor.get("remote_device") or obs.raw_neighbor.get("remote_ip") or "")
+            )
+            if raw_short:
+                observed_raw_pairs.add((obs.local_host, obs.local_port, raw_short.lower()))
     for st in all_states:
-        if not st.neighbor_hostname or (st.device_hostname, st.interface_name, st.neighbor_hostname) in observed_pairs:
+        if not st.neighbor_hostname:
+            continue
+        if (st.device_hostname, st.interface_name, st.neighbor_hostname) in observed_pairs or (
+            st.device_hostname,
+            st.interface_name,
+            st.neighbor_hostname,
+        ) in observed_raw_pairs:
             continue
         r_host = peer_index.resolve_peer_host(st.neighbor_hostname)
+        if (st.device_hostname, st.interface_name, r_host) in observed_pairs:
+            continue
         r_port_raw = st.neighbor_interface or ""
         r_port = peer_index.global_member_to_lag.get((r_host, r_port_raw), r_port_raw) if r_port_raw else ""
         observations.append(
@@ -1349,10 +1399,12 @@ def _collect_neighbor_observations(
     uncrawled_lag_remote_port: dict[tuple[str, str, str], str] = {}
 
     for dev in crawled_devs:
-        short_h, _ = normalize_hostname(
-            str(dev.get("hostname") or dev.get("canonical_hostname") or dev.get("ip") or "")
-        )
-        l_host = short_h.lower()
+        l_host = peer_index.dev_id_to_host.get(id(dev))
+        if not l_host:
+            short_h, _ = normalize_hostname(
+                str(dev.get("hostname") or dev.get("canonical_hostname") or dev.get("ip") or "")
+            )
+            l_host = short_h.lower()
         if not l_host:
             continue
         for nbr in dev.get("neighbors") or []:
@@ -1931,7 +1983,7 @@ def evaluate_trunk_mismatches(raw_devices: list[dict]) -> dict:
     """
     crawled_devs = _deduplicate_crawled_infra(raw_devices)
     peer_index = _build_peer_lookup_index(crawled_devs)
-    states_by_dev_port, all_states, total_trunk_ports = _collect_all_trunk_states(crawled_devs)
+    states_by_dev_port, all_states, total_trunk_ports = _collect_all_trunk_states(crawled_devs, peer_index)
     observations = _collect_neighbor_observations(crawled_devs, peer_index, all_states)
     edges = _group_candidate_edges(observations, peer_index.dev_by_host, states_by_dev_port)
 
