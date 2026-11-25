@@ -97,6 +97,7 @@ def test_offline_mixed_vendor_e2e_replay_and_deliverables(tmp_path: Path):
     with open(out_dir / "asset_inventory.csv", encoding="utf-8") as f:
         asset_rows = list(csv.DictReader(f))
     assert {r["IP Address"] for r in asset_rows} == {"10.10.1.1", "10.10.1.2", "10.10.1.10", "10.10.1.20"}
+    assert {r["Device Type"].lower() for r in asset_rows} == {"firewall", "switch", "access point"}
     for row in asset_rows:
         assert row["Hostname"]
         assert row["Model"] and row["Model"] != "Unknown"
@@ -105,9 +106,11 @@ def test_offline_mixed_vendor_e2e_replay_and_deliverables(tmp_path: Path):
     with open(out_dir / "migration_cabling_matrix.csv", encoding="utf-8") as f:
         cabling_rows = list(csv.DictReader(f))
     assert len(cabling_rows) > 0
+    forbidden_pseudo = {"bme0", "jsrv", "naf.root", "ssl.root", "pflog0", "pfsync0", "enc0", "dsc", "mtun", "lo0"}
     for row in cabling_rows:
-        assert row["Source Port"] not in {"bme0", "jsrv", "naf.root", "ssl.root", "pflog0", "pfsync0"}
+        assert row["Source Port"] not in forbidden_pseudo
         assert '"' not in row.get("Neighbor Hostname", "")
+        assert row["Source Hostname"] in {"fw-edge-01", "sw-core-01", "sw-access-01", "ap-floor1-01"}
 
     # 4. L2 & L3 diagrams contain all 4 devices, valid Mermaid syntax, and zero fabric leaks
     l2_txt = (out_dir / "L2_network_diagrams.md").read_text(encoding="utf-8")
@@ -134,3 +137,13 @@ def test_offline_mixed_vendor_e2e_replay_and_deliverables(tmp_path: Path):
     assert "# Network Migration Analysis Blueprint" in analysis_txt
     for host in ("fw-edge-01", "sw-core-01", "sw-access-01", "ap-floor1-01"):
         assert host in analysis_txt
+
+    # 6. Quality & Truthfulness gates: Zero premature checkmarks, zero pseudo-interfaces leaked to reports
+    runbook_txt = (out_dir / "cutover_runbook.md").read_text(encoding="utf-8")
+    assert "- [x]" not in analysis_txt, "Network_Analysis.md checklist must not contain premature '- [x]' marks"
+    assert "- [x]" not in runbook_txt, "cutover_runbook.md checklist must not contain premature '- [x]' marks"
+    assert "- [ ] **Configuration & Dataset Backup**" in runbook_txt
+    assert "- [ ] **Cabling & Optics Staging**" in runbook_txt
+    for doc in (analysis_txt, runbook_txt, l2_txt, l3_txt):
+        for pseudo in forbidden_pseudo:
+            assert pseudo not in doc, f"Pseudo-interface {pseudo} leaked into generated deliverable"
