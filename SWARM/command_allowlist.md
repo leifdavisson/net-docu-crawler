@@ -91,12 +91,10 @@ Codebase-wide grep confirmed **zero** calls to `send_config_set`, `send_config_f
 
 ---
 
-### Phase 4 Veto Gate Criteria (Enforced on Every Fix Branch Before Merge)
-I will VETO any Phase 3/4 diff that:
-1. Retains or introduces any write/config/commit/clear/reload/reboot/state-mutating command (explicit or via Netmiko `session_preparation`/`disable_paging`/`cleanup`).
-2. Weakens any connect/auth/banner/read timeout or leaves a socket/VTY unclosed on exception paths.
-3. Allows >1 authentication attempt per username per target IP (across drivers or SSH/Telnet ports) or adds credential retries.
-4. Logs, prints, or persists unredacted passwords, enable secrets, private keys, or SNMP communities (including in `LazySessionLog` or `tests/fixtures/`).
-5. Imports or commits `scratch/` provisioning scripts or `credentials.json`.
-
-Standing by for Phase 4 diff reviews.
+### Phase 4 Veto Gate Criteria (Enforced across All 24 Merged Branches — Final Sign-Off `#100`)
+All 24 fix branches merged into `swarm/integration` (Waves 0–4) passed every veto gate below:
+1. **Zero Blast Radius**: Retains or introduces zero write/config/commit/clear/reload/reboot/state-mutating commands (explicit or via Netmiko `session_preparation`/`disable_paging`/`cleanup`). `FortinetDriver` P0 violation (`SF-01`) is permanently resolved via `ReadOnlyFortinetSSH` (`f041ba4`). AST cross-check confirms **100% parity** between literal driver commands across all 13 drivers and Section 2 above.
+2. **Timeouts & Session Lifecycle**: Enforces Netmiko 4.x `conn_timeout`, `banner_timeout`, `auth_timeout`, `blocking_timeout`, and `read_timeout_override` (`SF-04`/`TR-04`) and guarantees socket/VTY cleanup on `BaseException` paths (`SF-06`/`TR-05`..`TR-07`).
+3. **AAA Anti-Lockout**: Enforces `<= 1` authentication attempt per normalized username per target IP across passwords, candidate drivers, and SSH/Telnet ports (`SF-03`/`TR-03`), with strict vendor scoping (`DD-07`).
+4. **Secret, Air-Gap & Script Hygiene**: Enforces `LazySessionLog` `no_log` redaction (`SF-02`), multi-vendor `sanitize_raw_config()` (`SF-05`), `_scrub_log_message()` & key-name-only `validate_credentials()` warnings (`SF-11`), offline-by-default `oui_lookup.py` (`SF-10`), and Bash/PowerShell/option-injection-safe `validate_cutover.sh`/`.ps1` (`SF-12`).
+5. **Repo & License Hygiene**: Zero tracked forbidden paths (`credentials.json`, `scratch/`, `.env`, `.pem`, `.key`, `.log`, `.db`); 100% `AGPL-3.0-or-later` SPDX coverage on all added files; `main` (`1f2cdc6`) untouched.
