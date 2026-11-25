@@ -412,14 +412,12 @@ def test_legacy_ssh_fallback_scope_is_thread_local():
 def test_is_ssh_negotiation_error_matches_negotiation_only():
     positive_samples = [
         IncompatiblePeer("Incompatible ssh peer (no acceptable kex algorithm)"),
-        BadHostKeyException("10.0.0.1", MagicMock(), MagicMock()),
         Exception("Incompatible ssh server (no acceptable cipher)"),
         Exception("no acceptable host key"),
         Exception("no matching host key type found"),
         Exception("no acceptable mac"),
         Exception("key exchange failed"),
         Exception("unable to agree on key exchange"),
-        Exception("bad host key"),
         Exception("Invalid key (class: LegacyDSSKey)"),
         NetmikoTimeoutException(
             "A paramiko SSHException occurred during connection creation:\n\n"
@@ -430,10 +428,16 @@ def test_is_ssh_negotiation_error_matches_negotiation_only():
         assert is_ssh_negotiation_error(exc) is True
 
     negative_samples = [
+        BadHostKeyException("10.0.0.1", MagicMock(), MagicMock()),
+        Exception("bad host key for 10.0.0.1"),
+        SSHException("Server '10.0.0.1' not found in known_hosts"),
         AuthenticationException("Authentication failed."),
         NetmikoAuthenticationException("Authentication to device failed.\nInvalid key or password"),
         Exception("Authentication failed: invalid key"),
         Exception("Permission denied (publickey,password)."),
+        SSHException("Too many authentication failures"),
+        SSHException("No authentication methods available"),
+        SSHException("Error reading SSH protocol banner"),
         NetmikoTimeoutException("TCP connection to device failed."),
         TimeoutError("timed out"),
         ConnectionRefusedError("Connection refused"),
@@ -679,3 +683,129 @@ def test_lazy_session_log_prevents_zero_byte_files_on_failed_connect(tmp_path):
         with pytest.raises(NetmikoAuthenticationException):
             connect_netmiko_with_fallback({"device_type": "cisco_ios", "ip": "10.0.0.9", "session_log": str(fail_log)})
     assert not fail_log.exists()
+
+
+def test_lazy_session_log_redacts_password_and_secret(tmp_path):
+    """TR-02: _wrap_lazy_session_log MUST populate no_log so secrets are never written in plaintext."""
+    log_path = tmp_path / "10.0.0.10_raw_session.log"
+    captured_slog = []
+
+    def fake_connect_handler(**kwargs):
+        slog = kwargs["session_log"]
+        captured_slog.append(slog)
+        slog.open()
+        slog.write("Password: SuperSecretLoginPw!\r\nSW# enable\r\nSecret: UltraEnableSecret99!\r\nSW#\r\n")
+        slog.close()
+        return MagicMock(base_prompt="SW#")
+
+    with patch("netmiko.ConnectHandler", side_effect=fake_connect_handler):
+        connect_netmiko_with_fallback(
+            {
+                "device_type": "cisco_ios",
+                "ip": "10.0.0.10",
+                "username": "netops",
+                "password": "SuperSecretLoginPw!",
+                "secret": "UltraEnableSecret99!",
+                "session_log": str(log_path),
+            }
+        )
+
+    assert len(captured_slog) == 1
+    assert captured_slog[0].no_log.get("password") == "SuperSecretLoginPw!"
+    assert captured_slog[0].no_log.get("secret") == "UltraEnableSecret99!"
+    content = log_path.read_text(encoding="utf-8")
+    assert "SuperSecretLoginPw!" not in content
+    assert "UltraEnableSecret99!" not in content
+    assert "********" in content
+
+
+def test_bad_host_key_and_lockout_sshexception_never_downgrade_or_retry():
+    """TR-09: BadHostKeyException (MITM/mismatch), RejectPolicy, and Stage 2 non-negotiation SSHExceptions never retry."""
+    base_params = {"device_type": "cisco_ios", "ip": "10.0.0.11", "username": "admin", "password": "pw"}
+
+    # 1) BadHostKeyException must abort immediately on Stage 1 (zero crypto downgrade)
+    mock_bad_hk = MagicMock(side_effect=BadHostKeyException("10.0.0.11", MagicMock(), MagicMock()))
+    with patch("netmiko.ConnectHandler", mock_bad_hk):
+        with pytest.raises(BadHostKeyException):
+            connect_netmiko_with_fallback(base_params)
+        assert mock_bad_hk.call_count == 1
+
+    # 2) Stage 2 fails with "Too many authentication failures" SSHException -> MUST NOT burn Stage 3
+    mock_lockout = MagicMock(
+        side_effect=[
+            IncompatiblePeer("Incompatible ssh peer (no acceptable kex algorithm)"),
+            SSHException("Too many authentication failures"),
+        ]
+    )
+    with patch("netmiko.ConnectHandler", mock_lockout):
+        with pytest.raises(SSHException, match="Too many authentication failures"):
+            connect_netmiko_with_fallback(base_params)
+        assert mock_lockout.call_count == 2
+
+    # 3) Stage 2 fails with banner/transport SSHException wrapped in NetmikoTimeoutException -> MUST NOT retry Stage 3
+    mock_banner_drop = MagicMock(
+        side_effect=[
+            IncompatiblePeer("Incompatible ssh peer (no acceptable kex algorithm)"),
+            NetmikoTimeoutException(
+                "A paramiko SSHException occurred during connection creation:\n\nError reading SSH protocol banner"
+            ),
+        ]
+    )
+    with patch("netmiko.ConnectHandler", mock_banner_drop):
+        with pytest.raises(NetmikoTimeoutException):
+            connect_netmiko_with_fallback(base_params)
+        assert mock_banner_drop.call_count == 2
+
+    # 4) Stage 2 fails with RejectPolicy unknown host key -> MUST NOT retry Stage 3
+    mock_reject = MagicMock(
+        side_effect=[
+            IncompatiblePeer("Incompatible ssh peer (no acceptable kex algorithm)"),
+            SSHException("Server '10.0.0.11' not found in known_hosts"),
+        ]
+    )
+    with patch("netmiko.ConnectHandler", mock_reject):
+        with pytest.raises(SSHException, match="known_hosts"):
+            connect_netmiko_with_fallback(base_params)
+        assert mock_reject.call_count == 2
+
+
+def test_paramiko_fallback_closes_client_on_all_failure_paths():
+    """TR-06: connect_paramiko_with_fallback must close client on Stage 1 abort, Stage 2 abort, and Stage 3 failure."""
+    # Stage 1 auth failure -> must close client before raising
+    c1 = MagicMock(spec=paramiko.SSHClient)
+    c1.connect.side_effect = AuthenticationException("Authentication failed.")
+    with pytest.raises(AuthenticationException):
+        connect_paramiko_with_fallback(c1, hostname="10.0.0.1", username="root", password="bad")
+    assert c1.connect.call_count == 1
+    assert c1.close.call_count == 1
+
+    # Stage 1 BadHostKeyException -> must close client and NOT retry Stage 2
+    c_hk = MagicMock(spec=paramiko.SSHClient)
+    c_hk.connect.side_effect = BadHostKeyException("10.0.0.1", MagicMock(), MagicMock())
+    with pytest.raises(BadHostKeyException):
+        connect_paramiko_with_fallback(c_hk, hostname="10.0.0.1", username="root", password="pw")
+    assert c_hk.connect.call_count == 1
+    assert c_hk.close.call_count == 1
+
+    # Stage 2 auth failure -> closes after Stage 1 AND after Stage 2 abort
+    c2 = MagicMock(spec=paramiko.SSHClient)
+    c2.connect.side_effect = [
+        IncompatiblePeer("no acceptable kex algorithm"),
+        AuthenticationException("Authentication failed."),
+    ]
+    with pytest.raises(AuthenticationException):
+        connect_paramiko_with_fallback(c2, hostname="10.0.0.1", username="root", password="bad")
+    assert c2.connect.call_count == 2
+    assert c2.close.call_count == 2
+
+    # Stage 3 failure -> closes after Stage 1, Stage 2, AND Stage 3
+    c3 = MagicMock(spec=paramiko.SSHClient)
+    c3.connect.side_effect = [
+        IncompatiblePeer("no acceptable kex algorithm"),
+        SSHException("Signature verification (rsa-sha2-512) failed."),
+        SSHException("Signature verification (ssh-rsa) failed."),
+    ]
+    with pytest.raises(SSHException):
+        connect_paramiko_with_fallback(c3, hostname="10.0.0.1", username="root", password="pw")
+    assert c3.connect.call_count == 3
+    assert c3.close.call_count == 3
