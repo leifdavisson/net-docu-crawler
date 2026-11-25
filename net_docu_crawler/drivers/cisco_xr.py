@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -20,7 +21,9 @@ HSRP/VRRP, Bundle-Ether LACP/L2VPN, optics/DOM) plus optional NETCONF/gNMI enric
 Official Documentation: https://www.cisco.com/c/en/us/support/ios-nx-os-software/ios-xr-software/tsd-products-support-series-home.html
 """
 
+import inspect
 import logging
+import os
 import re
 
 import oui_lookup
@@ -29,22 +32,46 @@ from net_docu_crawler.drivers.base import BaseDriver
 
 logger = logging.getLogger(__name__)
 
+_STRICT_HOST_KEY_ENV_VAR = "NDC_STRICT_HOST_KEYS"
+_CLI_ERROR_RE = re.compile(
+    r"(?:%\s*invalid\s+input|%\s*incomplete\s+command|%\s*ambiguous\s+command|%\s*unknown\s+command|syntax\s+error)",
+    re.IGNORECASE,
+)
+_XR_IFACE_PREFIX = (
+    r"(?:Gi|Te|Tw|Twe|Fi|Fo|Hu|FH|BE|Bundle-Ether|GigabitEthernet|TenGigE|"
+    r"TwentyFiveGigE|FortyGigE|FiftyGigE|HundredGigE|TwoHundredGigE|FourHundredGigE)"
+)
+
+
+def _is_cli_error(raw: str) -> bool:
+    return bool(raw and _CLI_ERROR_RE.search(raw))
+
+
+def _is_bgp_peer_addr(token: str) -> bool:
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", token):
+        return True
+    return ":" in token and bool(re.match(r"^[0-9a-fA-F:]+$", token))
+
 
 def _parse_xr_arp_line(line: str) -> dict | None:
     """Parse a single Cisco IOS-XR `show arp` table row."""
     # Example: 10.0.0.1        00:00:01   0011.2233.4455  Dynamic    ARPA  GigabitEthernet0/0/0/0
     m = re.match(
-        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-fA-F.:-]{12,17})\s+\S+\s+\S+\s+(\S+)\s*$",
+        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+([0-9a-fA-F.:-]{12,17})\s+(\S+)\s+\S+\s+(\S+)\s*$",
         line,
     )
     if not m:
         return None
-    ip_addr, raw_mac, intf = m.groups()
+    ip_addr, age, raw_mac, state, intf = m.groups()
     mac = oui_lookup.normalize_mac(raw_mac).lower()
     return {
+        "ip": ip_addr,
+        "mac": mac,
         "ip_address": ip_addr,
         "mac_address": mac,
         "interface": intf,
+        "age": age,
+        "type": state.lower(),
         "vendor": oui_lookup.lookup_oui(mac),
     }
 
@@ -55,6 +82,7 @@ def _parse_xr_bgp_summary(raw: str) -> list[dict]:
     cur_vrf = "default"
     cur_afi = "IPv4 Unicast"
     in_table = False
+    pending_neighbor: str | None = None
 
     for line in (raw or "").splitlines():
         s = line.strip()
@@ -64,22 +92,35 @@ def _parse_xr_bgp_summary(raw: str) -> list[dict]:
         if m_vrf:
             cur_vrf = m_vrf.group(1)
             in_table = False
+            pending_neighbor = None
             continue
         m_afi = re.match(r"^Address Family:\s*(.+)$", s, re.IGNORECASE)
         if m_afi:
             cur_afi = m_afi.group(1).strip()
             in_table = False
+            pending_neighbor = None
             continue
         if s.startswith("Neighbor") and "AS" in s:
             in_table = True
+            pending_neighbor = None
             continue
         if not in_table:
             continue
 
         # Neighbor        Spk    AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down  St/PfxRcd
         parts = s.split()
-        if len(parts) >= 10 and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
-            state_tok = parts[-1]
+        if len(parts) == 1 and _is_bgp_peer_addr(parts[0]):
+            pending_neighbor = parts[0]
+            continue
+        if pending_neighbor and len(parts) >= 9 and parts[0].isdigit():
+            parts = [pending_neighbor, *parts]
+            pending_neighbor = None
+        else:
+            pending_neighbor = None
+
+        if len(parts) >= 10 and _is_bgp_peer_addr(parts[0]):
+            uptime = parts[8]
+            state_tok = " ".join(parts[9:])
             is_up = state_tok.isdigit()
             peers.append(
                 {
@@ -87,8 +128,9 @@ def _parse_xr_bgp_summary(raw: str) -> list[dict]:
                     "vrf": cur_vrf,
                     "afi": cur_afi,
                     "neighbor_ip": parts[0],
+                    "remote_as": parts[2],
                     "asn": parts[2],
-                    "uptime": parts[-2],
+                    "uptime": uptime,
                     "state": "Established" if is_up else state_tok,
                     "prefixes_received": int(state_tok) if is_up else 0,
                 }
@@ -176,7 +218,7 @@ def _parse_xr_ldp_interfaces(raw: str) -> list[dict]:
     interfaces: list[dict] = []
     for line in (raw or "").splitlines():
         m = re.match(
-            r"^\s*((?:Gi|Te|Hu|Fo|BE|Bundle-Ether|TenGigE|GigabitEthernet|HundredGigE)\S+)\s+(Enabled|Disabled)\s+(.*)$",
+            rf"^\s*({_XR_IFACE_PREFIX}\S+)\s+(Enabled|Disabled)\s+(.*)$",
             line,
             re.IGNORECASE,
         )
@@ -231,6 +273,7 @@ class CiscoXRDriver(BaseDriver):
         use_gnmi: bool = False,
         gnmi_port: int = 57400,
         gnmi_insecure: bool = False,
+        strict_host_key_checking: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -239,22 +282,48 @@ class CiscoXRDriver(BaseDriver):
         self.use_gnmi = use_gnmi
         self.gnmi_port = gnmi_port
         self.gnmi_insecure = gnmi_insecure
+        self.strict_host_key_checking = strict_host_key_checking
+        self._cached_show_inventory: str | None = None
 
     def connect(self):
-        device = self._build_netmiko_params("cisco_xr", secret=self.secret, global_delay_factor=2)
+        device = self._build_netmiko_params(
+            "cisco_xr",
+            secret=self.secret,
+            global_delay_factor=2,
+            include_auth_timeout=True,
+        )
         conn = self.connect_netmiko(device)
         if self.secret:
             self._safe_enable(conn)
         return conn
+
+    def _fetch_inventory(self, conn) -> str:
+        """Fetch and cache `show inventory` output across version and optics collection."""
+        if self._cached_show_inventory is not None:
+            return self._cached_show_inventory
+        try:
+            raw = conn.send_command("show inventory")
+            if _is_cli_error(raw):
+                logger.warning("[%s] IOS-XR show inventory returned CLI error: %s", self.ip, raw.strip()[:160])
+                return ""
+            self._cached_show_inventory = raw or ""
+            return self._cached_show_inventory
+        except Exception as exc:
+            logger.warning("[%s] IOS-XR show inventory failed: %s", self.ip, exc)
+            return ""
 
     def get_version(self, conn) -> dict:
         sh_ver = getattr(self, "_prefetched_sh_ver", None)
         if sh_ver is not None:
             self._prefetched_sh_ver = None
         else:
-            sh_ver = conn.send_command("show version")
+            try:
+                sh_ver = conn.send_command("show version")
+            except Exception as exc:
+                logger.warning("[%s] IOS-XR show version failed: %s", self.ip, exc)
+                sh_ver = ""
 
-        ver = parser.parse_show_version(sh_ver, "cisco_xr")
+        ver = parser.parse_show_version(sh_ver or "", "cisco_xr")
         ver["os_type"] = "cisco_xr"
         ver["device_type"] = "router"
         ver["device_persona"] = "router"
@@ -265,8 +334,8 @@ class CiscoXRDriver(BaseDriver):
             if m_host:
                 ver["hostname"] = m_host.group(1).strip()
 
-        try:
-            sh_inv = conn.send_command("show inventory")
+        sh_inv = self._fetch_inventory(conn)
+        if sh_inv:
             for item in parser.parse_show_inventory(sh_inv):
                 if "chassis" in item.get("name", "").lower() or "chassis" in item.get("descr", "").lower():
                     if item.get("pid"):
@@ -274,17 +343,29 @@ class CiscoXRDriver(BaseDriver):
                     if item.get("sn") and item["sn"] != "N/A":
                         ver["serial"] = item["sn"]
                     break
-        except Exception as exc:
-            logger.debug("[%s] IOS-XR show inventory failed: %s", self.ip, exc)
 
         return ver
 
     def get_interfaces(self, conn) -> tuple[list, dict]:
-        sh_ip_int = conn.send_command("show ipv4 interface brief")
-        l3_ints = parser.parse_ip_interface_brief(sh_ip_int, "cisco_xr")
+        sh_ip_int = ""
+        try:
+            sh_ip_int = conn.send_command("show ipv4 interface brief")
+            if _is_cli_error(sh_ip_int):
+                logger.warning("[%s] IOS-XR show ipv4 interface brief returned CLI error", self.ip)
+                sh_ip_int = ""
+        except Exception as exc:
+            logger.warning("[%s] IOS-XR show ipv4 interface brief failed: %s", self.ip, exc)
+        l3_ints = parser.parse_ip_interface_brief(sh_ip_int, "cisco_xr") if sh_ip_int else []
 
-        sh_ints = conn.send_command("show interfaces")
-        ints_detail = parser.parse_show_interfaces(sh_ints, "cisco_xr")
+        sh_ints = ""
+        try:
+            sh_ints = conn.send_command("show interfaces")
+            if _is_cli_error(sh_ints):
+                logger.warning("[%s] IOS-XR show interfaces returned CLI error", self.ip)
+                sh_ints = ""
+        except Exception as exc:
+            logger.warning("[%s] IOS-XR show interfaces failed: %s", self.ip, exc)
+        ints_detail = parser.parse_show_interfaces(sh_ints, "cisco_xr") if sh_ints else {}
         for stats in ints_detail.values():
             if stats.get("mac_address"):
                 stats["mac_address"] = oui_lookup.normalize_mac(stats["mac_address"]).lower()
@@ -320,8 +401,9 @@ class CiscoXRDriver(BaseDriver):
             low = (sh_lldp or "").lower()
             if "not enabled" in low or "lldp is not running" in low:
                 lldp_status = "disabled"
-            elif "invalid input" in low:
+            elif _is_cli_error(sh_lldp):
                 lldp_status = "unsupported"
+                logger.warning("[%s] IOS-XR show lldp neighbors detail unsupported/error", self.ip)
             else:
                 lldp_status = "enabled"
                 for n in parser.parse_lldp_neighbors_detail(sh_lldp):
@@ -331,15 +413,16 @@ class CiscoXRDriver(BaseDriver):
                         seen.add(key)
                         neighbors.append(n)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show lldp neighbors detail failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show lldp neighbors detail failed: %s", self.ip, exc)
 
         try:
             sh_cdp = conn.send_command("show cdp neighbors detail")
             low = (sh_cdp or "").lower()
             if "cdp is not enabled" in low:
                 cdp_status = "disabled"
-            elif "invalid input" in low:
+            elif _is_cli_error(sh_cdp):
                 cdp_status = "unsupported"
+                logger.warning("[%s] IOS-XR show cdp neighbors detail unsupported/error", self.ip)
             else:
                 cdp_status = "enabled"
                 for n in parser.parse_cdp_neighbors_detail(sh_cdp):
@@ -349,7 +432,7 @@ class CiscoXRDriver(BaseDriver):
                         seen.add(key)
                         neighbors.append(n)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show cdp neighbors detail failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show cdp neighbors detail failed: %s", self.ip, exc)
 
         self._discovery_protocols = {
             "lldp": lldp_status,
@@ -373,57 +456,76 @@ class CiscoXRDriver(BaseDriver):
     def get_routing_table(self, conn) -> list[dict]:
         try:
             sh_route = conn.send_command("show route")
+            if _is_cli_error(sh_route):
+                logger.warning("[%s] IOS-XR show route returned CLI error", self.ip)
+                return []
             return parser.parse_show_ip_route(sh_route, "cisco_xr")
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show route failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show route failed: %s", self.ip, exc)
             return []
 
     def get_arp_table(self, conn) -> list[dict]:
         entries: list[dict] = []
         try:
             raw = conn.send_command("show arp")
+            if _is_cli_error(raw):
+                logger.warning("[%s] IOS-XR show arp returned CLI error", self.ip)
+                return entries
             for line in (raw or "").splitlines():
                 parsed = _parse_xr_arp_line(line)
                 if parsed:
                     entries.append(parsed)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show arp failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show arp failed: %s", self.ip, exc)
         return entries
 
     def get_fhrp(self, conn) -> list[dict]:
         fhrp: list[dict] = []
-        for proto, cmd in (("HSRP", "show hsrp summary"), ("VRRP", "show vrrp summary")):
-            try:
-                raw = conn.send_command(cmd)
-                if not raw or "invalid input" in raw.lower():
-                    continue
-                for line in raw.splitlines():
-                    m = re.match(
-                        r"^\s*(\S+)\s+(\d+)\s+\d+\s+(?:[P\-]\s+)?(Active|Standby|Master|Backup|Init|Listen)\b(.*)$",
-                        line,
-                        re.IGNORECASE,
-                    )
-                    if m:
-                        ips = re.findall(r"\d+\.\d+\.\d+\.\d+", m.group(4))
-                        vip = ips[-1] if ips else ""
-                        if vip:
-                            fhrp.append(
-                                {
-                                    "protocol": proto,
-                                    "interface": m.group(1),
-                                    "group": m.group(2),
-                                    "state": m.group(3),
-                                    "vip": vip,
-                                }
-                            )
-            except Exception as exc:
-                logger.debug("[%s] IOS-XR %s failed: %s", self.ip, cmd, exc)
+        for proto, cmds in (
+            ("HSRP", ("show hsrp brief", "show hsrp summary")),
+            ("VRRP", ("show vrrp brief", "show vrrp summary")),
+        ):
+            proto_entries: list[dict] = []
+            for cmd in cmds:
+                try:
+                    raw = conn.send_command(cmd)
+                    if not raw or _is_cli_error(raw):
+                        continue
+                    for line in raw.splitlines():
+                        m = re.match(
+                            r"^\s*(\S+)\s+(\d+)\s+(\d+)\s+([P\-])?\s*(Active|Standby|Master|Backup|Init|Listen)\b(.*)$",
+                            line,
+                            re.IGNORECASE,
+                        )
+                        if m:
+                            ips = re.findall(r"\d+\.\d+\.\d+\.\d+", m.group(6))
+                            vip = ips[-1] if ips else ""
+                            if vip:
+                                proto_entries.append(
+                                    {
+                                        "protocol": proto,
+                                        "interface": m.group(1),
+                                        "group": m.group(2),
+                                        "priority": int(m.group(3)),
+                                        "preempt": (m.group(4) or "").strip().upper() == "P",
+                                        "state": m.group(5),
+                                        "vip": vip,
+                                    }
+                                )
+                    if proto_entries:
+                        break
+                except Exception as exc:
+                    logger.warning("[%s] IOS-XR %s failed: %s", self.ip, cmd, exc)
+            fhrp.extend(proto_entries)
         return fhrp
 
     def get_l2_operational(self, conn) -> dict[str, dict]:
         ops: dict[str, dict] = {}
         try:
             raw_bundle = conn.send_command("show bundle")
+            if _is_cli_error(raw_bundle):
+                logger.warning("[%s] IOS-XR show bundle returned CLI error", self.ip)
+                return ops
             cur_bundle = ""
             for line in (raw_bundle or "").splitlines():
                 m_b = re.match(r"^(Bundle-Ether\d+)\s*$", line.strip(), re.IGNORECASE)
@@ -432,41 +534,45 @@ class CiscoXRDriver(BaseDriver):
                     ops.setdefault(cur_bundle, {"mode": "trunk", "oper_mode": "trunk", "lag_role": "bundle"})
                     continue
                 m_mem = re.match(
-                    r"^\s*((?:Gi|Te|Hu|Fo|TenGigE|GigabitEthernet|HundredGigE)\S+)\s+(Active|Standby|Configured)\b",
+                    rf"^\s*({_XR_IFACE_PREFIX}\S+)\s+(Active|Standby|Configured)\b",
                     line,
                     re.IGNORECASE,
                 )
                 if m_mem and cur_bundle:
                     mem = m_mem.group(1)
                     ops[mem] = {
+                        "lag_group": cur_bundle,
                         "lag_id": cur_bundle,
                         "lacp_mode": "active" if "active" in m_mem.group(2).lower() else "passive",
                     }
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show bundle failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show bundle failed: %s", self.ip, exc)
         return ops
 
     def get_optics(self, conn) -> list[dict]:
         optics: list[dict] = []
-        try:
-            inv_raw = conn.send_command("show inventory")
-            for item in parser.parse_show_inventory(inv_raw):
-                name = item.get("name", "")
-                descr = item.get("descr", "")
-                pid = item.get("pid", "")
-                if any(k in descr.lower() or k in pid.lower() for k in ("sfp", "qsfp", "xfp", "cfp", "optic")):
-                    optics.append(
-                        {
-                            "port": name,
-                            "part_number": pid,
-                            "serial": item.get("sn", ""),
-                            "description": descr,
-                            "tx_power_dbm": None,
-                            "rx_power_dbm": None,
-                        }
-                    )
-        except Exception as exc:
-            logger.debug("[%s] IOS-XR show inventory optics failed: %s", self.ip, exc)
+        inv_raw = self._fetch_inventory(conn)
+        if not inv_raw:
+            return optics
+        for item in parser.parse_show_inventory(inv_raw):
+            name = item.get("name", "")
+            descr = item.get("descr", "")
+            pid = item.get("pid", "")
+            if any(k in descr.lower() or k in pid.lower() for k in ("sfp", "qsfp", "xfp", "cfp", "optic")):
+                optics.append(
+                    {
+                        "port": name,
+                        "type": descr or "SFP",
+                        "vendor": "Cisco",
+                        "part_number": pid,
+                        "serial": item.get("sn", ""),
+                        "description": descr,
+                        "tx_power_dbm": None,
+                        "rx_power_dbm": None,
+                        "temperature_c": None,
+                        "voltage_v": None,
+                    }
+                )
         return optics
 
     def get_routing_peers(self, conn) -> list[dict]:
@@ -474,57 +580,92 @@ class CiscoXRDriver(BaseDriver):
         for cmd in ("show bgp all all summary", "show bgp vrf all summary"):
             try:
                 raw = conn.send_command(cmd)
-                if raw and "invalid input" not in raw.lower():
+                if raw and not _is_cli_error(raw):
                     peers.extend(_parse_xr_bgp_summary(raw))
                     if peers:
                         break
             except Exception as exc:
-                logger.debug("[%s] IOS-XR %s failed: %s", self.ip, cmd, exc)
+                logger.warning("[%s] IOS-XR %s failed: %s", self.ip, cmd, exc)
 
-        for proto, cmd in (("ospf", "show ospf neighbor"), ("isis", "show isis neighbors")):
-            try:
-                raw = conn.send_command(cmd)
-                if not raw or "invalid input" in raw.lower():
-                    continue
-                for line in raw.splitlines():
-                    m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
-                    if m_ip and ("full" in line.lower() or "up" in line.lower()):
-                        peers.append({"protocol": proto, "neighbor_ip": m_ip.group(1), "state": "Up"})
-            except Exception as exc:
-                logger.debug("[%s] IOS-XR %s failed: %s", self.ip, cmd, exc)
+        try:
+            raw_ospf = conn.send_command("show ospf neighbor")
+            if raw_ospf and not _is_cli_error(raw_ospf):
+                for line in raw_ospf.splitlines():
+                    m_ospf = re.match(
+                        r"^\s*(\d+\.\d+\.\d+\.\d+)\s+\d+\s+([A-Za-z0-9_-]+(?:/\s*[A-Za-z0-9_-]+)?)\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)",
+                        line,
+                    )
+                    if m_ospf:
+                        state_val = re.sub(r"\s*/\s*", "/", m_ospf.group(2).strip())
+                        peers.append(
+                            {
+                                "protocol": "ospf",
+                                "neighbor_id": m_ospf.group(1),
+                                "neighbor_ip": m_ospf.group(3),
+                                "state": state_val,
+                                "interface": m_ospf.group(4),
+                            }
+                        )
+        except Exception as exc:
+            logger.warning("[%s] IOS-XR show ospf neighbor failed: %s", self.ip, exc)
+
+        try:
+            raw_isis = conn.send_command("show isis neighbors")
+            if raw_isis and not _is_cli_error(raw_isis):
+                for line in raw_isis.splitlines():
+                    if line.strip().lower().startswith(("system id", "is-is", "total")):
+                        continue
+                    m_isis = re.match(
+                        r"^\s*(\S+)\s+(\S+)\s+(\S+)\s+(Up|Init|Down|Failed)\s+\d+",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if m_isis:
+                        peers.append(
+                            {
+                                "protocol": "isis",
+                                "neighbor_ip": m_isis.group(1),
+                                "system_id": m_isis.group(1),
+                                "interface": m_isis.group(2),
+                                "snpa": m_isis.group(3),
+                                "state": m_isis.group(4),
+                            }
+                        )
+        except Exception as exc:
+            logger.warning("[%s] IOS-XR show isis neighbors failed: %s", self.ip, exc)
         return peers
 
     def get_vrfs(self, conn) -> list[dict]:
         try:
             raw = conn.send_command("show vrf all detail")
-            if raw and "invalid input" not in raw.lower():
+            if raw and not _is_cli_error(raw):
                 return _parse_xr_vrf_detail(raw)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show vrf all detail failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show vrf all detail failed: %s", self.ip, exc)
         return []
 
     def get_mpls_ldp(self, conn) -> dict:
         mpls = {"ldp_neighbors": [], "ldp_interfaces": [], "forwarding": []}
         try:
             raw_nbr = conn.send_command("show mpls ldp neighbor brief")
-            if raw_nbr and "invalid input" not in raw_nbr.lower():
+            if raw_nbr and not _is_cli_error(raw_nbr):
                 mpls["ldp_neighbors"] = _parse_xr_ldp_neighbors(raw_nbr)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show mpls ldp neighbor brief failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show mpls ldp neighbor brief failed: %s", self.ip, exc)
 
         try:
             raw_if = conn.send_command("show mpls ldp interface")
-            if raw_if and "invalid input" not in raw_if.lower():
+            if raw_if and not _is_cli_error(raw_if):
                 mpls["ldp_interfaces"] = _parse_xr_ldp_interfaces(raw_if)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show mpls ldp interface failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show mpls ldp interface failed: %s", self.ip, exc)
 
         try:
             raw_fwd = conn.send_command("show mpls forwarding-table")
-            if raw_fwd and "invalid input" not in raw_fwd.lower():
+            if raw_fwd and not _is_cli_error(raw_fwd):
                 mpls["forwarding"] = _parse_xr_mpls_forwarding(raw_fwd)
         except Exception as exc:
-            logger.debug("[%s] IOS-XR show mpls forwarding-table failed: %s", self.ip, exc)
+            logger.warning("[%s] IOS-XR show mpls forwarding-table failed: %s", self.ip, exc)
         return mpls
 
     def get_running_config(self, conn) -> str:
@@ -540,13 +681,30 @@ class CiscoXRDriver(BaseDriver):
             logger.warning("[%s] --netconf requested, but 'ncclient' is not installed (pip install '.[xr]').", self.ip)
             return ""
 
+        strict_host_keys = self.strict_host_key_checking or os.environ.get(
+            _STRICT_HOST_KEY_ENV_VAR, ""
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not strict_host_keys:
+            logger.warning(
+                "[%s] NETCONF hostkey_verify=False (set %s=1 or strict_host_key_checking=True to enforce SSH host-key verification).",
+                self.ip,
+                _STRICT_HOST_KEY_ENV_VAR,
+            )
+
         try:
             with manager.connect(
                 host=self.ip,
                 port=self.netconf_port,
                 username=self.username,
                 password=self.password,
-                hostkey_verify=False,
+                hostkey_verify=strict_host_keys,
+                allow_agent=False,
+                look_for_keys=False,
                 timeout=self.timeout,
             ) as m:
                 reply = m.get(filter=("xpath", xpath_filter))
@@ -565,15 +723,41 @@ class CiscoXRDriver(BaseDriver):
             logger.warning("[%s] --gnmi requested, but 'pygnmi' is not installed (pip install '.[xr]').", self.ip)
             return {}
 
+        if self.gnmi_insecure:
+            logger.warning("[%s] gNMI insecure=True enabled (unverified/plaintext channel).", self.ip)
+
         target_paths = paths or ["/interfaces/interface/state", "/network-instances/network-instance/bgp"]
+        init_kwargs: dict = {
+            "target": (self.ip, self.gnmi_port),
+            "username": self.username,
+            "password": self.password,
+            "insecure": self.gnmi_insecure,
+        }
         try:
-            with gNMIclient(
-                target=(self.ip, self.gnmi_port),
-                username=self.username,
-                password=self.password,
-                insecure=self.gnmi_insecure,
-            ) as gc:
-                return gc.get(path=target_paths, encoding="json_ietf")
+            sig = inspect.signature(gNMIclient)
+            params = sig.parameters
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if "gnmi_timeout" in params or has_varkw:
+                init_kwargs["gnmi_timeout"] = self.timeout
+            elif "timeout" in params:
+                init_kwargs["timeout"] = self.timeout
+            if "grpc_options" in params or has_varkw:
+                init_kwargs["grpc_options"] = [("grpc.keepalive_timeout_ms", max(1000, int(self.timeout * 1000)))]
+        except (TypeError, ValueError):
+            init_kwargs["gnmi_timeout"] = self.timeout
+
+        try:
+            with gNMIclient(**init_kwargs) as gc:
+                get_kwargs: dict = {"path": target_paths, "encoding": "json_ietf"}
+                try:
+                    get_sig = inspect.signature(gc.get)
+                    get_params = get_sig.parameters
+                    get_has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in get_params.values())
+                    if "timeout" in get_params or get_has_varkw:
+                        get_kwargs["timeout"] = self.timeout
+                except (TypeError, ValueError):
+                    pass
+                return gc.get(**get_kwargs)
         except Exception as exc:
             logger.warning("[%s] gNMI read-only Get failed; falling back to CLI: %s", self.ip, exc)
             return {}
