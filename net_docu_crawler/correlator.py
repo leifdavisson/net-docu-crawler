@@ -21,13 +21,75 @@ Produces:
   3. Site- and device-scoped L3 SVI / VLAN / DHCP-relay join table (`build_l3_svi_table`)
 """
 
-import ipaddress
 import re
 
+from netaddr import AddrFormatError, IPAddress, IPNetwork
+
 from net_docu_crawler.schema import build_empty_port_record, normalize_tri_state, stamp_schema_v2
-from net_docu_crawler.topology_resolver import normalize_interface
+from net_docu_crawler.topology_resolver import (
+    extract_vlan_id_from_interface,
+    infer_interface_speed,
+    normalize_interface,
+    normalize_interface_key,
+    normalize_stp_bridge_id,
+)
 
 _INFRA_NEIGHBOR_TYPES = frozenset({"switch", "router", "firewall", "wlc", "bridge"})
+_INFERRED_L2_ACCURACIES = frozenset(
+    {"mac_inferred", "l3_next_hop_egress", "wan_carrier_arp_route", "virtual_passthrough", "multi_neighbor_port"}
+)
+_VIRTUAL_IFACE_RE = re.compile(
+    r"^(?:vtnet|veth|br[-.\d]|docker|virbr|tun|tap|wg|gre|st\d|vlan|irb|bvi|lo\d*$)",
+    re.IGNORECASE,
+)
+_LAG_IFACE_RE = re.compile(r"^(?:po|port-channel|ae|be|bundle-ether|lag|trk|reth)\d", re.IGNORECASE)
+
+
+def _neighbor_priority(nbr: dict) -> int:
+    """Rank neighbor candidates on a shared port so direct infra uplinks beat MAC-inferred/endpoint entries."""
+    is_direct = (
+        str(nbr.get("link_confidence") or "").upper() != "INFERRED"
+        and str(nbr.get("l2_accuracy") or "").strip().lower() not in _INFERRED_L2_ACCURACIES
+    )
+    is_infra = str(nbr.get("device_type") or "").strip().lower() in _INFRA_NEIGHBOR_TYPES
+    if is_direct and is_infra:
+        return 3
+    if is_direct:
+        return 2
+    if is_infra:
+        return 1
+    return 0
+
+
+def _infer_non_optic_media(port_name: str, speed_operational: str, oper_state: str) -> str:
+    """Infer truthful link media label when DOM optical telemetry is absent."""
+    p_clean = str(port_name or "").strip()
+    if _VIRTUAL_IFACE_RE.match(p_clean):
+        return "Virtual"
+    if _LAG_IFACE_RE.match(p_clean):
+        return "LAG / Logical"
+    if not speed_operational and oper_state != "up":
+        return ""
+    mbps, _ = infer_interface_speed(speed_operational, p_clean)
+    if mbps >= 100000:
+        return "100GBASE / QSFP28 (Unmonitored)"
+    if mbps >= 40000:
+        return "40GBASE / QSFP+ (Unmonitored)"
+    if mbps >= 25000:
+        return "25GBASE / SFP28 (Unmonitored)"
+    if mbps >= 10000:
+        return "10GBASE-CX / SFP+ (Unmonitored)"
+    if mbps >= 5000:
+        return "5GBASE-T (RJ45)"
+    if mbps >= 2500:
+        return "2.5GBASE-T (RJ45)"
+    if oper_state != "up":
+        return ""
+    if mbps == 100:
+        return "100BASE-TX (RJ45)"
+    if mbps == 10:
+        return "10BASE-T (RJ45)"
+    return "1000BASE-T (RJ45)"
 
 
 def correlate_device_ports(dev: dict) -> dict[str, dict]:
@@ -50,27 +112,36 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
         ):
             poe_dict["poe_supported"] = False
     poe_ports = (poe_dict or {}).get("ports", {}) or {}
-    optics_by_port = {normalize_interface(o.get("port", "")): o for o in (dev.get("optics") or []) if o.get("port")}
-    neighbors_by_port = {
-        normalize_interface(n.get("local_port", "")): n for n in (dev.get("neighbors") or []) if n.get("local_port")
-    }
+    poe_ports_ci = {normalize_interface_key(k): v for k, v in poe_ports.items() if k}
+    optics_by_port = {normalize_interface_key(o.get("port", "")): o for o in (dev.get("optics") or []) if o.get("port")}
+    neighbors_by_port: dict[str, dict] = {}
+    for n in dev.get("neighbors") or []:
+        if not isinstance(n, dict) or not n.get("local_port"):
+            continue
+        nk = normalize_interface_key(n.get("local_port", ""))
+        if not nk:
+            continue
+        prev = neighbors_by_port.get(nk)
+        if prev is None or _neighbor_priority(n) > _neighbor_priority(prev):
+            neighbors_by_port[nk] = n
     vlans_map = dev.get("vlans", {}) or {}
-    norm_profiles = {normalize_interface(k): v for k, v in port_profiles.items()}
+    norm_profiles = {normalize_interface_key(k): v for k, v in port_profiles.items() if k}
 
-    # Count MACs per normalized port
+    # Count MACs per canonical lowercase port key
     mac_counts: dict[str, int] = {}
     for m in dev.get("mac_table", []) or []:
-        p = normalize_interface(m.get("interface") or m.get("port") or "")
-        if p:
-            mac_counts[p] = mac_counts.get(p, 0) + 1
+        pk = normalize_interface_key(m.get("interface") or m.get("port") or "")
+        if pk:
+            mac_counts[pk] = mac_counts.get(pk, 0) + 1
 
     ports: dict[str, dict] = {}
     for port_name, stats in ints_detail.items():
         if str(port_name).strip().lower() in ("irb", "vlan", "lo", "lo0"):
             continue
         norm_p = normalize_interface(port_name)
+        norm_k = normalize_interface_key(port_name)
         rec = build_empty_port_record(hostname=hostname, interface=port_name, normalized_interface=norm_p)
-        prof = port_profiles.get(port_name) or norm_profiles.get(norm_p) or {}
+        prof = port_profiles.get(port_name) or norm_profiles.get(norm_k) or {}
 
         rec["admin_state"] = str(stats.get("admin_status") or "unknown").lower()
         rec["oper_state"] = str(stats.get("status") or "unknown").lower()
@@ -124,7 +195,7 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
             if prof.get("acl_out"):
                 rec["acl_out"] = prof["acl_out"]
 
-        poe_p = poe_ports.get(port_name) or poe_ports.get(norm_p)
+        poe_p = poe_ports.get(port_name) or poe_ports.get(norm_p) or poe_ports_ci.get(norm_k)
         if poe_p:
             rec["poe_state"] = str(poe_p.get("status") or "unknown").lower()
             rec["poe_draw_watts"] = float(
@@ -133,18 +204,16 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
             rec["poe_allocated_watts"] = float(poe_p.get("allocated_watts", 0.0) or 0.0)
             rec["poe_class"] = str(poe_p.get("class") or "")
 
-        opt = optics_by_port.get(norm_p)
+        opt = optics_by_port.get(norm_k)
         if opt:
             rec["media"] = opt.get("type") or ""
             rec["optic_part_number"] = opt.get("part_number") or ""
             rec["rx_power_dbm"] = opt.get("rx_power_dbm")
             rec["tx_power_dbm"] = opt.get("tx_power_dbm")
-        elif "10g" in rec["speed_operational"].lower():
-            rec["media"] = "10GBASE-CX / SFP+ (Unmonitored)"
-        elif rec["oper_state"] == "up":
-            rec["media"] = "1000BASE-T (RJ45)"
+        else:
+            rec["media"] = _infer_non_optic_media(port_name, rec["speed_operational"], rec["oper_state"])
 
-        nbr = neighbors_by_port.get(norm_p)
+        nbr = neighbors_by_port.get(norm_k)
         if nbr:
             rec["neighbor_hostname"] = nbr.get("remote_device") or ""
             rec["neighbor_port"] = nbr.get("remote_port") or ""
@@ -152,7 +221,7 @@ def correlate_device_ports(dev: dict) -> dict[str, dict]:
             rec["neighbor_type"] = (nbr.get("device_type") or "").lower()
             rec["link_confidence"] = nbr.get("link_confidence") or "one-way"
 
-        m_cnt = mac_counts.get(norm_p, 0)
+        m_cnt = mac_counts.get(norm_k, 0)
         is_infra_uplink = rec["mode"] == "trunk" or rec["neighbor_type"] in _INFRA_NEIGHBOR_TYPES
         if is_infra_uplink:
             rec["trunk_mac_count"] = m_cnt
@@ -189,13 +258,14 @@ def compute_stp_root_consensus(raw_devices: list[dict]) -> None:
     """
     Distinguish true campus STP root bridges (`is_verified_campus_root=True`,
     corroborated by >=1 other switch) from isolated self-roots (`isolated_self_root`).
+    Normalizes bridge-ID MAC notation across Cisco dotted and Juniper/Arista colon formats.
     """
     root_claims: dict[str, int] = {}
     for dev in raw_devices:
         if dev.get("status", "success") != "success":
             continue
         stp = dev.get("stp") or {}
-        rb = str(stp.get("root_bridge") or "").strip().lower()
+        rb = normalize_stp_bridge_id(str(stp.get("root_bridge") or ""))
         if rb:
             root_claims[rb] = root_claims.get(rb, 0) + 1
 
@@ -203,7 +273,7 @@ def compute_stp_root_consensus(raw_devices: list[dict]) -> None:
         stp = dev.get("stp")
         if not isinstance(stp, dict):
             continue
-        rb = str(stp.get("root_bridge") or "").strip().lower()
+        rb = normalize_stp_bridge_id(str(stp.get("root_bridge") or ""))
         is_root = bool(stp.get("is_root", False))
         if is_root and rb and root_claims.get(rb, 0) >= 2:
             stp["is_verified_campus_root"] = True
@@ -221,8 +291,8 @@ def compute_stp_root_consensus(raw_devices: list[dict]) -> None:
 
 def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
     """
-    Build a site- and device-scoped L3 SVI / VLAN / DHCP-relay join table
-    using exact VLAN ID matching (never substring `vid in iname`).
+    Build a site- and device-scoped L3 SVI / VLAN / DHCP-relay join table using `netaddr`
+    and multi-vendor SVI/subinterface VLAN ID extraction (exact `by_svi` priority, rejecting VLAN 0).
     """
     rows: list[dict] = []
     for dev in raw_devices:
@@ -231,54 +301,70 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
         hostname = dev.get("hostname") or dev.get("ip", "")
         site_code = dev.get("site_code") or ""
         vlans_map = dev.get("vlans", {}) or {}
+        ints_detail = dev.get("interfaces_detail", {}) or {}
         relays = (dev.get("dhcp") or {}).get("relays", []) or []
-        by_svi = {
-            v.get("svi_interface", "").lower(): (
-                vid,
-                str(v.get("name", "")).strip('"'),
-                str(v.get("description", "")).strip('"'),
-            )
-            for vid, v in vlans_map.items()
-            if v.get("svi_interface")
-        }
+        by_svi: dict[str, tuple[str, str, str]] = {}
+        for vid, v in vlans_map.items():
+            if isinstance(v, dict) and v.get("svi_interface"):
+                svi_raw = str(v["svi_interface"]).strip()
+                meta = (
+                    str(vid),
+                    str(v.get("name", "")).strip('"'),
+                    str(v.get("description", "")).strip('"'),
+                )
+                by_svi[svi_raw.lower()] = meta
+                by_svi[normalize_interface_key(svi_raw)] = meta
         by_name = {
             str(v.get("name", "")).strip('"').lower(): (
-                vid,
+                str(vid),
                 str(v.get("name", "")).strip('"'),
                 str(v.get("description", "")).strip('"'),
             )
             for vid, v in vlans_map.items()
-            if v.get("name")
+            if isinstance(v, dict) and v.get("name")
         }
 
         for intf in dev.get("l3_interfaces", []) or []:
             iname = str(intf.get("interface") or "").strip()
             ip_str = str(intf.get("ip_address") or "").strip()
-            if not iname or not ip_str or ip_str in ("unassigned", "down", "up", "unset"):
+            if not iname or not ip_str or ip_str.lower() in ("unassigned", "down", "up", "unset", "n/a"):
                 continue
+            collapsed = re.sub(r"\s+", " ", ip_str)
+            mask_known = ("/" in collapsed) or (" " in collapsed)
             try:
-                net = ipaddress.IPv4Interface(ip_str.replace(" ", "/")).network
-                prefix_cidr = str(net)
-            except ValueError:
+                ip_part = collapsed.split("/", 1)[0].split(" ", 1)[0]
+                ip_obj = IPAddress(ip_part)
+                ip_s = str(ip_obj)
+                if ip_obj.is_loopback() or ip_s in ("0.0.0.0", "::", "::1") or ip_s.startswith(("127.", "128.0.")):
+                    continue
+                if mask_known:
+                    net = IPNetwork(collapsed.replace(" ", "/"))
+                    prefix_cidr = f"{net.network}/{net.prefixlen}"
+                else:
+                    prefix_cidr = ""
+            except (AddrFormatError, ValueError):
                 prefix_cidr = ""
 
-            m_vid = re.match(r"^(?:vlan\.?|vl|irb\.)0*(\d+)$", iname, re.IGNORECASE)
-            if m_vid and (m_vid.group(1) in vlans_map or iname.lower() not in by_svi):
-                vid = m_vid.group(1)
-                vinfo = vlans_map.get(vid, {}) or {}
-                vname = str(vinfo.get("name", "")).strip('"')
-                vdesc = str(vinfo.get("description", "")).strip('"')
-            elif iname.lower() in by_svi:
-                vid, vname, vdesc = by_svi[iname.lower()]
-            elif iname.lower() in by_name:
-                vid, vname, vdesc = by_name[iname.lower()]
-            elif iname.upper() == "DEFAULT_VLAN" and "1" in vlans_map:
-                vid = "1"
-                vinfo = vlans_map["1"] or {}
-                vname = str(vinfo.get("name", "DEFAULT_VLAN")).strip('"')
-                vdesc = str(vinfo.get("description", "")).strip('"')
+            iname_l = iname.lower()
+            iname_k = normalize_interface_key(iname)
+            if iname_l in by_svi or iname_k in by_svi:
+                vid, vname, vdesc = by_svi.get(iname_l) or by_svi[iname_k]
             else:
-                vid, vname, vdesc = "", "", ""
+                extracted_vid = extract_vlan_id_from_interface(iname, intf_meta=intf, interfaces_detail=ints_detail)
+                if extracted_vid:
+                    vid = extracted_vid
+                    vinfo = vlans_map.get(vid, {}) if isinstance(vlans_map.get(vid), dict) else {}
+                    vname = str(vinfo.get("name", "")).strip('"')
+                    vdesc = str(vinfo.get("description", "")).strip('"')
+                elif iname_l in by_name:
+                    vid, vname, vdesc = by_name[iname_l]
+                elif iname.upper() == "DEFAULT_VLAN" and "1" in vlans_map:
+                    vid = "1"
+                    vinfo = vlans_map["1"] or {}
+                    vname = str(vinfo.get("name", "DEFAULT_VLAN")).strip('"')
+                    vdesc = str(vinfo.get("description", "")).strip('"')
+                else:
+                    vid, vname, vdesc = "", "", ""
 
             matched_relays = sorted(
                 {
@@ -286,8 +372,13 @@ def build_l3_svi_table(raw_devices: list[dict]) -> list[dict]:
                     for r in relays
                     if r.get("helper_ip")
                     and (
-                        r.get("interface", "").lower() == iname.lower()
-                        or (vid and r.get("interface", "").lower() in (f"vlan {vid}", f"vlan{vid}", f"irb.{vid}"))
+                        str(r.get("interface") or "").strip().lower() == iname_l
+                        or normalize_interface_key(str(r.get("interface") or "")) == iname_k
+                        or (
+                            vid
+                            and str(r.get("interface") or "").strip().lower()
+                            in (f"vlan {vid}", f"vlan{vid}", f"vlan.{vid}", f"vlan_{vid}", f"irb.{vid}", vid)
+                        )
                     )
                 }
             )
