@@ -113,9 +113,24 @@ def detect_paging_artifact(output: str) -> bool:
     return bool(PAGING_PROMPT_RE.search(output))
 
 
+_LINE_CLI_ERROR_RE = re.compile(
+    r"(?im)^\s*(?:%\s*(?:invalid|unrecognized|unknown|incomplete|ambiguous|authorization|error)|"
+    r"command\s+(?:parse\s+error|fail)|syntax\s+error|cli\s+error|-?(?:ba|da|a)?sh:\s+.*command\s+not\s+found)"
+)
+
+
 def detect_cli_error(output: str) -> str:
     """Return the first matched CLI error marker if `output` looks like a CLI rejection, else ''."""
     if not isinstance(output, str) or not output.strip():
+        return ""
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    if len(lines) > 25:
+        head_text = "\n".join(lines[:5]).lower()
+        for marker in CLI_ERROR_MARKERS:
+            if marker in head_text:
+                return marker
+        if m := _LINE_CLI_ERROR_RE.search("\n".join(lines[:15])):
+            return m.group(0).strip().lower()
         return ""
     low = output.lower()
     for marker in CLI_ERROR_MARKERS:

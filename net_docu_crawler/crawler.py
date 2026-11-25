@@ -984,6 +984,15 @@ def _connect_and_crawl_once(
         if raw_prompt.strip():
             prompt_os = inspect_prompt_os(raw_prompt)
             prompt_vendor = resolve_prompt_vendor(raw_prompt)
+            if prompt_vendor == "unknown" and driver_cls.__name__ == "CiscoDriver":
+                cleaned_p = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", raw_prompt).strip()
+                last_p = [ln.strip() for ln in cleaned_p.splitlines() if ln.strip()][-1] if cleaned_p else ""
+                if re.search(
+                    r"^(?:\[[^\[\]\s@]+@[^\[\]\s]+\s+[^\]]+\]|[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^>\r\n]*)\s*[#$]\s*$",
+                    last_p,
+                ):
+                    prompt_vendor = "frrouting"
+                    prompt_os = "linux_frr"
             if prompt_vendor != "unknown":
                 target_cls = resolve_driver_for_vendor(prompt_vendor)
                 if isinstance(target_cls, type) and target_cls is not driver_cls:

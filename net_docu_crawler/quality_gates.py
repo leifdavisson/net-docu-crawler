@@ -23,9 +23,9 @@ import json
 import os
 from collections import Counter
 
+from net_docu_crawler.drivers.base import detect_cli_error
 from net_docu_crawler.schema import (
     APPLIANCE_TYPES,
-    CLI_ERROR_MARKERS,
     CRITICAL_COLLECTION_SECTIONS,
     normalize_collection_status,
 )
@@ -260,11 +260,9 @@ def evaluate_quality_gates(raw_devices: list[dict], trunk_audit: dict | None = N
                 reasons.append("hostname unresolved (header/version parse mismatch)")
             if not (dev.get("interfaces_detail") or {}):
                 reasons.append("0 interfaces parsed (command/driver mismatch)")
-            cfg_l = str(dev.get("raw_config") or "").lower()
-            for marker in CLI_ERROR_MARKERS:
-                if marker in cfg_l:
-                    reasons.append(f"CLI error in config output (`{marker}`)")
-                    break
+            cfg_marker = detect_cli_error(str(dev.get("raw_config") or ""))
+            if cfg_marker:
+                reasons.append(f"CLI error in config output (`{cfg_marker}`)")
             if reasons:
                 command_header_mismatches.append(
                     {

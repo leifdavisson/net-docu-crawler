@@ -312,3 +312,13 @@ def test_driver_registry_aliases_canonicalize_strip_and_exports():
 
     assert "CiscoXRDriver" in drivers_pkg.__all__
     assert "canonicalize_vendor" in drivers_pkg.__all__
+
+
+def test_inspect_prompt_os_linux_stays_unknown_for_generic_shell():
+    """inspect_prompt_os keeps generic Linux shell prompts 'unknown' while OpenWrt/OPNsense still match."""
+    from net_docu_crawler.drivers.detector import resolve_prompt_vendor
+
+    assert inspect_prompt_os("\x1b[?2004hroot@pve:~#") == "unknown"
+    assert inspect_prompt_os("\x1b[?2004hroot@FRR-Router-01:~# ") == "unknown"
+    assert resolve_prompt_vendor("root@OpenWrt:~#") == "openwrt"
+    assert resolve_prompt_vendor("root@opnsense:~ #") == "opnsense"

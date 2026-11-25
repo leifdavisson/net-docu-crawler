@@ -237,3 +237,17 @@ MIIEowIBAAKCAQEAsecretkeymaterial
         "MIIEowIBAAKCAQEAsecretkeymaterial",
     ):
         assert leaked not in cleaned, f"Secret leaked after sanitization: {leaked}"
+
+
+def test_detect_cli_error_ignores_benign_large_config_substrings():
+    """Large valid running configs containing 'authorization failed' text must not trigger CLI error."""
+    from net_docu_crawler.drivers.base import detect_cli_error
+
+    large_cfg = "\n".join(
+        ["config system global", "    set hostname FortiGate-VM64-KVM", "end"]
+        + [f"    set comment line_{i}" for i in range(40)]
+        + ['    set auth-msg "authorization failed"']
+    )
+    assert detect_cli_error(large_cfg) == ""
+    assert detect_cli_error("Command fail. Return code -61\nauthorization failed") == "authorization failed"
+    assert detect_cli_error("% Invalid input detected at '^' marker.") == "% invalid input"

@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 _BAD_NEIGH_STATES = frozenset({"FAILED", "INCOMPLETE", "NOARP"})
+_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def _strip_ansi(text: str | None) -> str:
+    """Strip ANSI/VT100 terminal control sequences (e.g. bash bracketed-paste) and outer whitespace."""
+    if not isinstance(text, str):
+        return ""
+    return _ANSI_RE.sub("", text).strip()
 
 
 class FRRDriver(BaseDriver):
@@ -83,9 +91,9 @@ class FRRDriver(BaseDriver):
             except Exception as exc:
                 last_exc = exc
                 continue
-            if not isinstance(raw, str) or not raw.strip():
+            stripped = _strip_ansi(raw)
+            if not stripped:
                 continue
-            stripped = raw.strip()
             if stripped.startswith(("{", "[")):
                 try:
                     return json.loads(stripped), cmd
@@ -112,9 +120,9 @@ class FRRDriver(BaseDriver):
             "device_type": self.default_device_type,
         }
         try:
-            h = (conn.send_command("hostname -s") or "").strip()
+            h = _strip_ansi(conn.send_command("hostname -s"))
             if h:
-                info["hostname"] = h
+                info["hostname"] = h.splitlines()[-1].strip()
         except Exception as exc:
             logger.warning("[%s] FRR hostname -s failed: %s", self.ip, exc)
 
@@ -151,8 +159,8 @@ class FRRDriver(BaseDriver):
         last_link_exc: Exception | None = None
         for cmd in ("ip -s -j link show", "ip -j link show"):
             try:
-                link_raw = conn.send_command(cmd)
-                if isinstance(link_raw, str) and link_raw.strip():
+                link_raw = _strip_ansi(conn.send_command(cmd))
+                if link_raw:
                     parsed = json.loads(link_raw)
                     if isinstance(parsed, list):
                         link_data = parsed
@@ -199,8 +207,8 @@ class FRRDriver(BaseDriver):
                 }
 
         try:
-            addr_raw = conn.send_command("ip -j -4 addr show")
-            addr_data = json.loads(addr_raw) if isinstance(addr_raw, str) and addr_raw.strip() else []
+            addr_raw = _strip_ansi(conn.send_command("ip -j -4 addr show"))
+            addr_data = json.loads(addr_raw) if addr_raw else []
             if not isinstance(addr_data, list):
                 logger.warning("[%s] Linux ip -j -4 addr show returned %s", self.ip, type(addr_data).__name__)
                 addr_data = []
@@ -308,7 +316,7 @@ class FRRDriver(BaseDriver):
         notes = ""
         is_plain_linux = self._frr_available is False
         try:
-            raw = (conn.send_command("lldpcli show neighbors -f json") or "").strip()
+            raw = _strip_ansi(conn.send_command("lldpcli show neighbors -f json"))
             if raw.startswith("{"):
                 parsed_nbrs, ok = parse_lldpd_json(raw, default_device_type="router", log=logger, ip=self.ip)
                 if ok:
@@ -388,8 +396,8 @@ class FRRDriver(BaseDriver):
         routes: list[dict] = []
         if not self._has_frr(conn):
             try:
-                raw = conn.send_command("ip -j route show")
-                data = json.loads(raw) if isinstance(raw, str) and raw.strip() else []
+                raw = _strip_ansi(conn.send_command("ip -j route show"))
+                data = json.loads(raw) if raw else []
                 if not isinstance(data, list):
                     logger.warning("[%s] Linux ip -j route show returned %s", self.ip, type(data).__name__)
                     return routes
@@ -592,8 +600,8 @@ class FRRDriver(BaseDriver):
     def get_arp_table(self, conn) -> list[dict]:
         arp_entries: list[dict] = []
         try:
-            raw = conn.send_command("ip -j neigh show")
-            data = json.loads(raw) if isinstance(raw, str) and raw.strip() else []
+            raw = _strip_ansi(conn.send_command("ip -j neigh show"))
+            data = json.loads(raw) if raw else []
             if not isinstance(data, list):
                 logger.warning("[%s] Linux ip -j neigh show returned %s", self.ip, type(data).__name__)
                 return arp_entries
