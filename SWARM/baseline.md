@@ -21,7 +21,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
     - `tests/test_topology_renderer.py`
   - Untracked (1 file):
     - `tests/conftest.py` (adds autouse `_hermetic_offline_oui_lookup` fixture forcing `NET_DOCU_OFFLINE_OUI=1` and isolated OUI cache paths)
-- **Worktree WIP Note**: Because the shared worktree inherited the parent's uncommitted WIP files on disk, `SWARM/` artifacts are staged and committed explicitly by path on `swarm/integration` so those uncommitted parent WIP edits are **never** silently mixed into swarm commits. Before Phase 3 merges begin, `@coordinator` should confirm whether `swarm/integration` should rebase/reset its unstaged working copy to clean `1f2cdc6` or incorporate the parent WIP.
+- **Worktree WIP Cleanup (Phase 3 Pre-Flight)**: Per `@coordinator` `#24`, our worktree's inherited unstaged WIP was cleaned (`git checkout -- . && git clean -fd`) so `swarm/integration` starts cleanly atop `1f2cdc6` + `SWARM/` commits (`3a359f9`, `8743ac1`), while parent `/home/leifdavisson/projects/net-docu-crawler` remains untouched.
 
 ---
 
@@ -29,16 +29,34 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 
 Command: `ruff check .` (using [Ruff](https://docs.astral.sh/ruff/))
 
-| Metric | Value |
-| :--- | :--- |
-| Exit Code | `0` |
-| Errors / Warnings | `0` (`All checks passed!`) |
+| State | Exit Code | Errors / Warnings |
+| :--- | :---: | :--- |
+| Pre-clean worktree (inherited WIP) | `0` | `0` (`All checks passed!`) |
+| Clean `swarm/integration` (`1f2cdc6` + `SWARM/`) | `0` | `0` (`All checks passed!`) |
 
 ---
 
 ## 3. Unit Test Baseline (`pytest`)
 
 Command: `pytest -v` (using [pytest](https://docs.pytest.org/) `9.0.3` on Python `3.14.8`, Linux)
+
+### 3.1 Clean `swarm/integration` Baseline (`1f2cdc6` + `SWARM/`, Post-Cleanup)
+
+| Metric | Count |
+| :--- | :---: |
+| Collected | `242` |
+| Passed | `230` |
+| Failed | `3` *(pre-existing offline missing-OUI failures on clean `1f2cdc6`)* |
+| Skipped | `9` |
+| Duration | `13.24s` |
+| Exit Code | `1` |
+
+**Pre-existing clean-`1f2cdc6` offline OUI failures** (pass only when untracked `oui.txt`/live `api.macvendors.com` or parent WIP `COMMON_OUIS` is present; resolved by Wave 1 `swarm/discovery/oui-and-mac-guards`):
+1. `tests/test_drivers.py::test_juniper_neighbors_port_priority_and_text_classification` — OUI `60:D0:2C` (`Ruckus Wireless`) absent from `1f2cdc6` `COMMON_OUIS`.
+2. `tests/test_drivers.py::test_wan_gateway_synthesis_and_reciprocal_port_resolution` — OUI `44:AA:50` (`Juniper Networks`) absent from `1f2cdc6` `COMMON_OUIS`.
+3. `tests/test_reports.py::test_l2_and_l3_norris_multi_site_link_types_conflicts_and_wireless_overlay` — OUIs `60:D0:2C` & `10:F0:68` (`Ruckus Wireless`) absent from `1f2cdc6` `COMMON_OUIS`.
+
+### 3.2 Initial Inherited-WIP Worktree Snapshot (Pre-Cleanup Reference)
 
 | Metric | Count |
 | :--- | :--- |
