@@ -510,20 +510,23 @@ def generate_asset_inventory(devices, output_path="asset_inventory.csv", infra_o
                         dev_type = "Unknown"
 
                 writer.writerow(
-                    {
-                        "Hostname": dev.get("hostname") or "Unknown",
-                        "IP Address": ip,
-                        "MAC Address": dev.get("mac_address") or "Unknown",
-                        "Device Type": dev_type,
-                        "Model": dev.get("model") or "Unknown",
-                        "Firmware": dev.get("firmware") or "Unknown",
-                        "Serial Number": dev.get("serial") or "Unknown",
-                        "Role": role,
-                        "Management Method": dev.get("mgmt_method") or "SSH",
-                    }
+                    _sanitize_csv_row(
+                        {
+                            "Hostname": dev.get("hostname") or "Unknown",
+                            "IP Address": ip,
+                            "MAC Address": dev.get("mac_address") or "Unknown",
+                            "Device Type": dev_type,
+                            "Model": dev.get("model") or "Unknown",
+                            "Firmware": dev.get("firmware") or "Unknown",
+                            "Serial Number": dev.get("serial") or "Unknown",
+                            "Role": role,
+                            "Management Method": dev.get("mgmt_method") or "SSH",
+                        }
+                    )
                 )
         print(f"Asset inventory successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating asset inventory CSV at %s: %s", output_path, e, exc_info=True)
         print(f"Error generating asset inventory CSV: {e}")
 
 
@@ -549,18 +552,84 @@ def _is_non_infra_neighbor(remote_host: str, nbr: dict) -> bool:
     return classify_neighbor_node(remote_host, nbr) == "endpoint"
 
 
-def _mermaid_safe_text(val: str) -> str:
-    """Sanitize arbitrary text for Mermaid 11 labels (never emit ``\\"`` or unsupported HTML tags)."""
-    cleaned = str(val or "").replace('"', "'").replace("\r", " ").replace("\n", " ")
-    # Temporarily preserve <br/> / <br> breaks while neutralizing stray angle brackets
+_CSV_NUMERIC_RE = re.compile(r"^-\d+(?:\.\d+)?$")
+_MERMAID_RESERVED_SLUGS = frozenset(
+    {
+        "end",
+        "subgraph",
+        "class",
+        "click",
+        "style",
+        "classdef",
+        "linkstyle",
+        "default",
+        "graph",
+        "flowchart",
+        "direction",
+    }
+)
+
+
+def _sanitize_csv_cell(val: object) -> object:
+    """
+    Collapse embedded newlines/carriage returns and neutralize spreadsheet formula injection
+    (CWE-1236) on untrusted string cells while preserving numeric types and plain negative numbers.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, (int, float, bool)):
+        return val
+    text = re.sub(r"[\r\n]+", " ", str(val))
+    stripped = text.lstrip(" ")
+    if stripped and stripped[0] in ("=", "+", "@", "\t"):
+        return "'" + text
+    if stripped.startswith("-") and stripped != "-" and not _CSV_NUMERIC_RE.match(stripped):
+        return "'" + text
+    return text
+
+
+def _sanitize_csv_row(row: dict) -> dict:
+    """Return a copy of `row` with every cell sanitized for single-line, formula-safe CSV export."""
+    return {k: _sanitize_csv_cell(v) for k, v in row.items()}
+
+
+def _escape_md_cell(val: object) -> str:
+    """Escape pipe delimiters and collapse line breaks for safe GitHub-Flavored Markdown table cells."""
+    text = re.sub(r"[\r\n]+", " ", str(val if val is not None else ""))
+    return text.replace("|", "\\|").strip()
+
+
+def _mermaid_safe_text(val: str, *, escape_brackets: bool = True) -> str:
+    """
+    Sanitize arbitrary device/config text for Mermaid 11 labels.
+    Neutralizes quotes, trailing/embedded backslashes, pipes, semicolons, hashes,
+    backticks, mid-line `%%` comments, stray HTML tags, and (by default) bracket/brace delimiters.
+    """
+    cleaned = str(val or "").replace("\r", " ").replace("\n", " ")
+    # Temporarily preserve explicit <br/> / <br> breaks while neutralizing stray angle brackets
     token = "__BR_TAG__"
     cleaned = re.sub(r"<br\s*/?>", token, cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("<", "(").replace(">", ")")
+    cleaned = (
+        cleaned.replace("\\", "/")
+        .replace('"', "'")
+        .replace("`", "'")
+        .replace("|", "/")
+        .replace(";", ",")
+        .replace("#", "No.")
+        .replace("%%", "% %")
+        .replace("<", "(")
+        .replace(">", ")")
+    )
+    if escape_brackets:
+        cleaned = cleaned.replace("[", "(").replace("]", ")").replace("{", "(").replace("}", ")")
     return cleaned.replace(token, "<br/>").strip()
 
 
 def _mermaid_slug(val: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", str(val or "").lower()).strip("_") or "node"
+    slug = re.sub(r"[^a-z0-9]+", "_", str(val or "").lower()).strip("_") or "node"
+    if slug in _MERMAID_RESERVED_SLUGS or slug[0].isdigit():
+        slug = f"n_{slug}"
+    return slug
 
 
 def _mermaid_l2_classdefs() -> list[str]:
@@ -621,18 +690,20 @@ def _format_l2_edge_mermaid(src_mid: str, dst_mid: str, edge: dict, link_idx: in
     is_blk = bool(edge.get("is_blocked"))
     speed_mbps = int(edge.get("speed_mbps") or 1000)
     thickness = _speed_thickness(speed_mbps)
-    raw_pairs = [re.sub(r"^\s*↔\s*", "", str(p)).strip() for p in (edge.get("port_pairs") or []) if p]
+    raw_pairs = [
+        _mermaid_safe_text(re.sub(r"^\s*↔\s*", "", str(p)).strip()) for p in (edge.get("port_pairs") or []) if p
+    ]
     ports = ", ".join(raw_pairs)
     if not ports:
         if edge.get("transit_cidr"):
-            ports = str(edge["transit_cidr"])
+            ports = _mermaid_safe_text(str(edge["transit_cidr"]))
         elif edge.get("transit_vlan"):
-            ports = f"VLAN {edge['transit_vlan']}"
+            ports = f"VLAN {_mermaid_safe_text(str(edge['transit_vlan']))}"
         else:
-            ports = str(edge.get("speed_label") or "")
+            ports = _mermaid_safe_text(str(edge.get("speed_label") or ""))
 
-    badge = str(edge.get("display_badge") or "").strip()
-    mm = str(edge.get("mask_mismatch") or "").strip()
+    badge = _mermaid_safe_text(str(edge.get("display_badge") or "").strip())
+    mm = _mermaid_safe_text(str(edge.get("mask_mismatch") or "").strip())
 
     if is_blk:
         arrow = "-.->"
@@ -664,7 +735,7 @@ def _format_l2_edge_mermaid(src_mid: str, dst_mid: str, edge: dict, link_idx: in
         style = f"  linkStyle {link_idx} stroke:#333,stroke-width:{thickness};"
         label = f"{ports} [{badge}]".strip() if badge else ports
 
-    safe_lbl = _mermaid_safe_text(label or badge or tt)
+    safe_lbl = _mermaid_safe_text(label or badge or tt, escape_brackets=False)
     return f'  {src_mid} {arrow}|"{safe_lbl}"| {dst_mid}', style
 
 
@@ -729,7 +800,7 @@ def _compact_mermaid_block_if_oversized(mermaid_lines: list[str], max_chars: int
     filtered: list[str] = []
     omitted_ext = 0
     for ln in mermaid_lines:
-        if re.match(r"^\s+ext_[a-z0-9_]+\[", ln):
+        if re.match(r"^\s+ext_[a-z0-9_]+(?:\[|\(\[)", ln):
             omitted_ext += 1
             continue
         if re.match(r"^\s+class\s+ext_[a-z0-9_]+\s+", ln):
@@ -1273,7 +1344,8 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
                 note_parts.append("No LLDP/CDP neighbors learned")
         notes_str = "; ".join(note_parts) if note_parts else "Direct LLDP/CDP visibility"
         lines.append(
-            f"| **{hostname}** | `{ip}` | `{persona}` | {stp_scope} | `{lldp_st}` | `{cdp_st}` | {len(nbrs)} | {notes_str} |"
+            f"| **{_escape_md_cell(hostname)}** | `{_escape_md_cell(ip)}` | `{_escape_md_cell(persona)}` | "
+            f"{_escape_md_cell(stp_scope)} | `{_escape_md_cell(lldp_st)}` | `{_escape_md_cell(cdp_st)}` | {len(nbrs)} | {_escape_md_cell(notes_str)} |"
         )
 
     try:
@@ -1281,11 +1353,13 @@ def generate_l2_diagram(devices, output_path="L2_network_diagrams.md"):
         for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
             errs = validate_mermaid_block(m_blk)
             if errs:
+                logger.warning("Mermaid syntax warning in %s: %s", output_path, "; ".join(errs))
                 print(f"[!] Mermaid syntax warning in {output_path}: {errs[0]}")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(full_md)
         print(f"L2 Diagrams successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating L2 diagram file %s: %s", output_path, e, exc_info=True)
         print(f"Error generating L2 diagram file: {e}")
 
 
@@ -1333,24 +1407,26 @@ def _format_l3_link_mermaid(src_mid: str, dst_mid: str, lk: dict, link_idx: int)
         style = f"  linkStyle {link_idx} stroke:#6366f1,stroke-width:2.5px,stroke-dasharray: 2 4;"
 
     badge_parts = [
-        f"{t_badge} VLAN {vid}" if (vid and tt in ("metro_ethernet", "wan_carrier", "direct_l2_uplink")) else t_badge
+        f"{t_badge} VLAN {_mermaid_safe_text(vid)}"
+        if (vid and tt in ("metro_ethernet", "wan_carrier", "direct_l2_uplink"))
+        else t_badge
     ]
     if mm:
-        badge_parts.append(f"MASK MISMATCH {mm_detail}".strip())
+        badge_parts.append(f"MASK MISMATCH {_mermaid_safe_text(mm_detail)}".strip())
     if tt == "l3_egress" and "0.0.0.0/0" in rpfxs:
         badge_txt = f"{t_badge} 0.0.0.0/0"
     else:
         badge_txt = " / ".join(badge_parts)
 
     pfx_note = ""
-    non_def = [p for p in rpfxs if p != "0.0.0.0/0"]
+    non_def = [_mermaid_safe_text(p) for p in rpfxs if p != "0.0.0.0/0"]
     if len(non_def) > 3:
         pfx_note = f"<br/>+{len(non_def)} routed prefixes"
     elif non_def:
         pfx_note = f"<br/>{', '.join(non_def)}"
 
-    hdr = f"{cidr} " if cidr else ""
-    safe_lbl = _mermaid_safe_text(f"{hdr}[{badge_txt}]{pfx_note}".strip())
+    hdr = f"{_mermaid_safe_text(cidr)} " if cidr else ""
+    safe_lbl = _mermaid_safe_text(f"{hdr}[{badge_txt}]{pfx_note}".strip(), escape_brackets=False)
     return f'  {src_mid} {arrow}|"{safe_lbl}"| {dst_mid}', style
 
 
@@ -1473,8 +1549,8 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
             used_l3_ids.add(cid)
             cidr_lbl = _mermaid_safe_text(conf.get("cidr") or "")
             title_lbl = "Duplicate Gateway IP" if ctype == "duplicate_gateway_ip" else "Overlapping Site Subnet"
-            dup_ip = f" ({conf['duplicate_ip']})" if conf.get("duplicate_ip") else ""
-            m1.append(f'  {cid}(["CONFLICT: {title_lbl}<br/>{cidr_lbl}{_mermaid_safe_text(dup_ip)}"])')
+            dup_ip = f" ({_mermaid_safe_text(conf['duplicate_ip'])})" if conf.get("duplicate_ip") else ""
+            m1.append(f'  {cid}(["CONFLICT: {title_lbl}<br/>{cidr_lbl}{dup_ip}"])')
             cls_lines.append(f"  class {cid} conflict;")
             hub_tgt = _mermaid_safe_text(conf.get("active_hub_route_target") or "")
             edge_lbl = f"CONFLICT - Hub routes to {hub_tgt}" if hub_tgt else "CONFLICT - Overlapping Subnet"
@@ -1696,7 +1772,10 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
                     vdesc = sub.get("vlan_description") or ""
                     meta_p = f"VLAN {vid}: {vname}".strip(": ") if (vid or vname) else ""
                     desc_p = f" — {vdesc}" if vdesc else ""
-                    lbl = _mermaid_safe_text(f"{sub.get('cidr', '')}<br/>{meta_p}{desc_p}".strip("<br/>"))
+                    cidr_p = str(sub.get("cidr") or "").strip()
+                    detail_p = f"{meta_p}{desc_p}".strip()
+                    raw_sub_lbl = f"{cidr_p}<br/>{detail_p}" if (cidr_p and detail_p) else (cidr_p or detail_p)
+                    lbl = _mermaid_safe_text(raw_sub_lbl)
                     s_m.append(f'  {sid}(["{lbl}"])')
                     s_cls.append(f"  class {sid} subnet;")
                     s_edges_lines.append(f"  {primary_site_mid} --- {sid}")
@@ -1998,11 +2077,13 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
         for m_blk in re.findall(r"```mermaid\n(.*?)```", full_md, re.DOTALL):
             errs = validate_mermaid_block(m_blk)
             if errs:
+                logger.warning("Mermaid syntax warning in %s: %s", output_path, "; ".join(errs))
                 print(f"[!] Mermaid syntax warning in {output_path}: {errs[0]}")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(full_md)
         print(f"L3 Diagrams successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating L3 diagram file %s: %s", output_path, e, exc_info=True)
         print(f"Error generating L3 diagram file: {e}")
 
 
@@ -2697,6 +2778,11 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
             writer.writeheader()
 
             for ip, dev in devices.items():
+                if not _is_network_infra(dev) or str(dev.get("record_class") or "").strip().lower() not in (
+                    "",
+                    "crawled_infra",
+                ):
+                    continue
                 hostname = dev.get("hostname") or ip
                 ints_detail = dev.get("interfaces_detail", {})
                 port_profiles = dev.get("port_profiles", {}) or {}
@@ -2774,35 +2860,38 @@ def generate_cabling_matrix(devices, output_path="migration_cabling_matrix.csv")
                         neigh_plat = neighbor.get("platform") or neighbor.get("remote_platform", "")
 
                     writer.writerow(
-                        {
-                            "Source Hostname": hostname,
-                            "Source Port": name,
-                            "Description": desc,
-                            "Status": status,
-                            "Admin Status": admin_status,
-                            "Mode": mode,
-                            "VLAN": vlan,
-                            "Access VLAN": access_vlan,
-                            "Voice VLAN": voice_vlan,
-                            "Native VLAN": native_vlan,
-                            "Allowed VLANs": allowed_vlans,
-                            "LAG Group": lag_group,
-                            "LACP Mode": lacp_mode,
-                            "Speed": speed,
-                            "Duplex": duplex,
-                            "PoE Draw (W)": poe_draw,
-                            "Edge MAC Count": edge_macs,
-                            "Hygiene Disposition": hygiene,
-                            "Neighbor Hostname": neigh_host,
-                            "Neighbor Port": neigh_port,
-                            "Neighbor Platform": neigh_plat,
-                            "Target Hostname (Placeholder)": "",
-                            "Target Port (Placeholder)": "",
-                            "Target Patch Panel (Placeholder)": "",
-                        }
+                        _sanitize_csv_row(
+                            {
+                                "Source Hostname": hostname,
+                                "Source Port": name,
+                                "Description": desc,
+                                "Status": status,
+                                "Admin Status": admin_status,
+                                "Mode": mode,
+                                "VLAN": vlan,
+                                "Access VLAN": access_vlan,
+                                "Voice VLAN": voice_vlan,
+                                "Native VLAN": native_vlan,
+                                "Allowed VLANs": allowed_vlans,
+                                "LAG Group": lag_group,
+                                "LACP Mode": lacp_mode,
+                                "Speed": speed,
+                                "Duplex": duplex,
+                                "PoE Draw (W)": poe_draw,
+                                "Edge MAC Count": edge_macs,
+                                "Hygiene Disposition": hygiene,
+                                "Neighbor Hostname": neigh_host,
+                                "Neighbor Port": neigh_port,
+                                "Neighbor Platform": neigh_plat,
+                                "Target Hostname (Placeholder)": "",
+                                "Target Port (Placeholder)": "",
+                                "Target Patch Panel (Placeholder)": "",
+                            }
+                        )
                     )
         print(f"Cabling patching matrix successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating cabling matrix CSV at %s: %s", output_path, e, exc_info=True)
         print(f"Error generating cabling matrix CSV: {e}")
 
 
@@ -3000,9 +3089,10 @@ def generate_port_endpoint_mapping(devices, output_path="port_mac_endpoint_mappi
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for r in rows:
-                writer.writerow(r)
+                writer.writerow(_sanitize_csv_row(r))
         print(f"Port-to-MAC endpoint mapping successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating port-to-endpoint CSV at %s: %s", output_path, e, exc_info=True)
         print(f"Error generating port-to-endpoint CSV: {e}")
 
 
@@ -5392,8 +5482,25 @@ def generate_cutover_validation_script(
         'echo -e "\\n${BOLD}[*] Phase 1: Verifying Layer 3 Gateway & SVI Reachability...${NC}"',
     ]
 
+    _safe_target_re = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+    def _is_safe_target_addr(val: object) -> bool:
+        s = str(val or "").strip()
+        return bool(s) and bool(_safe_target_re.match(s))
+
+    def _escape_bash_dq(val: object) -> str:
+        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).strip()
+        s = s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`").replace("!", "\\!")
+        return s
+
+    def _escape_ps_dq(val: object) -> str:
+        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).strip()
+        s = s.replace("`", "``").replace('"', '`"').replace("$", "`$")
+        return s
+
     for gw in sorted(gateways):
-        lines.append(f'check_ping "{gw}" "Gateway / SVI"')
+        if _is_safe_target_addr(gw):
+            lines.append(f'check_ping "{gw}" "Gateway / SVI"')
 
     lines.extend(
         [
@@ -5402,8 +5509,9 @@ def generate_cutover_validation_script(
         ]
     )
     for dns in sorted(dns_servers):
-        lines.append(f'check_ping "{dns}" "DNS Resolver"')
-        lines.append(f'check_port "{dns}" 53 "DNS Port 53"')
+        if _is_safe_target_addr(dns):
+            lines.append(f'check_ping "{dns}" "DNS Resolver"')
+            lines.append(f'check_port "{dns}" 53 "DNS Port 53"')
 
     lines.extend(
         [
@@ -5412,12 +5520,16 @@ def generate_cutover_validation_script(
         ]
     )
     for dev in devices.values():
-        if not _is_network_infra(dev):
+        if not _is_network_infra(dev) or str(dev.get("record_class") or "").strip().lower() not in (
+            "",
+            "crawled_infra",
+        ):
             continue
         dev_ip = dev.get("ip")
         dev_host = dev.get("hostname") or dev_ip
-        if dev_ip:
-            lines.append(f'check_port "{dev_ip}" 22 "{dev_host} SSH"')
+        if _is_safe_target_addr(dev_ip):
+            safe_host_sh = _escape_bash_dq(dev_host)
+            lines.append(f'check_port "{dev_ip}" 22 "{safe_host_sh} SSH"')
 
     lines.extend(
         [
@@ -5494,7 +5606,8 @@ def generate_cutover_validation_script(
             'Write-Host "`n[*] Phase 1: Verifying Layer 3 Gateway & SVI Reachability..." -ForegroundColor Cyan',
         ]
         for gw in sorted(gateways):
-            ps1_lines.append(f'Test-PingReachability -ip "{gw}" -label "Gateway / SVI"')
+            if _is_safe_target_addr(gw):
+                ps1_lines.append(f'Test-PingReachability -ip "{gw}" -label "Gateway / SVI"')
 
         ps1_lines.extend(
             [
@@ -5503,8 +5616,9 @@ def generate_cutover_validation_script(
             ]
         )
         for dns in sorted(dns_servers):
-            ps1_lines.append(f'Test-PingReachability -ip "{dns}" -label "DNS Resolver"')
-            ps1_lines.append(f'Test-TcpPort -ip "{dns}" -port 53 -label "DNS Port 53"')
+            if _is_safe_target_addr(dns):
+                ps1_lines.append(f'Test-PingReachability -ip "{dns}" -label "DNS Resolver"')
+                ps1_lines.append(f'Test-TcpPort -ip "{dns}" -port 53 -label "DNS Port 53"')
 
         ps1_lines.extend(
             [
@@ -5513,10 +5627,16 @@ def generate_cutover_validation_script(
             ]
         )
         for dev in devices.values():
+            if not _is_network_infra(dev) or str(dev.get("record_class") or "").strip().lower() not in (
+                "",
+                "crawled_infra",
+            ):
+                continue
             dev_ip = dev.get("ip")
             dev_host = dev.get("hostname") or dev_ip
-            if dev_ip:
-                ps1_lines.append(f'Test-TcpPort -ip "{dev_ip}" -port 22 -label "{dev_host} SSH"')
+            if _is_safe_target_addr(dev_ip):
+                safe_host_ps = _escape_ps_dq(dev_host)
+                ps1_lines.append(f'Test-TcpPort -ip "{dev_ip}" -port 22 -label "{safe_host_ps} SSH"')
 
         ps1_lines.extend(
             [
@@ -5642,24 +5762,27 @@ def generate_bom_hardware_sizing(devices, output_path="bom_hardware_sizing.csv",
                 opt_str = "; ".join(f"{k}:{v}" for k, v in sorted(opt_counts.items())) or "None"
                 rec_sku = _recommend_replacement_sku(dev, total_ports, tot_w, target_vendor=target_vendor)
                 writer.writerow(
-                    {
-                        "Hostname": dev.get("hostname") or ip,
-                        "IP Address": ip,
-                        "Vendor": dev.get("vendor") or "Unknown",
-                        "Model": dev.get("model") or "Unknown",
-                        "Device Type": dev.get("device_type") or "unknown",
-                        "Total Ports": total_ports,
-                        "Active Ports": active_ports,
-                        "PoE Budget (W)": f"{tot_w:.1f}",
-                        "PoE Used (W)": f"{used_w:.1f}",
-                        "PoE Active Ports": poe_ports,
-                        "Optics Count": len(optics),
-                        "Optics Breakdown": opt_str,
-                        "Recommended SKU": rec_sku,
-                    }
+                    _sanitize_csv_row(
+                        {
+                            "Hostname": dev.get("hostname") or ip,
+                            "IP Address": ip,
+                            "Vendor": dev.get("vendor") or "Unknown",
+                            "Model": dev.get("model") or "Unknown",
+                            "Device Type": dev.get("device_type") or "unknown",
+                            "Total Ports": total_ports,
+                            "Active Ports": active_ports,
+                            "PoE Budget (W)": f"{tot_w:.1f}",
+                            "PoE Used (W)": f"{used_w:.1f}",
+                            "PoE Active Ports": poe_ports,
+                            "Optics Count": len(optics),
+                            "Optics Breakdown": opt_str,
+                            "Recommended SKU": rec_sku,
+                        }
+                    )
                 )
         print(f"BOM & hardware sizing CSV successfully written to {output_path}")
     except Exception as e:
+        logger.error("Error generating BOM hardware sizing CSV at %s: %s", output_path, e, exc_info=True)
         print(f"Error generating BOM hardware sizing CSV: {e}")
 
 
@@ -5797,7 +5920,7 @@ def _export_failures_csv(raw_devices: list[dict], manifest_dir: str) -> None:
     with open(os.path.join(manifest_dir, "failures.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fail_fields)
         w.writeheader()
-        w.writerows(fail_rows)
+        w.writerows(_sanitize_csv_row(r) for r in fail_rows)
 
 
 def _export_interfaces_csv(infra: list[dict], norm_dir: str, corr_dir: str) -> None:
@@ -5831,6 +5954,12 @@ def _export_interfaces_csv(infra: list[dict], norm_dir: str, corr_dir: str) -> N
     unused_rows = []
     for d in infra:
         for p_rec in (d.get("ports") or {}).values():
+            raw_allowed = p_rec.get("allowed_vlans") or []
+            allowed_str = (
+                ",".join(str(v).strip() for v in raw_allowed if str(v).strip())
+                if isinstance(raw_allowed, (list, tuple, set))
+                else str(raw_allowed).strip()
+            )
             row = {
                 "hostname": p_rec.get("hostname", ""),
                 "interface": p_rec.get("interface", ""),
@@ -5840,7 +5969,7 @@ def _export_interfaces_csv(infra: list[dict], norm_dir: str, corr_dir: str) -> N
                 "access_vlan": p_rec.get("access_vlan", ""),
                 "voice_vlan": p_rec.get("voice_vlan", ""),
                 "native_vlan": p_rec.get("native_vlan", ""),
-                "allowed_vlans": ",".join(p_rec.get("allowed_vlans") or []),
+                "allowed_vlans": allowed_str,
                 "lag_id": p_rec.get("lag_id", ""),
                 "lacp_mode": p_rec.get("lacp_mode", ""),
                 "speed": p_rec.get("speed_operational", ""),
@@ -5856,9 +5985,10 @@ def _export_interfaces_csv(infra: list[dict], norm_dir: str, corr_dir: str) -> N
                 "hygiene_disposition": p_rec.get("hygiene_disposition", ""),
                 "hygiene_reason": p_rec.get("hygiene_reason", ""),
             }
-            iface_rows.append(row)
+            sanitized = _sanitize_csv_row(row)
+            iface_rows.append(sanitized)
             if row["hygiene_disposition"] in ("SHUTDOWN", "QUARANTINE", "REVIEW"):
-                unused_rows.append(row)
+                unused_rows.append(sanitized)
 
     with open(os.path.join(norm_dir, "interfaces.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=iface_fields)
@@ -5875,14 +6005,16 @@ def _export_vlans_and_svi_csvs(infra: list[dict], norm_dir: str) -> list[dict]:
     from net_docu_crawler.correlator import build_l3_svi_table
 
     vlan_rows = [
-        {
-            "hostname": d.get("hostname") or d.get("ip", ""),
-            "site_code": d.get("site_code", ""),
-            "vlan_id": vid,
-            "vlan_name": vinfo.get("name", ""),
-            "svi_interface": vinfo.get("svi_interface", ""),
-            "voice": vinfo.get("voice", False),
-        }
+        _sanitize_csv_row(
+            {
+                "hostname": d.get("hostname") or d.get("ip", ""),
+                "site_code": d.get("site_code", ""),
+                "vlan_id": vid,
+                "vlan_name": vinfo.get("name", ""),
+                "svi_interface": vinfo.get("svi_interface", ""),
+                "voice": vinfo.get("voice", False),
+            }
+        )
         for d in infra
         for vid, vinfo in (d.get("vlans") or {}).items()
     ]
@@ -5910,8 +6042,13 @@ def _export_vlans_and_svi_csvs(infra: list[dict], norm_dir: str) -> list[dict]:
         for sr in svi_rows:
             row = dict(sr)
             row.setdefault("vlan_description", "")
-            row["dhcp_relays"] = ",".join(sr.get("dhcp_relays") or [])
-            w.writerow(row)
+            raw_relays = sr.get("dhcp_relays") or []
+            row["dhcp_relays"] = (
+                ",".join(str(r).strip() for r in raw_relays if str(r).strip())
+                if isinstance(raw_relays, (list, tuple, set))
+                else str(raw_relays).strip()
+            )
+            w.writerow(_sanitize_csv_row(row))
     return svi_rows
 
 
@@ -5934,17 +6071,19 @@ def _export_poe_csv(infra: list[dict], norm_dir: str) -> None:
         for d in infra:
             poe = d.get("poe") or {}
             w.writerow(
-                {
-                    "hostname": d.get("hostname") or d.get("ip", ""),
-                    "ip": d.get("ip", ""),
-                    "poe_supported": poe.get("poe_supported", False),
-                    "total_power_watts": poe.get("total_power_watts", 0.0),
-                    "used_power_watts": poe.get("used_power_watts", 0.0),
-                    "allocated_power_watts": poe.get("allocated_power_watts", 0.0),
-                    "poe_capable_ports": poe.get("poe_capable_ports", 0),
-                    "poe_delivering_ports": poe.get("poe_delivering_ports", 0),
-                    "psu_redundancy": poe.get("psu_redundancy", "unknown"),
-                }
+                _sanitize_csv_row(
+                    {
+                        "hostname": d.get("hostname") or d.get("ip", ""),
+                        "ip": d.get("ip", ""),
+                        "poe_supported": poe.get("poe_supported", False),
+                        "total_power_watts": poe.get("total_power_watts", 0.0),
+                        "used_power_watts": poe.get("used_power_watts", 0.0),
+                        "allocated_power_watts": poe.get("allocated_power_watts", 0.0),
+                        "poe_capable_ports": poe.get("poe_capable_ports", 0),
+                        "poe_delivering_ports": poe.get("poe_delivering_ports", 0),
+                        "psu_redundancy": poe.get("psu_redundancy", "unknown"),
+                    }
+                )
             )
 
 
@@ -5972,19 +6111,21 @@ def _export_neighbors_csv(infra: list[dict], norm_dir: str) -> None:
             ct = d.get("capture_time", "")
             for nbr in d.get("neighbors") or []:
                 w.writerow(
-                    {
-                        "source_device": host,
-                        "site_code": sc,
-                        "local_port": nbr.get("local_port", ""),
-                        "remote_device": nbr.get("remote_device", ""),
-                        "remote_port": nbr.get("remote_port", ""),
-                        "remote_ip": nbr.get("remote_ip", ""),
-                        "remote_mac": nbr.get("remote_mac", ""),
-                        "platform": nbr.get("platform", ""),
-                        "device_type": nbr.get("device_type", ""),
-                        "link_confidence": nbr.get("link_confidence", ""),
-                        "capture_time": ct,
-                    }
+                    _sanitize_csv_row(
+                        {
+                            "source_device": host,
+                            "site_code": sc,
+                            "local_port": nbr.get("local_port", ""),
+                            "remote_device": nbr.get("remote_device", ""),
+                            "remote_port": nbr.get("remote_port", ""),
+                            "remote_ip": nbr.get("remote_ip", ""),
+                            "remote_mac": nbr.get("remote_mac", ""),
+                            "platform": nbr.get("platform", ""),
+                            "device_type": nbr.get("device_type", ""),
+                            "link_confidence": nbr.get("link_confidence", ""),
+                            "capture_time": ct,
+                        }
+                    )
                 )
 
 
@@ -6031,7 +6172,7 @@ def _export_physical_links_and_endpoints_csvs(registry, corr_dir: str, run_outpu
             row.setdefault("link_class", "infra_uplink")
             row.setdefault("transport_type", "")
             row.setdefault("evidence", "")
-            w.writerow(row)
+            w.writerow(_sanitize_csv_row(row))
 
     ep_src = os.path.join(run_output_dir, "port_mac_endpoint_mapping.csv")
     if os.path.isfile(ep_src):
@@ -6084,17 +6225,19 @@ def _export_vlan_propagation_csv(infra: list[dict], svi_rows: list[dict], corr_d
             sr = svi_by_site_vid.get(key, {})
             tports = sorted(vp["trunk_ports"])
             w.writerow(
-                {
-                    "site_code": vp["site_code"],
-                    "vlan_id": vp["vlan_id"],
-                    "vlan_name": sr.get("vlan_name") or vp["vlan_name"],
-                    "svi_device": sr.get("source_device", ""),
-                    "gateway_ip": sr.get("primary_ip", ""),
-                    "subnet": sr.get("prefix_cidr", ""),
-                    "switch_count": len(vp["switches"]),
-                    "trunk_port_count": len(tports),
-                    "trunk_ports": ";".join(tports[:25]),
-                }
+                _sanitize_csv_row(
+                    {
+                        "site_code": vp["site_code"],
+                        "vlan_id": vp["vlan_id"],
+                        "vlan_name": sr.get("vlan_name") or vp["vlan_name"],
+                        "svi_device": sr.get("source_device", ""),
+                        "gateway_ip": sr.get("primary_ip", ""),
+                        "subnet": sr.get("prefix_cidr", ""),
+                        "switch_count": len(vp["switches"]),
+                        "trunk_port_count": len(tports),
+                        "trunk_ports": ";".join(tports[:25]),
+                    }
+                )
             )
 
 
@@ -6110,7 +6253,7 @@ def _export_trunk_audit_artifacts(
     with open(os.path.join(corr_dir, "trunk_mismatches.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=TRUNK_MISMATCH_CSV_FIELDS)
         w.writeheader()
-        w.writerows(trunk_csv_rows)
+        w.writerows(_sanitize_csv_row(r) for r in trunk_csv_rows)
 
     layered_trunk_md = os.path.join(rep_dir, "trunk_vlan_audit.md")
     if not os.path.isfile(layered_trunk_md):
@@ -6137,7 +6280,11 @@ def export_layered_csvs(
         os.makedirs(d, exist_ok=True)
 
     _export_failures_csv(raw_devices, m_dir)
-    infra = [d for d in raw_devices if d.get("status", "success") == "success"]
+    infra = [
+        d
+        for d in raw_devices
+        if _is_network_infra(d) and str(d.get("record_class") or "").strip().lower() in ("", "crawled_infra")
+    ]
     _export_interfaces_csv(infra, n_dir, c_dir)
     svi_rows = _export_vlans_and_svi_csvs(infra, n_dir)
     _export_poe_csv(infra, n_dir)
