@@ -29,15 +29,15 @@ Every target flows through a 4-tier identification cascade (local ARP OUI with h
 ### Target & Credential Selection
 
 - `--targets IP_OR_CIDR [IP_OR_CIDR ...]`
-  List of seed IPv4 addresses or CIDRs to crawl (e.g. `10.1.0.1`, `172.16.1.0/24`).
+  List of seed IPv4 addresses, `ip:port` endpoints (e.g., `192.168.1.220:2222`), or CIDRs to crawl (e.g., `10.1.0.1`, `172.16.1.0/24`).
 - `--credentials PATH [PATH ...]`
-  One or more credentials JSON files tried in vendor-prioritized order (default: `credentials.json`).
+  One or more credentials JSON files tried in vendor-prioritized order (default: `credentials.json`). Uses canonical `name`/`vendor`/`username`/`password`/`secret` profile fields.
 - `--validate-credentials`
   Validate `--credentials` JSON file(s) and exit without running a crawl.
 - `--try-all-creds`
   Try every credential profile even when a specific vendor is detected (not recommended for lockout-protected appliances).
 - `--vendor-hint VENDOR`
-  Fallback vendor driver hint when OUI/SSH banner is unknown (e.g. `fortinet`, `ciscosmb`, `cisco`, `juniper`, `hpprocurve`).
+  Fallback vendor driver hint when OUI/SSH banner is unknown. Canonical keys: `cisco`, `cisco_xr`, `ciscosmb`, `juniper`, `arista`, `hpprocurve`, `aruba`, `mikrotik`, `fortinet`, `paloalto`, `opnsense`, `openwrt`, `frrouting` (aliases: `iosxr`, `xr`, `cisco_s300`, `cbs`, `sg300`, `sg350`, `procurve`, `hp`, `frr`).
 
 ### Multi-Hop Discovery & Smart Subnet Filtering
 
@@ -80,13 +80,25 @@ Every target flows through a 4-tier identification cascade (local ARP OUI with h
   SNMPv2c community string when `--snmp` is enabled (default: `public`).
 - `--no-online-oui`
   Disable online OUI lookup fallback for unseen MAC prefixes (air-gapped environments).
+- `--netconf`
+  Opt-in read-only NETCONF `<get>` enrichment for supported platforms such as Cisco IOS-XR (requires optional `[xr]` extra: `ncclient`).
+- `--netconf-port PORT`
+  NETCONF SSH port when `--netconf` is enabled (default: `830`).
+- `--gnmi`
+  Opt-in read-only gNMI `Get()` enrichment for supported platforms such as Cisco IOS-XR (requires optional `[xr]` extra: `pygnmi`).
+- `--gnmi-port PORT`
+  gNMI gRPC port when `--gnmi` is enabled (default: `57400`).
+- `--gnmi-insecure`
+  Skip TLS certificate verification for gNMI connections (lab/self-signed certificates only).
+- `--install-deps`
+  Pre-flight wrapper option (when invoked via `python3 net_crawler.py` or `python3 -m net_docu_crawler`) to auto-install missing required Python packages (`netmiko`, `paramiko`, `netaddr`).
 
 ### Output, Sanitization & Migration
 
 - `--output-dir DIR`
   Flat output directory when `--no-organize` is used, or custom base directory when organized (default flat path: `docs/net_docu_crawler`, default organized base: `deliverables/`).
 - `--organize`
-  (Default) Store deliverables under `deliverables/<Target>_<Timestamp>_<domain>/`.
+  (Default) Store deliverables under `deliverables/<Target>_<Timestamp>_<site>/`.
 - `--no-organize`
   Write flat output directly to `--output-dir` without creating a timestamped subfolder.
 - `--site LABEL`, `--domain LABEL`
@@ -94,7 +106,7 @@ Every target flows through a 4-tier identification cascade (local ARP OUI with h
 - `--sanitize-passwords`
   Redact passwords, pre-shared keys, and SNMP communities in saved configurations, logs, and exports.
 - `--target-vendor VENDOR`
-  Generate staged target-vendor migration CLI configs (`cisco`, `juniper`, `arista`, `aruba`, `hpprocurve`, `fortinet`, `meraki`, or `persona=vendor` pairs such as `switch=juniper,ap=aruba`).
+  Generate staged target-vendor migration CLI configs (`cisco`, `juniper`, `arista`, `aruba`, `hpprocurve`, `meraki`, or `persona=vendor` pairs such as `switch=juniper,ap=aruba`).
 
 ### Baseline Verification & Offline Modes
 
@@ -154,9 +166,14 @@ python3 net_crawler.py --reparse-logs deliverables/10.1.0.1_20261114_195759_lan/
 | `net_docu_crawler_dataset.json` | Canonical normalized JSON inventory for all crawled and discovered nodes |
 | `net_docu_crawler_live_report.md` | Layered L1/L2/L3 audit, port utilization, PoE budgets, STP, and CIDR checks |
 | `Network_Analysis.md` | Master architecture, hardware/optics inventory, and migration blueprint |
+| `cutover_runbook.md` | Phased pre-cutover, execution, and rollback runbook |
 | `L2_network_diagrams.md` | Mermaid L2 topology diagrams (confirmed links, STP root, wireless overlay) |
 | `L3_network_diagrams.md` | Mermaid L3 routed/SVI subnet & next-hop diagrams |
-| `asset_inventory.csv` | Device inventory CSV (`Hostname`, `IP`, `MAC`, `Device Type`, `Model`, `Role`) |
+| `topology_interactive.html` | Self-contained interactive HTML topology explorer |
+| `trunk_vlan_audit.md` | Cross-vendor trunk VLAN mismatch audit (`TRK-001`–`TRK-007`) |
+| `manual_followup_report.md` | Actionable checklist for unauthenticated, passive, or incomplete nodes |
+| `cisco_to_target_translation.md` | Cross-vendor protocol and configuration translation reference |
+| `asset_inventory.csv` | Infrastructure device inventory CSV (`Hostname`, `IP Address`, `MAC Address`, `Device Type`, `Model`, `Firmware`, `Serial Number`, `Role`, `Management Method`; excludes unauthenticated/passive endpoints) |
 | `migration_cabling_matrix.csv` | Port-to-port uplink & AP cabling matrix |
 | `port_mac_endpoint_mapping.csv` | Switchport-to-MAC/OUI endpoint mapping |
 | `bom_hardware_sizing.csv` | Hardware replacement & PoE/optics sizing BOM |

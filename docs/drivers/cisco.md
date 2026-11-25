@@ -18,9 +18,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Cisco Systems Driver Specification
 
-* **Driver Class**: [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py)
-* **Supported Platforms**: Cisco Catalyst (IOS/IOS-XE), Nexus (NX-OS), Service Provider (IOS-XR)
-* **Upstream Netmiko Device Types**: `cisco_ios`, `cisco_nxos`, `cisco_xr` ([Netmiko](https://github.com/ktbyers/netmiko))
+* **Driver Class**: [`CiscoDriver`](../../net_docu_crawler/drivers/cisco.py) *(automatically delegates IOS-XR to [`CiscoXRDriver`](../../net_docu_crawler/drivers/cisco_xr.py) — see [`cisco_xr.md`](cisco_xr.md); also delegates Arista EOS to [`AristaDriver`](../../net_docu_crawler/drivers/arista.py))*
+* **Supported Platforms**: Cisco Catalyst (IOS / IOS-XE) and Nexus (NX-OS)
+* **Upstream Netmiko Device Types**: `cisco_ios`, `cisco_nxos` ([Netmiko](https://github.com/ktbyers/netmiko))
 * **Official Documentation**: [Cisco IOS & NX-OS Documentation](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html)
 
 ---
@@ -58,17 +58,22 @@ privilege exec level 1 show inventory
 
 ## 3. Discovered Data Mapping
 
-| Data Element | IOS / IOS-XE Command | NX-OS Command | IOS-XR Command |
-| :--- | :--- | :--- | :--- |
-| **System Info & Serial** | `show version`, `show inventory` | `show version`, `show inventory` | `show version`, `show inventory` |
-| **L3 Interfaces** | `show ip interface brief` | `show ip interface brief` | `show ipv4 interface brief` |
-| **Physical Interface Stats** | `show interfaces` | `show interface` | `show interfaces` |
-| **L2 Trunk & LAG Telemetry** | `show interfaces trunk`<br>`show etherchannel summary` | `show interfaces trunk`<br>`show etherchannel summary` | N/A |
-| **Topology Neighbors** | `show cdp neighbors detail`<br>`show lldp neighbors detail` | `show cdp neighbors detail`<br>`show lldp neighbors detail` | `show cdp neighbors detail`<br>`show lldp neighbors detail` |
-| **Routing Table** | `show ip route` | `show ip route` | `show route` |
-| **ARP Table** | `show ip arp` | `show ip arp` | `show arp` |
-| **MAC Address Table** | `show mac address-table` | `show mac address-table` | `show l2vpn forwarding bridge-domain ...` |
-| **Running Config Backup** | `show running-config` | `show running-config` | `show running-config` |
+| Data Element | IOS / IOS-XE Command | NX-OS Command |
+| :--- | :--- | :--- |
+| **System Info & Serial** | `show version`, `show inventory` | `show version`, `show inventory` |
+| **L3 Interfaces** | `show ip interface brief` | `show ip interface brief` |
+| **Physical Interface Stats** | `show interfaces` | `show interfaces` |
+| **L2 Trunk & LAG Telemetry** | `show interfaces trunk`<br>`show etherchannel summary` | `show interfaces trunk`<br>`show etherchannel summary` |
+| **Spanning Tree (STP)** | `show spanning-tree` | `show spanning-tree` |
+| **Topology Neighbors** | `show cdp neighbors detail`<br>`show lldp neighbors detail` *(fallback: `show lldp neighbors`)* | `show cdp neighbors detail`<br>`show lldp neighbors detail` |
+| **Routing Table** | `show ip route` | `show ip route` |
+| **ARP Table** | `show ip arp` | `show ip arp` |
+| **MAC Address Table** | `show mac address-table` | `show mac address-table` |
+| **PoE & Optics Telemetry** | `show power inline`<br>`show inventory`, `show interfaces transceiver` | `show power inline`<br>`show inventory`, `show interfaces transceiver` |
+| **Running Config Backup** | `show running-config` | `show running-config` |
+
+> [!NOTE]
+> Cisco **IOS-XR** platforms (ASR 9000, NCS, CRS, XRv) are handled by the dedicated [`CiscoXRDriver`](../../net_docu_crawler/drivers/cisco_xr.py). See [`cisco_xr.md`](cisco_xr.md) for the complete IOS-XR command matrix (`show ipv4 interface brief`, `show bundle`, `show vrf all detail`, `show mpls ldp ...`, `show bgp all all summary`, and optional NETCONF/gNMI).
 
 ### Trunk VLAN Mismatch & L2 Intent Extraction
 

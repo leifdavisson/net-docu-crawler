@@ -1,5 +1,6 @@
 <!--
 Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -88,7 +89,7 @@ When adding a new hardware driver to `net_docu_crawler/drivers/`, every driver c
 |    - Exact command to disable interactive prompts (--More--, Page Down, Screen Breaks)  |
 |    - Cisco: terminal length 0      | Juniper: set cli screen-length 0                  |
 |    - Aruba: no page               | Palo Alto: set cli pager off                      |
-|    - Fortinet: config system console / set output standard / end                       |
+|    - Fortinet: Read-only bounded --More-- pager drainer (zero config writes)          |
 +----------------------------------------------------------------------------------------+
 | 3. Zero-Blast Prompt Signatures                                                        |
 |    - Regular expressions matching unprivileged (`>`) and privileged (`#`) prompts      |

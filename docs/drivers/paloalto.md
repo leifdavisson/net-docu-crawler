@@ -1,5 +1,6 @@
 <!--
 Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -19,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 * **Driver Class**: [`PaloAltoDriver`](../../net_docu_crawler/drivers/paloalto.py)
 * **Supported Platforms**: PA-Series Firewalls (PA-220, PA-400, PA-800, PA-3200, PA-5200, VM-Series)
-* **Upstream Netmiko Device Type**: `paloalto_panos`
+* **Upstream Netmiko Device Type**: `paloalto_panos` ([Netmiko](https://github.com/ktbyers/netmiko))
 * **Device Persona**: `firewall`
 * **Official Documentation**: [Palo Alto Networks PAN-OS CLI Reference](https://docs.paloaltonetworks.com/pan-os)
 

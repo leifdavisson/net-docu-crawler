@@ -27,7 +27,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 flowchart LR
     Targets["Target IPs / Routed Subnets<br>(192.168.1.0/24, 172.16.1.0/24)"]
     Cascade["4-Tier Zero-Blast-Radius Cascade<br>1. Offline ARP OUI<br>2. TCP 22 SSH Banner<br>3. Post-Auth Prompt<br>4. Version Probe"]
-    Drivers["12 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
+    Drivers["13 Multi-Vendor Read-Only Drivers<br>(Netmiko CLI + Paramiko Exec)"]
     Registry["DeviceRegistry<br>- SVI and Hypervisor MAC Safe<br>- Global ARP Neighbor Resolution<br>- Bidirectional Link Stitching"]
     Reports["Deliverables (deliverables/)<br>- L2 and L3 Mermaid Topologies<br>- Asset Inventory and Cabling CSVs<br>- Health Audit and Migration Blueprint"]
 
@@ -48,14 +48,15 @@ flowchart LR
 
 | Platform / OS | Driver | Transport | Official Reference |
 | :--- | :--- | :--- | :--- |
-| **Cisco IOS / IOS-XE / NX-OS / IOS-XR** | [`CiscoDriver`](net_docu_crawler/drivers/cisco.py) | [Netmiko](https://github.com/ktbyers/netmiko) (`cisco_ios`) | [Cisco IOS & NX-OS Docs](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html) |
-| **Cisco Small Business (SG300 / SG350 / CBS350)** | [`CiscoSMBDriver`](net_docu_crawler/drivers/ciscosmb.py) | Netmiko (`cisco_s300`) | [Cisco SMB 300 Command Ref](https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html) |
+| **Cisco IOS / IOS-XE / NX-OS** | [`CiscoDriver`](net_docu_crawler/drivers/cisco.py) | [Netmiko](https://github.com/ktbyers/netmiko) (`cisco_ios`) | [Cisco IOS & NX-OS Docs](https://www.cisco.com/c/en/us/support/ios-nx-os-software/index.html) |
+| **Cisco IOS-XR (ASR 9000 / NCS / XRv)** | [`CiscoXRDriver`](net_docu_crawler/drivers/cisco_xr.py) | Netmiko (`cisco_xr`; optional NETCONF/gNMI) | [Cisco IOS-XR Docs](https://www.cisco.com/c/en/us/support/ios-nx-os-software/ios-xr-software/tsd-products-support-series-home.html) |
+| **Cisco Small Business (SG250 / SG300 / SG350 / CBS350)** | [`CiscoSMBDriver`](net_docu_crawler/drivers/ciscosmb.py) | Netmiko (`cisco_s300`) | [Cisco SMB 300 Command Ref](https://www.cisco.com/c/en/us/support/switches/small-business-300-series-managed-switches/products-command-reference-list.html) |
 | **Juniper Junos OS (EX / QFX / SRX / MX)** | [`JuniperDriver`](net_docu_crawler/drivers/juniper.py) | Netmiko (`juniper_junos` JSON) | [Juniper Junos Documentation](https://www.juniper.net/documentation/product/us/en/junos-os/) |
 | **Arista EOS / vEOS** | [`AristaDriver`](net_docu_crawler/drivers/arista.py) | Netmiko (`arista_eos` JSON) | [Arista EOS User Manual](https://www.arista.com/en/um-eos) |
 | **HP ProCurve / ArubaOS-S (Provision)** | [`HPProCurveDriver`](net_docu_crawler/drivers/hpprocurve.py) | Netmiko (`hp_procurve`) | [ArubaOS-S Documentation](https://www.arubanetworks.com/techdocs/AOS-S/16.10/MWG/content/home.htm) |
 | **Aruba Instant / AOS-CX** | [`ArubaDriver`](net_docu_crawler/drivers/aruba.py) | Netmiko (`aruba_os` / AOS-CX) | [HPE Aruba AOS-CX Docs](https://www.arubanetworks.com/techdocs/AOS-CX/help_portal/Content/home.htm) / [Aruba Instant](https://www.arubanetworks.com/techdocs/ArubaDocPortal/content/cons-instant-home.htm) |
 | **MikroTik RouterOS / CHR** | [`MikroTikDriver`](net_docu_crawler/drivers/mikrotik.py) | Netmiko (`mikrotik_routeros`) | [MikroTik RouterOS CLI Docs](https://help.mikrotik.com/docs/spaces/ROS/pages/8519681/Command+Line+Interface) |
-| **Fortinet FortiOS (FortiGate)** | [`FortinetDriver`](net_docu_crawler/drivers/fortinet.py) | Netmiko (`fortinet`) | [FortiOS CLI Reference](https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference) |
+| **Fortinet FortiOS (FortiGate)** | [`FortinetDriver`](net_docu_crawler/drivers/fortinet.py) | Read-only Netmiko (`ReadOnlyFortinetSSH`) | [FortiOS CLI Reference](https://docs.fortinet.com/document/fortigate/hardware/fortios-cli-reference) |
 | **Palo Alto PAN-OS** | [`PaloAltoDriver`](net_docu_crawler/drivers/paloalto.py) | Netmiko (`paloalto_panos`) | [Palo Alto PAN-OS Docs](https://docs.paloaltonetworks.com/pan-os) |
 | **OPNsense (FreeBSD)** | [`OPNsenseDriver`](net_docu_crawler/drivers/opnsense.py) | [Paramiko](https://www.paramiko.org/) (`exec_command`) | [OPNsense Documentation](https://docs.opnsense.org/) |
 | **OpenWrt (`ubus` / `uci`)** | [`OpenWrtDriver`](net_docu_crawler/drivers/openwrt.py) | Netmiko (`linux` + `ubus` JSON) | [OpenWrt Documentation](https://openwrt.org/docs/start) |
@@ -76,12 +77,16 @@ powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1        # assess onl
 powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 -Fix   # assess + fix
 ```
 
-**Linux/macOS:**
+**Linux/macOS (recommended isolated `.venv`):**
 
 ```bash
-pip install -e ".[dev]"
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .          # runtime + `net-crawler` CLI (or `pip install -e ".[dev]"` for pytest/ruff/mypy)
 cp credentials.example.json credentials.json
 ```
+
+*(Runtime-only alternative without the `net-crawler` console script: `pip install -r requirements.txt`. For optional Cisco IOS-XR NETCONF/gNMI extras, run `pip install -e ".[xr]"`.)*
 
 ### 2. Run Discovery & Generate Documentation
 
@@ -111,19 +116,19 @@ python3 net_crawler.py --snmp --snmp-community public --organize
 
 ## Generated Deliverables
 
-When executed (organized into `deliverables/<Target>_<Timestamp>_<domain>/` by default, or flat into `docs/net_docu_crawler/` with `--no-organize`), the crawler automatically builds an engineer-ready deliverable bundle:
+When executed (organized into `deliverables/<Target>_<Timestamp>_<site>/` by default, or flat into `docs/net_docu_crawler/` with `--no-organize`), the crawler automatically builds an engineer-ready deliverable bundle:
 
-1. **`Network_Analysis.md`**: Complete Network Migration Blueprint tailored for network engineers (chassis migration, VLAN mappings, cabling schedules, routing and default gateway requirements, risk matrix).
-2. **`asset_inventory.csv`**: Normalized inventory (Hostname, IP, MAC, Vendor, Persona, Model, Firmware, Serial), including unauthenticated, unsupported, and ARP-discovered hosts.
+1. **`Network_Analysis.md`** & **`cutover_runbook.md`**: Complete Network Migration Blueprint and phased cutover runbook tailored for network engineers (chassis migration, VLAN mappings, cabling schedules, routing and default gateway requirements, risk matrix).
+2. **`asset_inventory.csv`**: Normalized infrastructure inventory (`Hostname`, `IP Address`, `MAC Address`, `Device Type`, `Model`, `Firmware`, `Serial Number`, `Role`, `Management Method`) for successfully authenticated network infrastructure. Unauthenticated, unsupported, and ARP-discovered hosts are tracked separately in `00_manifest/failures.csv` and `failed_hosts.json`.
 3. **`bom_hardware_sizing.csv`**: Hardware sizing & Bill-of-Materials rollup (port counts, PoE wattage budgets/draw, SFP/SFP+/QSFP optics totals; defaults target SKU sizing to Juniper unless `--target-vendor` is set).
 4. **`migration_cabling_matrix.csv`** & **`port_mac_endpoint_mapping.csv`**: Physical port-by-port patching matrix with link speeds, duplex, and LLDP/CDP neighbor mapping, plus switchport-to-MAC/OUI endpoint mapping.
-5. **`L2_network_diagrams.md`**: Interactive Mermaid physical switching diagram + Wireless Access Point overlay table.
+5. **`L2_network_diagrams.md`** & **`topology_interactive.html`**: Interactive Mermaid physical switching diagram, self-contained HTML topology explorer, and Wireless Access Point overlay table.
 6. **`L3_network_diagrams.md`**: Authoritative VLAN, CIDR subnet ([netaddr](https://netaddr.readthedocs.io/)), and SVI routing topology diagram.
-7. **`net_docu_crawler_live_report.md`**: Layered L1–L7 network health analysis (interface utilization, STP root/blocking audit, CIDR conflict check, DNS/NTP/AAA posture, per-port L2 intent, trunk VLAN mismatch summary, routing peers/FHRP, DHCP, and PoE/optics sizing).
+7. **`net_docu_crawler_live_report.md`** & **`manual_followup_report.md`**: Layered L1–L7 network health analysis (interface utilization, STP root/blocking audit, CIDR conflict check, DNS/NTP/AAA posture, per-port L2 intent, trunk VLAN mismatch summary, routing peers/FHRP, DHCP, and PoE/optics sizing) plus actionable manual follow-up checklist.
 8. **`trunk_vlan_audit.md`**, **`03_correlated/trunk_audit.json`**, & **`03_correlated/trunk_mismatches.csv`**: Dedicated cross-vendor Trunk VLAN Mismatch Detection report (`05_reports/trunk_vlan_audit.md` and top-level `trunk_vlan_audit.md`), structured edge audit JSON, and per-discrepancy remediation CSV (`TRK-001`–`TRK-007`, LAG aggregation, QinQ boundaries, and uncrawled/asymmetric neighbor flags).
 9. **`cisco_to_target_translation.md`** *(and `target_migration_<vendor>.md` with `--target-vendor`)*: Cross-vendor configuration translation and staged target CLI.
 10. **`net_docu_crawler_dataset.json`**, **`validate_cutover.sh`**, & **`failed_hosts.json`**: Canonical normalized JSON dataset (for `--from-dataset`), read-only post-cutover smoke test script, and unauthenticated/unsupported host log (for `--retry-failed`).
-11. **Layered Subdirectories (`00_manifest/`, `01_raw/`, `02_normalized/`, `03_correlated/`, `04_migration/`, `05_reports/`) & `logs/`**: Machine-readable CSVs, `00_manifest/data_quality_report.md`, `00_manifest/collection_manifest.json`, `03_correlated/trunk_audit.json`, `03_correlated/trunk_mismatches.csv`, `05_reports/trunk_vlan_audit.md`, and complete operational/raw session logs.
+11. **Layered Subdirectories (`00_manifest/`, `01_raw/`, `02_normalized/`, `03_correlated/`, `04_migration/`, `05_reports/`) & `logs/`**: Machine-readable CSVs, `00_manifest/data_quality_report.md`, `00_manifest/collection_manifest.json`, `00_manifest/failures.csv`, `03_correlated/trunk_audit.json`, `03_correlated/trunk_mismatches.csv`, `05_reports/trunk_vlan_audit.md`, and complete operational/raw session logs.
 
 ---
 
@@ -132,7 +137,7 @@ When executed (organized into `deliverables/<Target>_<Timestamp>_<domain>/` by d
 * **[Junior Operator Playbook (Zero-Knowledge Beginner Guide)](docs/junior_operator_playbook.md)**: Beginner-friendly step-by-step walkthrough for technicians who only know basic IP concepts.
 * **[Agent & Contributor Architecture Guide](AGENTS.md)**: Operational guardrails, zero-blast-radius rules, and code architecture.
 * **[Model & Prompt Routing Strategy](docs/model_prompt_routing_strategy.md)**: [Google Gemini](https://ai.google.dev/gemini-api/docs/models) capability/cost routing matrix, thinking-level policy, quota fallback chains, and swarm task assignment.
-* **[Driver Command Reference](docs/drivers/overview.md)**: Supported read-only CLI command matrices, 3-stage SSH compatibility ladder, and transport notes for all 12 supported network operating systems.
+* **[Driver Command Reference](docs/drivers/overview.md)**: Supported read-only CLI command matrices, 3-stage SSH compatibility ladder, and transport notes for all 13 supported network operating system drivers.
 * **[Manual Page (`net-crawler(1)`)](docs/man/net-crawler.1.md)**: Full CLI reference.
 * **[Virtual Lab & Driver Roadmap](docs/proxmox_lab_and_driver_roadmap.md)**: Architecture and setup for virtualized multi-vendor Proxmox VE testbeds.
 
