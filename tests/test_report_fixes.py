@@ -925,3 +925,252 @@ add action=masquerade chain=srcnat out-interface=ether1
     m_sec = extract_firewall_nat_vpn(mt_sec_cfg, vendor="MikroTik")
     assert len(m_sec["firewall_rules"]) == 1
     assert len(m_sec["nat_rules"]) == 1
+
+
+def test_wave2_report_generator_delegates_to_topology_resolver():
+    """Wave 2: report_generator delegates interface norm, speed, dedupe, and CIDR overlaps to topology_resolver."""
+    from net_docu_crawler.topology_resolver import normalize_interface_key
+
+    assert report_generator.normalize_interface_name("Ethernet1") == normalize_interface_key("Ethernet1") == "eth1"
+    assert report_generator.normalize_interface_name("Et1") == "eth1"
+    assert report_generator.get_link_speed("Hu0/0/0/0", {"Hu0/0/0/0": {"speed": "400G"}}) == "400G"
+    assert report_generator.get_link_speed("et-0/0/0", {}) == "100G"
+
+    # Multi-SVI same hardware MAC with Unknown serial must dedupe into 1 device via topology_resolver.dedupe_devices
+    svi_dup = {
+        "10.0.10.1": {
+            "ip": "10.0.10.1",
+            "hostname": "Switch",
+            "serial": "Unknown",
+            "mac_address": "00:1a:2b:3c:4d:5e",
+            "status": "success",
+        },
+        "10.0.20.1": {
+            "ip": "10.0.20.1",
+            "hostname": "Switch",
+            "serial": "Unknown",
+            "mac_address": "00:1a:2b:3c:4d:5e",
+            "status": "success",
+        },
+    }
+    assert len(report_generator.get_unique_devices(svi_dup)) == 1
+
+
+def test_wave2_bom_and_target_configs_support_parsed_target_vendor_map(tmp_path):
+    """Wave 2 (CD-08 / DD-17): BOM sizing & target migration configs support persona=vendor maps and fortinet/aruba/meraki."""
+    import csv
+
+    devices = {
+        "10.0.0.1": {
+            "ip": "10.0.0.1",
+            "hostname": "SW-ACCESS-1",
+            "status": "success",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "interfaces_detail": {"Gi1/0/1": {"status": "up"}},
+            "poe": {"total_power_watts": 370.0, "used_power_watts": 60.0},
+        },
+        "10.0.0.2": {
+            "ip": "10.0.0.2",
+            "hostname": "FW-EDGE-1",
+            "status": "success",
+            "device_type": "firewall",
+            "device_persona": "firewall",
+            "interfaces_detail": {"port1": {"status": "up"}},
+        },
+        "10.0.0.3": {
+            "ip": "10.0.0.3",
+            "hostname": "AP-FLOOR-1",
+            "status": "success",
+            "device_type": "ap",
+            "device_persona": "ap",
+            "interfaces_detail": {"eth0": {"status": "up"}},
+        },
+    }
+    bom_csv = tmp_path / "bom.csv"
+    report_generator.generate_bom_hardware_sizing(
+        devices,
+        output_path=str(bom_csv),
+        target_vendor="switch=cisco,firewall=fortinet,ap=aruba",
+    )
+    with open(bom_csv, encoding="utf-8") as f:
+        rows = {r["Hostname"]: r for r in csv.DictReader(f)}
+    assert rows["SW-ACCESS-1"]["Recommended SKU"].startswith("C9")
+    assert "FortiGate" in rows["FW-EDGE-1"]["Recommended SKU"]
+    assert "AP-" in rows["AP-FLOOR-1"]["Recommended SKU"]
+
+    for tv in ("fortinet", "aruba", "meraki"):
+        out_cfg = tmp_path / f"target_{tv}.md"
+        report_generator.generate_target_migration_configs(devices, target_vendor=tv, output_path=str(out_cfg))
+        txt = out_cfg.read_text(encoding="utf-8")
+        assert f"# Unsupported target_vendor={tv}" not in txt
+
+
+def test_wave2_cutover_script_rejects_leading_dash_and_escapes_ps_smart_quotes(tmp_path):
+    """Wave 2 (SF-12 #75): Reject leading '-' option flags in targets and escape Unicode smart quotes in PowerShell."""
+    devices = {
+        "192.168.1.1": {
+            "ip": "192.168.1.1",
+            "hostname": "SW-\u201cSmart\u201d-\u201eQuote",
+            "status": "success",
+            "device_type": "switch",
+            "device_persona": "switch",
+            "l3_interfaces": [{"interface": "Vlan1", "ip_address": "192.168.1.1/24"}],
+            "services": {"dns_servers": ["-oProxyCommand=id", "--help", "1.1.1.1"]},
+        },
+        "-badflag": {
+            "ip": "-badflag",
+            "hostname": "FlagHost",
+            "status": "success",
+            "device_type": "switch",
+            "device_persona": "switch",
+        },
+    }
+    sh_path = tmp_path / "validate_cutover.sh"
+    report_generator.generate_cutover_validation_script(devices, str(sh_path))
+    sh_txt = sh_path.read_text(encoding="utf-8")
+    ps_txt = (tmp_path / "validate_cutover.ps1").read_text(encoding="utf-8")
+
+    assert "-oProxyCommand" not in sh_txt
+    assert "--help" not in sh_txt
+    assert "-badflag" not in sh_txt
+    assert "-oProxyCommand" not in ps_txt
+    assert "-badflag" not in ps_txt
+    assert "\u201c" not in ps_txt
+    assert "\u201d" not in ps_txt
+    assert "\u201e" not in ps_txt
+
+
+def test_wave2_base_extract_services_from_config_multivendor():
+    """Wave 2: extract_services_from_config supports OPNsense MVC, Cisco IOS-XE AAA/VRF helper, Junos braces, MikroTik, Aruba."""
+    from net_docu_crawler.drivers.base import extract_services_from_config
+
+    cfg = """
+<opnsense>
+  <OPNsense>
+    <Syslog>
+      <destinations>
+        <destination uuid="111">
+          <enabled>1</enabled>
+          <server>10.0.0.70</server>
+        </destination>
+      </destinations>
+    </Syslog>
+    <DHCRelay>
+      <destinations>
+        <destination uuid="222">
+          <server>10.0.0.69,10.0.0.68</server>
+        </destination>
+      </destinations>
+    </DHCRelay>
+  </OPNsense>
+</opnsense>
+radius server RAD-CORP
+ address ipv4 10.0.0.71 auth-port 1812 acct-port 1813
+!
+tacacs server TAC-CORP
+ address ipv4 10.0.0.72
+!
+interface Vlan10
+ ip helper-address vrf CORP 10.0.0.73
+ ip dhcp relay address 10.0.0.74
+!
+system {
+    name-server {
+        10.0.0.75;
+    }
+    ntp {
+        server 10.0.0.76;
+    }
+    syslog {
+        host 10.0.0.77 {
+            any info;
+        }
+    }
+    radius-server {
+        10.0.0.78 {
+            secret "x";
+        }
+    }
+    tacplus-server {
+        10.0.0.79 {
+            secret "x";
+        }
+    }
+}
+snmp {
+    trap-group TG-1 {
+        targets {
+            10.0.0.80;
+        }
+    }
+}
+/system logging action
+add name=remote remote=10.0.0.81 target=remote
+/radius
+add address=10.0.0.82 service=login
+/snmp
+set enabled=yes trap-target=10.0.0.83
+/ip dhcp-relay
+add dhcp-server=10.0.0.84 interface=ether2 name=rel1
+syslog-server 10.0.0.85
+wlan auth-server CORP-RAD
+ ip 10.0.0.86
+"""
+    serv = extract_services_from_config(cfg)
+    assert "10.0.0.75" in serv["dns_servers"]
+    assert "10.0.0.76" in serv["ntp_servers"]
+    for sys_ip in ("10.0.0.70", "10.0.0.77", "10.0.0.81", "10.0.0.85"):
+        assert sys_ip in serv["syslog_servers"], f"Missing syslog {sys_ip}"
+    for rad_ip in ("10.0.0.71", "10.0.0.78", "10.0.0.82", "10.0.0.86"):
+        assert rad_ip in serv["radius_servers"], f"Missing radius {rad_ip}"
+    for tac_ip in ("10.0.0.72", "10.0.0.79"):
+        assert tac_ip in serv["tacacs_servers"], f"Missing tacacs {tac_ip}"
+    for rel_ip in ("10.0.0.69", "10.0.0.68", "10.0.0.73", "10.0.0.74", "10.0.0.84"):
+        assert rel_ip in serv["dhcp_relays"], f"Missing dhcp relay {rel_ip}"
+    for snmp_ip in ("10.0.0.80", "10.0.0.83"):
+        assert snmp_ip in serv["snmp_servers"], f"Missing snmp {snmp_ip}"
+
+
+def test_wave2_base_sanitize_raw_config_sf05_complete():
+    """Wave 2 (SF-05 #35): sanitize_raw_config scrubs FortiOS auth/priv-pwd, PAN-OS phash, OPNsense rocommunity/apikey, Cisco tacacs/radius/isakmp/ospf/hsrp keys, MikroTik wpa psk."""
+    from net_docu_crawler.drivers.base import sanitize_raw_config
+
+    raw = """
+set auth-pwd ENC SuperSecretAuthPwd111
+set priv-pwd ENC SuperSecretPrivPwd222
+set api-key SuperSecretApiKey333
+<phash>$1$panos$SuperSecretPanosHash444</phash>
+<api-key>PanosApiKey555</api-key>
+<rocommunity>OpnRoComm666</rocommunity>
+<rwcommunity>OpnRwComm777</rwcommunity>
+<apikey>OpnApiKey888</apikey>
+<apisecret>OpnApiSecret999</apisecret>
+tacacs-server key 7 CiscoTacKey101
+radius-server key CiscoRadKey202
+ key-string 7 CiscoKeyString303
+ ip ospf message-digest-key 1 md5 7 CiscoOspfMd5Key404
+ standby 10 authentication md5 key-string 7 CiscoHsrpKey505
+wpa-pre-shared-key="MikrotikWpaKey606"
+wpa2-pre-shared-key=MikrotikWpa2Key707
+"""
+    scrubbed = sanitize_raw_config(raw)
+    for leaked in (
+        "SuperSecretAuthPwd111",
+        "SuperSecretPrivPwd222",
+        "SuperSecretApiKey333",
+        "SuperSecretPanosHash444",
+        "PanosApiKey555",
+        "OpnRoComm666",
+        "OpnRwComm777",
+        "OpnApiKey888",
+        "OpnApiSecret999",
+        "CiscoTacKey101",
+        "CiscoRadKey202",
+        "CiscoKeyString303",
+        "CiscoOspfMd5Key404",
+        "CiscoHsrpKey505",
+        "MikrotikWpaKey606",
+        "MikrotikWpa2Key707",
+    ):
+        assert leaked not in scrubbed, f"Secret {leaked!r} survived sanitize_raw_config()"

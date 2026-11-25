@@ -154,15 +154,74 @@ def extract_services_from_config(raw_config: str) -> dict:
     if not raw_config:
         return services
 
-    # XML style (OPNsense / pfSense / PAN-OS)
+    # XML style (OPNsense / pfSense / PAN-OS legacy & MVC)
     for m_dns in re.findall(r"<dnsserver>([^<\s]+)</dnsserver>", raw_config):
         services["dns_servers"].append(m_dns.strip())
     for m_ntp in re.findall(r"<timeservers>([^<]+)</timeservers>", raw_config):
         services["ntp_servers"].extend(s.strip() for s in m_ntp.split() if s.strip())
-    for m_dhcp in re.findall(r"<dhcrelay>\s*<server>([^<\s]+)</server>", raw_config):
-        services["dhcp_relays"].append(m_dhcp.strip())
+    for m_dhcp in re.findall(r"<dhcrelay>[\s\S]*?<server>([^<]+)</server>", raw_config, flags=re.IGNORECASE):
+        services["dhcp_relays"].extend(s.strip() for s in m_dhcp.split(",") if s.strip())
+    for m_mvc_dhcp in re.findall(r"<DHCRelay>[\s\S]*?<destination\b[^>]*>[\s\S]*?<server>([^<]+)</server>", raw_config):
+        services["dhcp_relays"].extend(s.strip() for s in m_mvc_dhcp.split(",") if s.strip())
     for m_sys in re.findall(r"<syslog_server>([^<\s]+)</syslog_server>", raw_config):
         services["syslog_servers"].append(m_sys.strip())
+    for m_mvc_sys in re.finditer(r"<Syslog>[\s\S]*?</Syslog>", raw_config):
+        for m_dest in re.finditer(r"<destination\b[^>]*>([\s\S]*?)</destination>", m_mvc_sys.group(0)):
+            dbody = m_dest.group(1)
+            m_en = re.search(r"<enabled>([^<]+)</enabled>", dbody)
+            if m_en and m_en.group(1).strip().lower() in ("0", "false"):
+                continue
+            m_srv = re.search(r"<(?:server|hostname)>([^<\s]+)</(?:server|hostname)>", dbody)
+            if m_srv and m_srv.group(1).strip():
+                services["syslog_servers"].append(m_srv.group(1).strip())
+
+    # Modern Cisco IOS-XE / NX-OS multi-line `radius server <NAME>` & `tacacs server <NAME>` stanzas
+    for m_rblk in re.finditer(
+        r"(?im)^radius\s+server\s+\S+\s*\r?\n((?:[ \t]+[^\r\n]+\r?\n?)+)",
+        raw_config,
+    ):
+        for m_addr in re.finditer(r"\baddress\s+(?:ipv4|ipv6)\s+([^\s\r\n]+)", m_rblk.group(1), re.IGNORECASE):
+            services["radius_servers"].append(m_addr.group(1).strip())
+    for m_tblk in re.finditer(
+        r"(?im)^tacacs\s+server\s+\S+\s*\r?\n((?:[ \t]+[^\r\n]+\r?\n?)+)",
+        raw_config,
+    ):
+        for m_addr in re.finditer(r"\baddress\s+(?:ipv4|ipv6)\s+([^\s\r\n]+)", m_tblk.group(1), re.IGNORECASE):
+            services["tacacs_servers"].append(m_addr.group(1).strip())
+
+    # Aruba Instant / AOS-CX `wlan auth-server <name>\n ip <ip>`
+    for m_ablk in re.finditer(
+        r"(?im)^wlan\s+auth-server\s+\S+\s*\r?\n((?:[ \t]*[^\r\n]+\r?\n?)+)",
+        raw_config,
+    ):
+        for aln in m_ablk.group(1).splitlines():
+            s_aln = aln.strip()
+            if not s_aln or s_aln == "!":
+                break
+            m_aip = re.match(r"^ip\s+(\d+\.\d+\.\d+\.\d+)\b", s_aln, re.IGNORECASE)
+            if m_aip:
+                services["radius_servers"].append(m_aip.group(1))
+                break
+
+    # Juniper Junos hierarchical brace-style `system { ... }` and `snmp { ... }`
+    if "system {" in raw_config or "snmp {" in raw_config:
+        for m_ns_blk in re.finditer(r"\bname-server\s*\{([^}]*)\}", raw_config):
+            for m_ip in re.finditer(r"\b(\d+\.\d+\.\d+\.\d+)\s*;", m_ns_blk.group(1)):
+                services["dns_servers"].append(m_ip.group(1))
+        for m_ntp_blk in re.finditer(r"\bntp\s*\{([^}]*)\}", raw_config):
+            for m_srv in re.finditer(r"\bserver\s+([^\s;{}]+)", m_ntp_blk.group(1)):
+                services["ntp_servers"].append(m_srv.group(1))
+        for m_sys_host in re.finditer(r"\bsyslog\s*\{[\s\S]*?\bhost\s+([^\s;{}]+)\s*\{", raw_config):
+            services["syslog_servers"].append(m_sys_host.group(1))
+        for m_rad_blk in re.finditer(r"\bradius-server\s*\{([\s\S]*?)\n\s*\}", raw_config):
+            for m_rh in re.finditer(r"(?m)^\s*(\d+\.\d+\.\d+\.\d+)\s*\{", m_rad_blk.group(1)):
+                services["radius_servers"].append(m_rh.group(1))
+        for m_tac_blk in re.finditer(r"\btacplus-server\s*\{([\s\S]*?)\n\s*\}", raw_config):
+            for m_th in re.finditer(r"(?m)^\s*(\d+\.\d+\.\d+\.\d+)\s*\{", m_tac_blk.group(1)):
+                services["tacacs_servers"].append(m_th.group(1))
+        for m_tg_blk in re.finditer(r"\btrap-group\s+\S+\s*\{[\s\S]*?\btargets\s*\{([^}]*)\}", raw_config):
+            for m_tip in re.finditer(r"\b(\d+\.\d+\.\d+\.\d+)\s*;", m_tg_blk.group(1)):
+                services["snmp_servers"].append(m_tip.group(1))
 
     in_forti_dns = False
     in_forti_ntp = False
@@ -217,11 +276,19 @@ def extract_services_from_config(raw_config: str) -> dict:
         if m_ios_ntp:
             services["ntp_servers"].append(m_ios_ntp.group(1))
 
-        m_ios_relay = re.match(r"^(?:ip\s+helper-address|helper-address)\s+(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE)
+        m_ios_relay = re.match(
+            r"^(?:ip\s+helper-address\s+(?:vrf\s+\S+\s+|global\s+)?|helper-address\s+|ip\s+dhcp\s+relay\s+address\s+)(\d+\.\d+\.\d+\.\d+)",
+            line,
+            re.IGNORECASE,
+        )
         if m_ios_relay:
             services["dhcp_relays"].append(m_ios_relay.group(1))
 
-        m_ios_syslog = re.match(r"^(?:logging\s+host|logging\s+server)\s+(\S+)", line, re.IGNORECASE)
+        m_ios_syslog = re.match(
+            r"^(?:logging\s+host|logging\s+server|syslog-server)\s+(\S+)",
+            line,
+            re.IGNORECASE,
+        )
         if m_ios_syslog:
             services["syslog_servers"].append(m_ios_syslog.group(1))
 
@@ -282,10 +349,22 @@ def extract_services_from_config(raw_config: str) -> dict:
             m_mt_ntp = re.search(r"(?:servers|address)=([^\s\"']+)", line)
             if m_mt_ntp:
                 services["ntp_servers"].extend(s for s in m_mt_ntp.group(1).split(",") if s)
-        if "relay=" in line or "dhcp-relay" in line:
-            m_mt_relay = re.search(r"relay=([0-9.]+)", line)
+        if "relay=" in line or "dhcp-relay" in line or "dhcp-server=" in line:
+            m_mt_relay = re.search(r"(?:relay|dhcp-server)=([0-9.,]+)", line)
             if m_mt_relay:
-                services["dhcp_relays"].append(m_mt_relay.group(1))
+                services["dhcp_relays"].extend(s.strip() for s in m_mt_relay.group(1).split(",") if s.strip())
+        if "remote=" in line and ("target=remote" in line or "logging" in line):
+            m_mt_sys = re.search(r"\bremote=([^\s\"']+)", line)
+            if m_mt_sys:
+                services["syslog_servers"].append(m_mt_sys.group(1).strip())
+        if "address=" in line and ("service=" in line or "/radius" in line):
+            m_mt_rad = re.search(r"\baddress=([^\s\"']+)", line)
+            if m_mt_rad:
+                services["radius_servers"].append(m_mt_rad.group(1).strip())
+        if "trap-target=" in line:
+            m_mt_snmp = re.search(r"\btrap-target=([^\s\"']+)", line)
+            if m_mt_snmp:
+                services["snmp_servers"].extend(s.strip() for s in m_mt_snmp.group(1).split(",") if s.strip())
 
         # OpenWrt UCI (`uci export`)
         m_uci_ntp = re.match(r"^list\s+server\s+['\"]([^'\"]+)['\"]", line)
@@ -320,15 +399,15 @@ def sanitize_raw_config(raw_config: str) -> str:
 
     # FortiOS `set <secret_field> [ENC] <value>` (handle ENC prefix before generic password rule)
     sanitized = re.sub(
-        r"(set\s+(?:password|passwd|psksecret|auth-key|priv-key|private-key|key|secret|community)\s+(?:ENC\s+)?)[^\s\r\n]+",
+        r"(set\s+(?:password|passwd|psksecret|auth-pwd|priv-pwd|enc-password|auth-key|priv-key|private-key|api-key|secret-key|ssh-hkey|ca-password|scep-password|group-password|alicloud-access-key-secret|key|secret|community)\s+(?:ENC\s+)?)(?:\"[^\"]*\"|'[^']*'|[^\s\r\n]+)",
         r"\1<REDACTED_SECRET>",
         sanitized,
         flags=re.IGNORECASE,
     )
 
-    # MikroTik key=value credentials (`password=...`, `secret=...`, `passphrase=...`, etc.)
+    # MikroTik key=value credentials (`password=...`, `secret=...`, `wpa-pre-shared-key=...`, etc.)
     sanitized = re.sub(
-        r"(\b(?:password|secret|passphrase|authentication-password|privacy-password|shared-secret|community)=)(?:\"[^\"]*\"|'[^']*'|[^\s\r\n]+)",
+        r"(\b(?:password|secret|passphrase|authentication-password|privacy-password|shared-secret|wpa-pre-shared-key|wpa2-pre-shared-key|private-key|api-key|auth-key|community)=)(?:\"[^\"]*\"|'[^']*'|[^\s\r\n]+)",
         r"\1<REDACTED_SECRET>",
         sanitized,
         flags=re.IGNORECASE,
@@ -338,6 +417,14 @@ def sanitize_raw_config(raw_config: str) -> str:
     sanitized = re.sub(
         r"(option\s+(?:key|password|secret|psk|auth_secret|acct_secret)\s+)(?:'[^']*'|\"[^\"]*\"|[^\s\r\n]+)",
         r"\1'<REDACTED_SECRET>'",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Cisco / Arista / FRR AAA, IKE, OSPF MD5, HSRP/VRRP auth, and key-string secrets (with optional encryption type digit)
+    sanitized = re.sub(
+        r"((?:tacacs-server\s+key|radius-server\s+key|crypto\s+isakmp\s+key|ip\s+ospf\s+message-digest-key\s+\d+\s+md5|standby\s+\d+\s+authentication(?:\s+md5\s+key-string|\s+text)?|key-string)\s+(?:\d+\s+)?)[^\s\r\n]+",
+        r"\1<REDACTED_KEY>",
         sanitized,
         flags=re.IGNORECASE,
     )
@@ -378,7 +465,7 @@ def sanitize_raw_config(raw_config: str) -> str:
     )
     # XML tags (OPNsense / pfSense / PAN-OS)
     sanitized = re.sub(
-        r"(<(?:password|pre-shared-key|secret|sharedsecret|bcrypt-hash|md5-hash|nt-hash|prv|community|psk|auth_pass|priv_pass)>)[^<]+(</(?:password|pre-shared-key|secret|sharedsecret|bcrypt-hash|md5-hash|nt-hash|prv|community|psk|auth_pass|priv_pass)>)",
+        r"(<(?:password|pre-shared-key|secret|sharedsecret|bcrypt-hash|md5-hash|nt-hash|phash|prv|private-key|community|rocommunity|rwcommunity|psk|auth_pass|priv_pass|bind-password|apikey|api-key|apisecret|lighttpd_user_password)>)[^<]+(</(?:password|pre-shared-key|secret|sharedsecret|bcrypt-hash|md5-hash|nt-hash|phash|prv|private-key|community|rocommunity|rwcommunity|psk|auth_pass|priv_pass|bind-password|apikey|api-key|apisecret|lighttpd_user_password)>)",
         r"\1<REDACTED>\2",
         sanitized,
         flags=re.IGNORECASE,
