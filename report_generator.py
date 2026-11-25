@@ -24,6 +24,15 @@ import shutil
 from netaddr import AddrFormatError, IPNetwork
 
 import oui_lookup
+from net_docu_crawler.topology_resolver import (
+    _extract_hw_macs,
+    dedupe_devices,
+    infer_interface_speed,
+    is_generic_hostname,
+    is_placeholder_serial,
+    normalize_hostname,
+    normalize_interface_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,31 +51,10 @@ def _route_sort_key(rt: dict) -> tuple:
 
 
 def normalize_interface_name(name):
+    """Delegate interface key canonicalization to topology_resolver.normalize_interface_key."""
     if not name:
         return ""
-    name = re.sub(r"\.0$", "", str(name).lower().strip().strip('"').strip("'"))
-    # Order longest prefixes first to prevent partial prefix collisions (e.g. twentyfive vs two)
-    replacements = (
-        ("twentyfivegigabitethernet", "twe"),
-        ("twentyfivegige", "twe"),
-        ("twopointfivegigabitethernet", "tw"),
-        ("hundredgigabitethernet", "hu"),
-        ("hundredgige", "hu"),
-        ("fortygigabitethernet", "fo"),
-        ("fortygige", "fo"),
-        ("tengigabitethernet", "te"),
-        ("tengige", "te"),
-        ("fivegigabitethernet", "fi"),
-        ("gigabitethernet", "gi"),
-        ("fastethernet", "fa"),
-        ("port-channel", "po"),
-        ("bundle-ether", "be"),
-        ("ethernet", "et"),
-    )
-    for full, short in replacements:
-        if name.startswith(full):
-            return short + name[len(full) :]
-    return name
+    return normalize_interface_key(str(name))
 
 
 def _parse_interface_network_strict(ip_str, mask_hint=None):
@@ -121,52 +109,15 @@ def parse_interface_network(ip_str, mask_hint=None):
 
 
 def get_link_speed(local_port, interfaces_detail):
+    """Delegate speed resolution to topology_resolver.infer_interface_speed."""
     norm_local = normalize_interface_name(local_port)
-    raw_low = str(local_port or "").strip().lower()
-
-    # 1. Try to find in interfaces_detail
+    speed_str = ""
     for name, stats in (interfaces_detail or {}).items():
         if normalize_interface_name(name) == norm_local:
-            speed_str = str((stats or {}).get("speed", "")).lower()
+            speed_str = str((stats or {}).get("speed", "")).strip()
             if speed_str:
-                if "100g" in speed_str or "100000" in speed_str:
-                    return "100G"
-                if "40g" in speed_str or "40000" in speed_str:
-                    return "40G"
-                if "25g" in speed_str or "25000" in speed_str:
-                    return "25G"
-                if "10g" in speed_str or "10000" in speed_str:
-                    return "10G"
-                if "5g" in speed_str or "5000" in speed_str:
-                    return "5G"
-                if "2.5g" in speed_str or "2500" in speed_str:
-                    return "2.5G"
-                if "1000m" in speed_str or "1g" in speed_str or "1000" in speed_str:
-                    return "1G"
-                if "100m" in speed_str or "100" in speed_str:
-                    return "100M"
-                if "10m" in speed_str or re.search(r"\b10\b", speed_str):
-                    return "10M"
-
-    # 2. Fallback to anchored prefix inference (never bare substring checks)
-    if re.match(r"^(?:hu|hundred|et-\d)", norm_local) or raw_low.startswith("et-"):
-        return "100G"
-    if re.match(r"^(?:fo|forty|qsfp)", norm_local):
-        return "40G"
-    if re.match(r"^(?:twe|twentyfive|25ge)", norm_local) or raw_low.startswith(("twe", "twentyfive", "25ge")):
-        return "25G"
-    if re.match(r"^(?:xe-|te(?:\d|$)|ten|10ge)", norm_local) or raw_low.startswith(("xe-", "tengig", "10ge")):
-        return "10G"
-    if re.match(r"^(?:fi\d|fivegig)", norm_local):
-        return "5G"
-    if re.match(r"^(?:tw\d|twopointfive)", norm_local):
-        return "2.5G"
-    if re.match(r"^(?:ge-|gi|gig|vtnet|ether|eth\d|et\d|port\d|swp)", norm_local):
-        return "1G"
-    if re.match(r"^(?:fe-|fa\d|fast)", norm_local):
-        return "100M"
-
-    return "1G"  # Default to 1G if unknown
+                break
+    return infer_interface_speed(speed_str=speed_str, port_name=str(local_port or ""))[1]
 
 
 def get_route_details(route):
@@ -269,88 +220,56 @@ _GENERIC_DEFAULT_HOSTNAMES = frozenset(
 
 def get_unique_devices(devices):
     """
-    De-duplicates devices based on Serial Number (primary) and Hostname (fallback only when
-    no unique valid hardware serial is present and hostname is non-generic).
-    If a device was discovered/crawled via multiple SVIs, it only keeps one primary instance.
+    Delegate multi-SVI chassis deduplication to topology_resolver.dedupe_devices
+    while preserving distinct named devices that merely share a conflicting L3 SVI IP
+    so Section 8.2 can flag Duplicate Gateway IP conflicts.
     """
     if not devices:
         return {}
+    unique_devices = dedupe_devices(devices)
+    if len(unique_devices) < len(devices):
+        retained_serials = {
+            str(d.get("serial") or "").strip().upper()
+            for d in unique_devices.values()
+            if isinstance(d, dict) and not is_placeholder_serial(str(d.get("serial") or "").strip())
+        }
+        retained_macs = set()
+        retained_hosts = set()
+        for d in unique_devices.values():
+            if not isinstance(d, dict):
+                continue
+            retained_macs.update(_extract_hw_macs(d))
+            sh, _ = normalize_hostname(str(d.get("hostname") or ""))
+            if not is_generic_hostname(sh):
+                retained_hosts.add(sh.lower())
 
-    unique_devices = {}
-    seen_serials = set()
-    seen_hostnames = set()
+        for ip, dev in devices.items():
+            if ip in unique_devices or not isinstance(dev, dict):
+                continue
+            ser = str(dev.get("serial") or "").strip()
+            has_valid_ser = not is_placeholder_serial(ser)
+            if has_valid_ser and ser.upper() in retained_serials:
+                continue
+            dev_macs = _extract_hw_macs(dev)
+            if dev_macs and (dev_macs & retained_macs):
+                continue
+            sh, _ = normalize_hostname(str(dev.get("hostname") or ""))
+            if not is_generic_hostname(sh) and sh.lower() not in retained_hosts:
+                unique_devices[ip] = dev
+                retained_hosts.add(sh.lower())
+                if has_valid_ser:
+                    retained_serials.add(ser.upper())
+                retained_macs.update(dev_macs)
 
-    def ip_sort_key_internal(ip):
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-            return [int(x) for x in ip.split(".")]
-        return [0]
-
-    sorted_ips = sorted(
-        devices.keys(),
-        key=lambda ip: (
-            devices[ip].get("status") == "success",
-            str(devices[ip].get("mgmt_method", "")).startswith("SSH"),
-            ip_sort_key_internal(ip),
-        ),
-        reverse=True,
-    )
-
-    duplicates_info = []
-
-    for ip in sorted_ips:
-        dev = devices[ip]
-        serial = str(dev.get("serial") or "").strip()
-        hostname = str(dev.get("hostname") or "").strip()
-
-        is_duplicate = False
-        duplicate_reason = ""
-
-        # Check Serial number uniqueness (ignoring placeholder VM/SMBIOS serials)
-        has_valid_serial = bool(serial) and serial.lower() not in _PLACEHOLDER_SERIALS
-        if has_valid_serial:
-            serial_clean = serial.upper()
-            if serial_clean in seen_serials:
-                is_duplicate = True
-                duplicate_reason = f"duplicate serial {serial_clean}"
-            else:
-                seen_serials.add(serial_clean)
-
-        # Check Hostname uniqueness ONLY as fallback when serial is absent/placeholder and hostname is non-generic
-        host_clean = hostname.lower()
-        if (
-            not is_duplicate
-            and not has_valid_serial
-            and host_clean
-            and host_clean not in _GENERIC_DEFAULT_HOSTNAMES
-            and not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host_clean)
-        ):
-            if host_clean in seen_hostnames:
-                is_duplicate = True
-                duplicate_reason = f"duplicate hostname {host_clean}"
-            else:
-                seen_hostnames.add(host_clean)
-
-        if not is_duplicate:
-            unique_devices[ip] = dev
-        else:
-            duplicates_info.append(
-                f"Discovered duplicate IP {ip} ({hostname}) via {duplicate_reason}. Excluding from deliverables."
-            )
-
-    if duplicates_info:
+    if len(unique_devices) < len(devices):
         print("\n--- Duplicate Device Detection (Multiple SVIs) ---")
-        for info in duplicates_info:
-            print(f"  [!] {info}")
+        for ip in sorted(set(devices.keys()) - set(unique_devices.keys())):
+            hostname = (devices.get(ip) or {}).get("hostname") or ip
+            print(f"  [!] Discovered duplicate IP {ip} ({hostname}). Excluding from deliverables.")
         print(
             f"  [+] Retained {len(unique_devices)} unique physical devices out of {len(devices)} discovered SVI endpoints.\n"
         )
-
-    def ip_sort_key(ip):
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-            return [int(x) for x in ip.split(".")]
-        return [0]
-
-    return {ip: unique_devices[ip] for ip in sorted(unique_devices.keys(), key=ip_sort_key)}
+    return unique_devices
 
 
 _INFRA_DEVICE_TYPES = frozenset({"switch", "router", "firewall", "ap", "wlc", "wireless", "gateway", "bridge"})
@@ -5482,19 +5401,22 @@ def generate_cutover_validation_script(
         'echo -e "\\n${BOLD}[*] Phase 1: Verifying Layer 3 Gateway & SVI Reachability...${NC}"',
     ]
 
-    _safe_target_re = re.compile(r"^[A-Za-z0-9._:-]+$")
+    _safe_target_re = re.compile(r"^[A-Za-z0-9._:][A-Za-z0-9._:-]*$")
+    _smart_quote_trans = str.maketrans(
+        {"\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u00ab": '"', "\u00bb": '"'}
+    )
 
     def _is_safe_target_addr(val: object) -> bool:
         s = str(val or "").strip()
-        return bool(s) and bool(_safe_target_re.match(s))
+        return bool(s) and not s.startswith("-") and bool(_safe_target_re.match(s))
 
     def _escape_bash_dq(val: object) -> str:
-        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).strip()
+        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).translate(_smart_quote_trans).strip()
         s = s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`").replace("!", "\\!")
         return s
 
     def _escape_ps_dq(val: object) -> str:
-        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).strip()
+        s = re.sub(r"[\r\n\x00]+", " ", str(val or "")).translate(_smart_quote_trans).strip()
         s = s.replace("`", "``").replace('"', '`"').replace("$", "`$")
         return s
 
@@ -5661,10 +5583,54 @@ def generate_cutover_validation_script(
         print(f"[-] Error writing cutover validation script: {e}")
 
 
-def _recommend_replacement_sku(dev: dict, total_ports: int, poe_budget_w: float, target_vendor: str = "juniper") -> str:
-    """Recommend a replacement hardware SKU for the target vendor (defaults to Juniper)."""
-    tv = (target_vendor or "juniper").strip().lower()
-    dtype = (dev.get("device_type") or "switch").lower()
+_TARGET_VENDOR_ALIASES = {
+    "junos": "juniper",
+    "juniper": "juniper",
+    "cisco": "cisco",
+    "cisco_ios": "cisco",
+    "cisco_xe": "cisco",
+    "ios": "cisco",
+    "ios-xe": "cisco",
+    "meraki": "meraki",
+    "arista": "arista",
+    "arista_eos": "arista",
+    "eos": "arista",
+    "aruba": "aruba",
+    "hp": "hpprocurve",
+    "procurve": "hpprocurve",
+    "hpprocurve": "hpprocurve",
+    "fortinet": "fortinet",
+    "fortigate": "fortinet",
+}
+
+
+def _resolve_target_vendor_for_device(dev: dict, target_vendor) -> str:
+    """Resolve a simple vendor string, `persona=vendor` spec string, or persona->vendor dict for `dev`."""
+    dtype = str(dev.get("device_type") or dev.get("device_persona") or "switch").strip().lower()
+    persona = str(dev.get("device_persona") or dtype or "switch").strip().lower()
+
+    if isinstance(target_vendor, dict):
+        raw_v = target_vendor.get(persona) or target_vendor.get(dtype) or target_vendor.get("default") or "juniper"
+        return _TARGET_VENDOR_ALIASES.get(str(raw_v).strip().lower(), str(raw_v).strip().lower() or "juniper")
+
+    spec = str(target_vendor or "juniper").strip().lower()
+    if "=" in spec:
+        vmap: dict[str, str] = {}
+        for part in spec.split(","):
+            if "=" not in part:
+                continue
+            k, v = [x.strip().lower() for x in part.split("=", 1)]
+            if k and v:
+                vmap[k] = _TARGET_VENDOR_ALIASES.get(v, v)
+        return vmap.get(persona) or vmap.get(dtype) or vmap.get("default") or "juniper"
+
+    return _TARGET_VENDOR_ALIASES.get(spec, spec or "juniper")
+
+
+def _recommend_replacement_sku(dev: dict, total_ports: int, poe_budget_w: float, target_vendor="juniper") -> str:
+    """Recommend a replacement hardware SKU for the target vendor (supporting persona=vendor maps)."""
+    tv = _resolve_target_vendor_for_device(dev, target_vendor)
+    dtype = str(dev.get("device_type") or dev.get("device_persona") or "switch").lower()
     model_l = (dev.get("model") or "").lower()
     host_l = (dev.get("hostname") or "").lower()
     has_poe = poe_budget_w > 0 or bool((dev.get("poe") or {}).get("ports"))
@@ -5677,36 +5643,64 @@ def _recommend_replacement_sku(dev: dict, total_ports: int, poe_budget_w: float,
         or len(dev.get("routes", []) or []) >= 10
     )
 
-    if tv in ("cisco", "cisco_ios", "cisco_xe"):
+    if tv == "cisco":
         if dtype == "firewall":
             return "FPR-1120"
         if dtype == "router":
             return "C8300-1N1S-4T2X"
+        if dtype == "ap":
+            return "CW9164I"
         if is_core:
             return "C9500-48Y4C" if not has_poe else "C9300-48P"
         if total_ports <= 28:
             return "C9200L-24P-4X" if has_poe else "C9200L-24T-4X"
         return "C9200L-48P-4X" if has_poe else "C9200L-48T-4X"
 
-    if tv in ("arista", "arista_eos"):
+    if tv == "arista":
+        if dtype == "ap":
+            return "C-360"
         if is_core:
             return "DCS-7050SX3-48YC8"
         if total_ports <= 28:
             return "CCS-720XP-24ZY4" if has_poe else "CCS-720XP-24Y6"
         return "CCS-720XP-48ZC2" if has_poe else "CCS-720XP-48Y6"
 
-    if tv in ("hpprocurve", "procurve", "hp", "aruba"):
+    if tv in ("hpprocurve", "aruba"):
+        if dtype == "ap":
+            return "AP-635"
         if is_core:
             return "Aruba CX 6300M 48G PoE+" if has_poe else "Aruba CX 8325-48Y8C"
         if total_ports <= 28:
             return "Aruba CX 6200F 24G PoE+" if has_poe else "Aruba CX 6200F 24G"
         return "Aruba CX 6200F 48G PoE+" if has_poe else "Aruba CX 6200F 48G"
 
+    if tv == "fortinet":
+        if dtype in ("firewall", "router"):
+            return "FortiGate-100F" if total_ports <= 16 else "FortiGate-200F"
+        if dtype == "ap":
+            return "FortiAP-231G"
+        if total_ports <= 28:
+            return "FortiSwitch-124F-FPOE" if has_poe else "FortiSwitch-124F"
+        return "FortiSwitch-148F-FPOE" if has_poe else "FortiSwitch-148F"
+
+    if tv == "meraki":
+        if dtype in ("firewall", "router"):
+            return "MX85"
+        if dtype == "ap":
+            return "MR46"
+        if is_core:
+            return "MS425-32"
+        if total_ports <= 28:
+            return "MS225-24P" if has_poe else "MS225-24"
+        return "MS225-48LP" if has_poe else "MS225-48"
+
     # Default: Juniper Networks
     if dtype == "firewall":
         return "SRX345" if total_ports <= 16 else "SRX1500"
     if dtype == "router":
         return "MX204"
+    if dtype == "ap":
+        return "AP45"
     if is_core:
         if "ex4600" in model_l or (not has_poe and len(dev.get("optics", []) or []) >= 8):
             return "EX4600-40F"
@@ -5797,9 +5791,13 @@ def generate_target_migration_configs(
     """
     from net_docu_crawler.target_adapters import render_device_target_config
 
-    tv = (target_vendor or "juniper").strip().lower()
+    tv_header = (
+        ",".join(f"{k}={v}" for k, v in target_vendor.items())
+        if isinstance(target_vendor, dict)
+        else str(target_vendor or "juniper").strip().lower()
+    )
     lines = [
-        f"# Target Vendor Migration Configs (`{tv}`)",
+        f"# Target Vendor Migration Configs (`{tv_header}`)",
         "",
         "Generated from normalized device intent (`ports`, `l3_interfaces`, `port_profiles`, `routes`, `services`, `dhcp`).",
         "",
@@ -5807,6 +5805,7 @@ def generate_target_migration_configs(
     for ip, dev in devices.items():
         if dev.get("status") != "success":
             continue
+        tv = _resolve_target_vendor_for_device(dev, target_vendor)
         hostname = dev.get("hostname") or ip
         lines.append(f"## {hostname} ({dev.get('vendor', 'Unknown')} `{dev.get('model', '')}` -> `{tv}`)")
         lines.append("```json" if tv == "meraki" else "```text")
@@ -5863,7 +5862,26 @@ def generate_target_migration_configs(
                         lines.append(
                             f"set interfaces {port} unit 0 family ethernet-switching vlan members [{prof['trunk_allowed_vlans'].replace(',', ' ')}]"
                         )
-        elif tv in ("hpprocurve", "procurve", "hp"):
+        elif tv == "aruba":
+            lines.append(f"hostname {hostname}")
+            for ntp in services.get("ntp_servers", []):
+                lines.append(f"ntp server {ntp}")
+            for dns in services.get("dns_servers", []):
+                lines.append(f"ip dns server-address {dns}")
+            for port, prof in list(port_profiles.items())[:48]:
+                lines.append(f"interface {port}")
+                if prof.get("mode") == "access" and prof.get("access_vlan"):
+                    lines.append(" no shutdown")
+                    lines.append(" no routing")
+                    lines.append(f" vlan access {prof['access_vlan']}")
+                elif prof.get("mode") == "trunk":
+                    lines.append(" no shutdown")
+                    lines.append(" no routing")
+                    if prof.get("native_vlan") and str(prof["native_vlan"]).isdigit():
+                        lines.append(f" vlan trunk native {prof['native_vlan']}")
+                    if prof.get("trunk_allowed_vlans"):
+                        lines.append(f" vlan trunk allowed {prof['trunk_allowed_vlans']}")
+        elif tv == "hpprocurve":
             lines.append(f'hostname "{hostname}"')
             for ntp in services.get("ntp_servers", []):
                 lines.append(f"sntp server priority 1 {ntp}")
@@ -5876,6 +5894,28 @@ def generate_target_migration_configs(
                     for vid in prof["trunk_allowed_vlans"].split(","):
                         if vid.strip().isdigit():
                             lines.append(f"vlan {vid.strip()} tagged {port}")
+        elif tv == "fortinet":
+            lines.extend(["config system global", f'    set hostname "{hostname}"', "end"])
+            if services.get("dns_servers"):
+                lines.append("config system dns")
+                lines.append(f"    set primary {services['dns_servers'][0]}")
+                if len(services["dns_servers"]) > 1:
+                    lines.append(f"    set secondary {services['dns_servers'][1]}")
+                lines.append("end")
+            if l3_ints:
+                lines.append("config system interface")
+                for intf in l3_ints[:20]:
+                    iname = intf.get("interface", "")
+                    ip_str = intf.get("ip_address", "")
+                    if iname and ip_str:
+                        lines.extend([f'    edit "{iname}"', f"        set ip {ip_str}", "    next"])
+                lines.append("end")
+        elif tv == "meraki":
+            rendered = render_device_target_config(dev, "meraki")
+            if isinstance(rendered, list):
+                lines.extend(rendered)
+            else:
+                lines.append(str(rendered))
         else:
             lines.append(f"# Unsupported target_vendor={tv}")
         lines.append("```")
