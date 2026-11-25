@@ -30,6 +30,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 
 import paramiko
 
@@ -68,15 +70,17 @@ class AuditedMissingHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     """
 
     _warned_host_keys: set[tuple[str, str]] = set()
+    _warned_lock = threading.Lock()
 
     def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
         key_type = key.get_name() if hasattr(key, "get_name") else "unknown"
         fingerprint = _format_host_key_fingerprint(key)
         cache_key = (str(hostname), fingerprint)
-        if cache_key in self._warned_host_keys:
-            return
-        if len(self._warned_host_keys) < 4096:
-            self._warned_host_keys.add(cache_key)
+        with self._warned_lock:
+            if cache_key in self._warned_host_keys:
+                return
+            if len(self._warned_host_keys) < 4096:
+                self._warned_host_keys.add(cache_key)
         logger.warning(
             "Unverified SSH host key for %s (%s %s) during read-only OPNsense discovery; "
             "set strict_host_key_checking=True or %s=1 to reject unknown hosts.",
@@ -87,26 +91,176 @@ class AuditedMissingHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         )
 
 
-class OPNsenseSSHConnection:
-    """Non-interactive SSH client wrapper for OPNsense / FreeBSD bypassing `/usr/local/etc/rc.initial` menu traps."""
+def _close_quietly(resource: object) -> None:
+    if resource is None:
+        return
+    close_fn = getattr(resource, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception as exc:
+            logger.debug("Ignoring close() error on OPNsense SSH resource: %s", exc)
 
-    def __init__(self, client: paramiko.SSHClient, session_log: str = ""):
+
+class OPNsenseSSHConnection:
+    """
+    Non-interactive SSH client wrapper for OPNsense / FreeBSD bypassing `/usr/local/etc/rc.initial` menu traps.
+    Enforces a strict total wall-clock deadline, drains stdout and stderr simultaneously to prevent SSH window
+    deadlocks, inspects remote exit status, and closes every channel/stream in `finally`.
+    """
+
+    def __init__(
+        self,
+        client: paramiko.SSHClient,
+        session_log: str = "",
+        timeout: int | float = 15,
+        no_log: dict[str, str] | None = None,
+    ):
         self.client = client
         self.session_log = session_log
+        self.timeout = max(1.0, float(timeout)) if timeout else 15.0
+        self.no_log: dict[str, str] = {k: v for k, v in (no_log or {}).items() if isinstance(v, str) and v}
+        self._log_lock = threading.Lock()
+        self.last_exit_status: int | None = None
+        self.last_stderr: str = ""
 
-    def send_command(self, cmd: str, timeout: int = 15) -> str:
-        _stdin, stdout, _stderr = self.client.exec_command(cmd, timeout=timeout)
-        output = stdout.read().decode("utf-8", errors="ignore")
+    def __enter__(self) -> "OPNsenseSSHConnection":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.disconnect()
+
+    def _scrub_text(self, text: str) -> str:
+        if not text:
+            return ""
+        out = text
+        for secret in self.no_log.values():
+            if secret:
+                out = out.replace(secret, "********")
+        return out
+
+    @staticmethod
+    def _supports_channel_polling(chan: object) -> bool:
+        if chan is None or hasattr(chan, "_mock_return_value"):
+            return False
+        required = ("recv_ready", "recv", "recv_stderr_ready", "recv_stderr", "exit_status_ready", "recv_exit_status")
+        return all(callable(getattr(chan, attr, None)) for attr in required)
+
+    @staticmethod
+    def _read_channel_bounded(chan, deadline: float, cmd: str) -> tuple[bytes, bytes, int | None]:
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+        exit_status: int | None = None
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"OPNsense exec_command timed out waiting for {cmd!r}")
+
+            if callable(getattr(chan, "settimeout", None)):
+                chan.settimeout(min(0.25, remaining))
+
+            progressed = False
+            while chan.recv_ready():
+                chunk = chan.recv(65536)
+                if not chunk:
+                    break
+                stdout_buf.extend(chunk)
+                progressed = True
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"OPNsense exec_command exceeded wall-clock deadline for {cmd!r}")
+
+            while chan.recv_stderr_ready():
+                err_chunk = chan.recv_stderr(65536)
+                if not err_chunk:
+                    break
+                stderr_buf.extend(err_chunk)
+                progressed = True
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"OPNsense exec_command exceeded wall-clock deadline for {cmd!r}")
+
+            if chan.exit_status_ready():
+                while chan.recv_ready():
+                    chunk = chan.recv(65536)
+                    if not chunk:
+                        break
+                    stdout_buf.extend(chunk)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"OPNsense exec_command exceeded wall-clock deadline for {cmd!r}")
+                while chan.recv_stderr_ready():
+                    err_chunk = chan.recv_stderr(65536)
+                    if not err_chunk:
+                        break
+                    stderr_buf.extend(err_chunk)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"OPNsense exec_command exceeded wall-clock deadline for {cmd!r}")
+                exit_status = int(chan.recv_exit_status())
+                break
+
+            if not progressed:
+                sleep_for = min(0.02, max(0.0, deadline - time.monotonic()))
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+        return bytes(stdout_buf), bytes(stderr_buf), exit_status
+
+    def send_command(self, cmd: str, timeout: int | float | None = None) -> str:
+        eff_timeout = float(timeout) if (timeout is not None and timeout > 0) else max(self.timeout, 15.0)
+        deadline = time.monotonic() + eff_timeout
+        stdin, stdout, stderr = self.client.exec_command(cmd, timeout=eff_timeout)
+        chan = getattr(stdout, "channel", None)
+        output = ""
+        err_text = ""
+        exit_status: int | None = None
+
+        try:
+            _close_quietly(stdin)
+            if self._supports_channel_polling(chan):
+                out_bytes, err_bytes, exit_status = self._read_channel_bounded(chan, deadline, cmd)
+                output = out_bytes.decode("utf-8", errors="ignore")
+                err_text = err_bytes.decode("utf-8", errors="ignore")
+            else:
+                if chan is not None and callable(getattr(chan, "settimeout", None)):
+                    chan.settimeout(eff_timeout)
+                raw_out = stdout.read()
+                output = (
+                    raw_out.decode("utf-8", errors="ignore")
+                    if isinstance(raw_out, (bytes, bytearray))
+                    else str(raw_out or "")
+                )
+                raw_err = stderr.read() if callable(getattr(stderr, "read", None)) else b""
+                err_text = raw_err.decode("utf-8", errors="ignore") if isinstance(raw_err, (bytes, bytearray)) else ""
+        finally:
+            _close_quietly(stdin)
+            _close_quietly(stdout)
+            _close_quietly(stderr)
+            _close_quietly(chan)
+
+        self.last_exit_status = exit_status
+        self.last_stderr = err_text
+
+        if exit_status is not None and exit_status != 0:
+            logger.warning(
+                "OPNsense command %r returned non-zero exit status %d (stderr: %s)",
+                cmd,
+                exit_status,
+                self._scrub_text(err_text.strip())[:200],
+            )
+        elif err_text.strip():
+            logger.debug("OPNsense command %r stderr: %s", cmd, self._scrub_text(err_text.strip())[:200])
+
         if self.session_log:
+            safe_out = self._scrub_text(output)
             try:
-                with open(self.session_log, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- COMMAND: {cmd} ---\n{output}\n")
+                with self._log_lock:
+                    with open(self.session_log, "a", encoding="utf-8") as f:
+                        f.write(f"\n--- COMMAND: {cmd} ---\n{safe_out}\n")
             except OSError as exc:
                 logger.debug("Failed writing OPNsense session log %s: %s", self.session_log, exc)
         return output
 
     def disconnect(self):
-        self.client.close()
+        _close_quietly(self.client)
 
 
 class OPNsenseDriver(BaseDriver):
@@ -119,6 +273,7 @@ class OPNsenseDriver(BaseDriver):
     device_persona = "firewall"
     default_device_type = "firewall"
     paging_cmd = ""
+    supports_telnet = False
 
     def __init__(
         self,
@@ -150,33 +305,45 @@ class OPNsenseDriver(BaseDriver):
         self.known_hosts_path = known_hosts_path
 
     def connect(self):
+        if self.transport != "ssh":
+            raise ValueError(f"OPNsenseDriver only supports SSH transport (got {self.transport!r})")
+
         from net_docu_crawler.ssh_compat import connect_paramiko_with_fallback
 
         client = paramiko.SSHClient()
         try:
-            client.load_system_host_keys()
-        except OSError as exc:
-            logger.warning("Unable to load system SSH known_hosts for OPNsense target %s: %s", self.ip, exc)
+            try:
+                client.load_system_host_keys()
+            except OSError as exc:
+                logger.warning("Unable to load system SSH known_hosts for OPNsense target %s: %s", self.ip, exc)
 
-        if self.known_hosts_path:
-            client.load_host_keys(self.known_hosts_path)
+            if self.known_hosts_path:
+                client.load_host_keys(self.known_hosts_path)
 
-        if self.strict_host_key_checking:
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        else:
-            client.set_missing_host_key_policy(AuditedMissingHostKeyPolicy())
+            if self.strict_host_key_checking:
+                client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            else:
+                client.set_missing_host_key_policy(AuditedMissingHostKeyPolicy())
 
-        connect_paramiko_with_fallback(
-            client,
-            hostname=self.ip,
-            port=self.port,
-            username=self.username,
-            password=self.password,
-            timeout=self.timeout,
-            banner_timeout=self.timeout,
-            auth_timeout=self.timeout,
-        )
-        return OPNsenseSSHConnection(client, session_log=self.session_log)
+            connect_paramiko_with_fallback(
+                client,
+                hostname=self.ip,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
+                channel_timeout=self.timeout,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+        except BaseException:
+            _close_quietly(client)
+            raise
+
+        no_log = {k: v for k, v in (("password", self.password), ("secret", self.secret)) if v}
+        return OPNsenseSSHConnection(client, session_log=self.session_log, timeout=self.timeout, no_log=no_log)
 
     def get_version(self, conn) -> dict:
         info = {
