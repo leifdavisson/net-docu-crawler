@@ -29,14 +29,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 | Audit Category | Executed Command | Description |
 | :--- | :--- | :--- |
-| **System Version & Chassis** | `show system`<br>`show modules`<br>`show version` | Extracts system hostname, software revision (e.g. `WB.16.10.0025`), serial number, base chassis MAC address, and model. |
+| **System Version & Chassis** | `show system`<br>`show modules` | Extracts system hostname, software revision (e.g. `WB.16.10.0025`), serial number, base chassis MAC address, and model *(falls back to running-config SKU header if chassis line is absent)*. |
 | **Layer 3 Interfaces & SVIs** | `show ip` | Parses active IP addresses, CIDR subnet masks, and VLAN associations. |
 | **Physical Interface Telemetry** | `show interfaces brief`<br>`show name` | Gathers link up/down operational status, speed, duplex, and port description names. |
-| **L2 Trunk, LAG & 802.1X Telemetry** | `show trunks`<br>`show lacp`<br>`show port-access authenticator` | Extracts `Trk*` LAG memberships, LACP mode (`active`/`passive`/`on`), operational trunk status, active VLANs, and 802.1X authentication state. |
-| **Layer 2 Discovery (LLDP & CDP)** | `show lldp info remote-device`<br>`show cdp neighbor detail` | Deterministically maps adjacent switches, routers, and wireless APs across physical ports. |
+| **L2 Trunk, LAG & 802.1X Telemetry** | `show trunks`<br>`show lacp`<br>`show vlans ports all`<br>`show port-access authenticator` | Extracts `Trk*` LAG memberships, LACP mode (`active`/`passive`/`on`), operational trunk VLAN membership (`tagged`/`untagged`), and 802.1X authentication state. |
+| **Layer 2 Discovery (LLDP & CDP)** | `show lldp info remote-device`<br>`show lldp info remote-device detail`<br>`show cdp neighbor detail` | Deterministically maps adjacent switches, routers, and wireless APs across physical ports (enriching truncated summary names with detail output and falling back to CDP). |
 | **Routing Table** | `show ip route` | Discovers static, connected, and default gateway routes (`0.0.0.0/0`). |
 | **ARP & MAC Table** | `show arp`<br>`show mac-address` | Extracts connected IP-to-MAC bindings and forwarding database entries. |
 | **Spanning Tree (STP)** | `show spanning-tree`<br>`show spanning-tree detail` | Determines spanning tree enable state, root bridge priority, root MAC address, and per-port STP state/role. |
+| **PoE & Optics Telemetry** | `show power-over-ethernet brief`<br>`show interfaces transceiver` | Collects chassis/per-port PoE budgets, draw/allocated wattage, PSU redundancy, and SFP/SFP+ transceiver inventory. |
 | **Configuration Backup** | `show running-config` (fallback `show config`) | Captures non-destructive configuration snapshot without altering flash memory. |
 
 ### Trunk VLAN Mismatch Normalization (`migration_parsers.py` & `trunk_audit.py`)

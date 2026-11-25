@@ -19,15 +19,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 # FRRouting (FRR) Driver Specification
 
 * **Driver Class**: [`FRRDriver`](../../net_docu_crawler/drivers/frr.py)
-* **Supported Platforms**: FRRouting 7.x, 8.x, 9.x, 10.x running on Linux (Debian, Ubuntu, Alpine)
-* **Upstream Netmiko Device Type**: `linux`
+* **Supported Platforms**: FRRouting 7.x, 8.x, 9.x, 10.x running on Linux (Debian, Ubuntu, Alpine), with safe read-only Linux host fallback when `vtysh` is absent
+* **Upstream Netmiko Device Type**: `linux` ([Netmiko](https://github.com/ktbyers/netmiko))
 * **Official Documentation**: [FRRouting Official User Guide](https://docs.frrouting.org/)
 
 ---
 
 ## 1. Connection Mechanics & Transport
 
-FRRouting runs as a modular routing daemon suite on top of the Linux kernel. Net-Docu-Crawler connects using a standard SSH shell session (`linux` Netmiko driver) and leverages `vtysh` unified CLI and native Linux networking commands.
+FRRouting runs as a modular routing daemon suite on top of the Linux kernel. Net-Docu-Crawler connects using a standard SSH shell session (`linux` [Netmiko](https://github.com/ktbyers/netmiko) driver) and leverages `vtysh` unified CLI and native Linux networking commands (`ip -j`).
 
 ## 2. Operator Access & RBAC
 
@@ -39,15 +39,14 @@ sudo usermod -aG frrvty crawler
 
 ## 3. Discovered Data Mapping
 
-| Data Element | Primary Command | Notes |
-| :--- | :--- | :--- |
-| **System Info & Version** | `vtysh -c 'show version'` | Extracts FRR daemon version and system host |
-| **L3 Interfaces** | `vtysh -c 'show interface json'` | Native JSON interface inventory with CIDRs |
-| **Physical Interface Stats** | `ip -j link show` | Kernel interface states and MAC addresses |
-| **Topology Neighbors** | `lldpcli show neighbors -f json` | Discovered LLDP neighbors via lldpd |
-| **Routing Table** | `vtysh -c 'show ip route json'` | Consolidated kernel and FRR protocol routes |
-| **ARP Table** | `ip -j neigh show` | Layer 3 neighbor table with learned MACs |
-| **Config Backup** | `vtysh -c 'show running-config'` | Integrated FRR daemon running configuration |
+| Data Element | Primary FRR Command | Plain-Linux Fallback (No `vtysh`) | Notes |
+| :--- | :--- | :--- | :--- |
+| **System Info & Version** | `hostname -s`, `vtysh -c 'show version'` | `hostname -s`, `cat /etc/os-release` | Extracts FRR daemon version or Linux distro release |
+| **L3 & Physical Interfaces** | `vtysh -c 'show interface json'` | `ip -s -j link show`, `ip -j -4 addr show` | Native JSON interface inventory, MACs, counters, and CIDRs |
+| **Topology Neighbors** | `lldpcli show neighbors -f json` | `lldpcli show neighbors -f json` | Discovered LLDP neighbors via `lldpd` |
+| **Routing Table** | `vtysh -c 'show ip route json'` | `ip -j route show` | Consolidated kernel and FRR protocol routes |
+| **ARP Table** | `ip -j neigh show` | `ip -j neigh show` | Layer 3 neighbor table with learned MACs |
+| **Config Backup** | `vtysh -c 'show running-config'` | N/A | Integrated FRR daemon running configuration |
 
 ## 4. Platform Gotchas & Safety
 * **vtysh Single Command Execution**: Executing `vtysh -c '<cmd>'` avoids entering an interactive VTY shell, eliminating prompt hang risks and ensuring strict read-only execution.

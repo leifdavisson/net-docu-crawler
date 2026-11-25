@@ -1,5 +1,6 @@
 <!--
 Copyright (C) 2026 Leif Davisson <leifdavisson@gmail.com>
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -65,7 +66,7 @@ Net-Docu-Crawler runs on Python (version 3.10 or newer). Follow the instructions
      ```powershell
      python --version
      ```
-   - If it prints `Python 3.10.x` (or 3.11, 3.12, 3.13, 3.14), you are ready for Step 3!
+   - If it prints `Python 3.10.x`, `3.11.x`, or `3.12.x`, you are ready for Step 3! *(On Windows, stick to Python **3.10–3.12** so all networking libraries install from prebuilt binary wheels without needing a C++ compiler. You can also run `powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 -Fix` inside the cloned folder to assess and install prerequisites automatically into `.venv`.)*
 3. **If Python is NOT installed or opens the Windows Store**:
    - Go to [https://www.python.org/downloads/](https://www.python.org/downloads/) in your web browser.
    - Click the big yellow **Download Python** button.
@@ -90,7 +91,7 @@ Net-Docu-Crawler runs on Python (version 3.10 or newer). Follow the instructions
 
 ## 3. Phase 2: Download the Project and Install Helpers
 
-In your PowerShell or Terminal window, run these commands one at a time:
+Net-Docu-Crawler uses [Netmiko](https://github.com/ktbyers/netmiko), [Paramiko](https://www.paramiko.org/), and [netaddr](https://netaddr.readthedocs.io/). In your PowerShell or Terminal window, create a local `.venv` and install the package:
 
 ```bash
 # 1. Download the crawler code to your laptop
@@ -99,11 +100,13 @@ git clone https://github.com/leifdavisson/net-docu-crawler.git
 # 2. Enter the crawler directory
 cd net-docu-crawler
 
-# 3. Install the required helper libraries (Netmiko, Paramiko, netaddr)
-pip install -r requirements.txt
+# 3. Create an isolated virtual environment (.venv) and install Net-Docu-Crawler
+python3 -m venv .venv
+source .venv/bin/activate          # Windows PowerShell: .\.venv\Scripts\Activate.ps1
+pip install -e .                   # installs runtime deps + `net-crawler` CLI
 ```
 
-*(Note for Linux/Mac users: If `pip` says command not found, use `pip3 install -r requirements.txt`).*
+*(Windows automated option: run `powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 -Fix` to create `.venv` and install prebuilt wheels automatically. Runtime-only alternative without the `net-crawler` CLI wrapper: `pip install -r requirements.txt`.)*
 
 ---
 
@@ -123,20 +126,25 @@ To log into switches and read their port statuses, the crawler needs your manage
      cp credentials.example.json credentials.json
      nano credentials.json
      ```
-2. You will see a file that looks like this:
+2. `credentials.example.json` ships with vendor-tagged default profiles. Replace its contents with your site credentials using the canonical schema (`name`, `vendor`, `username`, `password`, `secret`):
    ```json
    [
      {
+       "name": "Site-Cisco-Switches",
+       "vendor": "cisco",
        "username": "admin",
        "password": "YourSwitchPasswordHere",
-       "enable_secret": ""
+       "secret": ""
      }
    ]
    ```
-3. Replace `"admin"` with your actual switch admin username.
-4. Replace `"YourSwitchPasswordHere"` with your switch password.
-5. If your network uses Cisco devices with an "enable" password, put that in `"enable_secret"`. Otherwise, leave it as `""`.
-6. Press `Ctrl + S` to save the file, then close Notepad.
+3. Set `"vendor"` to the matching platform tag (e.g., `"cisco"`, `"cisco_xr"`, `"ciscosmb"`, `"juniper"`, `"arista"`, `"hpprocurve"`, `"aruba"`, `"mikrotik"`, `"fortinet"`, `"paloalto"`, `"opnsense"`, `"openwrt"`, `"frrouting"`), or omit `"vendor"` for a shared TACACS+/RADIUS account.
+4. Replace `"admin"` and `"YourSwitchPasswordHere"` with your real management username and password.
+5. If your network uses Cisco or Arista devices with an "enable" password, put that in `"secret"` (otherwise leave it as `""`). *(Note: `"enable_secret"` is deprecated; always use `"secret"`.)*
+6. Save the file, close your editor, and validate syntax before crawling:
+   ```bash
+   python3 net_crawler.py --validate-credentials --credentials credentials.json
+   ```
 
 > [!NOTE]
 > **Password Privacy Guarantee**:
@@ -198,14 +206,14 @@ To discover every active switch across an entire `/24` subnet:
 ```bash
 python net_crawler.py --targets 192.168.1.0/24 --organize
 ```
-*(The crawler checks port 22 first, so it only attempts SSH logins on devices that actually listen on SSH, ignoring standard computers and printers).*
+*(The crawler pre-scans SSH port 22 and Telnet port 23 by default, so it only attempts CLI logins on reachable management hosts, ignoring standard workstations and printers).*
 
 ### What if a Switch Has a Custom or Non-Standard Banner?
 If the crawler says `Unknown Vendor` because a switch has a custom login message, tell it the brand using `--vendor-hint`:
 ```bash
 python net_crawler.py --targets 192.168.1.1 --vendor-hint cisco --organize
 ```
-*(Supported hints: `cisco`, `ciscosmb`, `juniper`, `arista`, `hpprocurve`, `aruba`, `mikrotik`, `fortinet`, `paloalto`, `opnsense`, `openwrt`, `frr`)*.
+*(Supported canonical hints: `cisco`, `cisco_xr`, `ciscosmb`, `juniper`, `arista`, `hpprocurve`, `aruba`, `mikrotik`, `fortinet`, `paloalto`, `opnsense`, `openwrt`, `frrouting`; common aliases like `frr`, `iosxr`, `hp`, `procurve` are also recognized)*.
 
 ---
 
@@ -216,12 +224,20 @@ By default (or when you pass `--organize`), the crawler creates a neat, timestam
 ```text
 deliverables/192.168.1.0-24_20261108_143000_lan/
 ├── Network_Analysis.md
+├── cutover_runbook.md
 ├── asset_inventory.csv
+├── bom_hardware_sizing.csv
 ├── migration_cabling_matrix.csv
+├── port_mac_endpoint_mapping.csv
 ├── L2_network_diagrams.md
 ├── L3_network_diagrams.md
+├── topology_interactive.html
 ├── net_docu_crawler_live_report.md
+├── trunk_vlan_audit.md
+├── manual_followup_report.md
 ├── cisco_to_target_translation.md
+├── failed_hosts.json
+├── 00_manifest/ ... 05_reports/
 └── logs/
 ```
 
@@ -279,7 +295,7 @@ flowchart TD
     ```bash
     ssh admin@192.168.1.1
     ```
-  - **Account Lockout Safety**: Net-Docu-Crawler will **never try more than one password per username**. It will never lock out your company Active Directory or TACACS+ account.
+  - **Account Lockout Safety**: Tag each profile in `credentials.json` with `"vendor"` so only matching profiles are tried against each device, and avoid placing multiple different passwords for the same Active Directory/TACACS+ username in `credentials.json`. Net-Docu-Crawler scopes credentials by detected vendor and enforces per-host authentication attempt limits to protect AD and TACACS+ accounts from lockout.
 
 ### 5. `"Connection Timed Out"`
 * **Why it happens**: Your computer sent packets to the switch, but received zero replies after 10 seconds.
@@ -311,7 +327,7 @@ As you grow in your network engineering career, understanding **why** production
 * **Lockout Policy**: Security policies routinely lock out an Active Directory account if it fails 3 to 5 consecutive login attempts.
 * **The Scripting Trap**: A naive crawler iterating through 10 passwords against 50 switches could attempt 500 bad logins, locking out the enterprise network engineering service account across the entire company within seconds.
 * **How Net-Docu-Crawler Protects AAA Accounts**:
-  The crawler maintains a strict attempt ledger: **no username is ever tried more than once against a given target IP**. If `admin` fails with Password A, the crawler will never retry `admin` on that device during the session.
+  The crawler pre-identifies each target's vendor, scopes candidate profiles to matching `"vendor"` tags (plus untagged profiles), deduplicates failed login attempts per host, and aborts non-authentication transport errors immediately. Best practice: tag every profile with `"vendor"` and avoid configuring multiple conflicting passwords for the same centralized TACACS+/RADIUS username.
 
 ---
 

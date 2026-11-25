@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 * **Driver Class**: [`AristaDriver`](../../net_docu_crawler/drivers/arista.py)
 * **Supported Platforms**: Arista 7000-Series, vEOS, cEOS, Fixed & Modular Spine/Leaf Switches
-* **Upstream Netmiko Device Type**: `arista_eos`
+* **Upstream Netmiko Device Type**: `arista_eos` ([Netmiko](https://github.com/ktbyers/netmiko))
 * **Official Documentation**: [Arista EOS Manual & CLI Documentation](https://www.arista.com/en/um-eos)
 
 ---
@@ -48,9 +48,11 @@ username crawler role network-operator secret 0 <password>
 
 | Data Element | Primary Native JSON Command | Text Fallback |
 | :--- | :--- | :--- |
-| **System Info & Serial** | `show version \| json` | `show version` |
-| **L3 Interfaces** | `show ip interface brief \| json` | `show ip interface brief` |
-| **Physical Interface Stats** | `show interfaces status \| json` | `show interfaces status` |
+| **System Info & Serial** | `show version \| json`, `show hostname \| json` | `show version` *(prompt / config fallback)* |
+| **L3 Interfaces** | `show ip interface \| json` | `show ip interface brief` |
+| **Physical Interface Stats** | `show interfaces \| json` | `show interfaces` |
+| **L2 Trunk & LAG Telemetry** | `show interfaces trunk \| json`<br>`show port-channel summary \| json` | `show interfaces trunk`<br>`show port-channel summary` |
+| **Spanning Tree (STP)** | `show spanning-tree \| json` | `show spanning-tree` |
 | **Topology Neighbors** | `show lldp neighbors detail \| json` | `show lldp neighbors detail` |
 | **Routing Table** | `show ip route \| json` | `show ip route` |
 | **ARP Table** | `show ip arp \| json` | `show ip arp` |
