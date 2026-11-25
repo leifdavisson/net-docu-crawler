@@ -44,24 +44,62 @@ def _route_sort_key(rt: dict) -> tuple:
 def normalize_interface_name(name):
     if not name:
         return ""
-    name = re.sub(r"\.0$", "", name.lower().strip().strip('"').strip("'"))
-    replacements = {
-        "gigabitethernet": "gi",
-        "tengigabitethernet": "te",
-        "fastethernet": "fa",
-        "ethernet": "et",
-        "fortygigabitethernet": "fo",
-        "hundredgige": "hu",
-        "hundredgigabitethernet": "hu",
-        "fivegigabitethernet": "fi",
-        "twopointfivegigabitethernet": "tw",
-        "port-channel": "po",
-        "bundle-ether": "be",
-    }
-    for full, short in replacements.items():
+    name = re.sub(r"\.0$", "", str(name).lower().strip().strip('"').strip("'"))
+    # Order longest prefixes first to prevent partial prefix collisions (e.g. twentyfive vs two)
+    replacements = (
+        ("twentyfivegigabitethernet", "twe"),
+        ("twentyfivegige", "twe"),
+        ("twopointfivegigabitethernet", "tw"),
+        ("hundredgigabitethernet", "hu"),
+        ("hundredgige", "hu"),
+        ("fortygigabitethernet", "fo"),
+        ("fortygige", "fo"),
+        ("tengigabitethernet", "te"),
+        ("tengige", "te"),
+        ("fivegigabitethernet", "fi"),
+        ("gigabitethernet", "gi"),
+        ("fastethernet", "fa"),
+        ("port-channel", "po"),
+        ("bundle-ether", "be"),
+        ("ethernet", "et"),
+    )
+    for full, short in replacements:
         if name.startswith(full):
-            return name.replace(full, short)
+            return short + name[len(full) :]
     return name
+
+
+def _parse_interface_network_strict(ip_str, mask_hint=None):
+    """
+    Parse multi-vendor interface IP representations into (clean_ip, IPNetwork | None, mask_known: bool).
+    Does NOT fabricate a /24 mask when no CIDR prefix or netmask was provided.
+    """
+    if not ip_str:
+        return "", None, False
+    raw = str(ip_str).strip()
+    if raw.lower() in ("unassigned", "down", "up", "unset", "n/a", "none", "0.0.0.0"):
+        return "", None, False
+
+    clean_ip = raw.split("/")[0].split()[0].strip()
+    net = None
+    mask_known = False
+    try:
+        if "/" in raw:
+            net = IPNetwork(raw.split()[0])
+            mask_known = True
+        elif " " in raw:
+            parts = raw.split()
+            net = IPNetwork(f"{parts[0]}/{parts[1]}")
+            mask_known = True
+        elif mask_hint:
+            net = IPNetwork(f"{clean_ip}/{str(mask_hint).lstrip('/')}")
+            mask_known = True
+    except (AddrFormatError, ValueError, TypeError) as exc:
+        logger.debug("Failed to parse interface network from %r (mask_hint=%r): %s", ip_str, mask_hint, exc)
+        net = None
+        mask_known = False
+
+    return clean_ip, net, mask_known
 
 
 def parse_interface_network(ip_str, mask_hint=None):
@@ -72,80 +110,68 @@ def parse_interface_network(ip_str, mask_hint=None):
       - Space-separated netmask: '192.168.1.252 255.255.255.0'
       - Bare IP + optional config mask hint: '192.168.1.3', mask_hint='255.255.255.0'
     """
-    if not ip_str:
-        return "", None
-    raw = ip_str.strip()
-    if raw.lower() in ("unassigned", "down", "up", "unset", "n/a", "none", "0.0.0.0"):
-        return "", None
-
-    clean_ip = raw.split("/")[0].split()[0].strip()
-    net = None
-    try:
-        if "/" in raw:
-            net = IPNetwork(raw.split()[0])
-        elif " " in raw:
-            parts = raw.split()
-            net = IPNetwork(f"{parts[0]}/{parts[1]}")
-        elif mask_hint:
-            net = IPNetwork(f"{clean_ip}/{mask_hint.lstrip('/')}")
-        else:
+    clean_ip, net, mask_known = _parse_interface_network_strict(ip_str, mask_hint=mask_hint)
+    if clean_ip and not mask_known:
+        try:
             net = IPNetwork(f"{clean_ip}/24")
-    except (AddrFormatError, ValueError, TypeError) as exc:
-        logger.debug("Failed to parse interface network from %r (mask_hint=%r): %s", ip_str, mask_hint, exc)
-        net = None
-
+        except (AddrFormatError, ValueError, TypeError) as exc:
+            logger.debug("Failed fallback /24 network parse for %r: %s", ip_str, exc)
+            net = None
     return clean_ip, net
 
 
 def get_link_speed(local_port, interfaces_detail):
     norm_local = normalize_interface_name(local_port)
+    raw_low = str(local_port or "").strip().lower()
 
     # 1. Try to find in interfaces_detail
-    for name, stats in interfaces_detail.items():
+    for name, stats in (interfaces_detail or {}).items():
         if normalize_interface_name(name) == norm_local:
-            speed_str = stats.get("speed", "").lower()
+            speed_str = str((stats or {}).get("speed", "")).lower()
             if speed_str:
                 if "100g" in speed_str or "100000" in speed_str:
                     return "100G"
-                elif "40g" in speed_str or "40000" in speed_str:
+                if "40g" in speed_str or "40000" in speed_str:
                     return "40G"
-                elif "10g" in speed_str or "10000" in speed_str:
+                if "25g" in speed_str or "25000" in speed_str:
+                    return "25G"
+                if "10g" in speed_str or "10000" in speed_str:
                     return "10G"
-                elif "5g" in speed_str or "5000" in speed_str:
+                if "5g" in speed_str or "5000" in speed_str:
                     return "5G"
-                elif "2.5g" in speed_str or "2500" in speed_str:
+                if "2.5g" in speed_str or "2500" in speed_str:
                     return "2.5G"
-                elif "1000m" in speed_str or "1g" in speed_str or "1000" in speed_str:
+                if "1000m" in speed_str or "1g" in speed_str or "1000" in speed_str:
                     return "1G"
-                elif "100m" in speed_str or "100" in speed_str:
+                if "100m" in speed_str or "100" in speed_str:
                     return "100M"
-                elif "10m" in speed_str or "10" in speed_str:
+                if "10m" in speed_str or re.search(r"\b10\b", speed_str):
                     return "10M"
 
-    # 2. Fallback to guessing from interface name
-    if "hu" in norm_local or "hundred" in norm_local:
+    # 2. Fallback to anchored prefix inference (never bare substring checks)
+    if re.match(r"^(?:hu|hundred|et-\d)", norm_local) or raw_low.startswith("et-"):
         return "100G"
-    elif "fo" in norm_local or "forty" in norm_local:
+    if re.match(r"^(?:fo|forty|qsfp)", norm_local):
         return "40G"
-    elif "te" in norm_local or "ten" in norm_local:
+    if re.match(r"^(?:twe|twentyfive|25ge)", norm_local) or raw_low.startswith(("twe", "twentyfive", "25ge")):
+        return "25G"
+    if re.match(r"^(?:xe-|te(?:\d|$)|ten|10ge)", norm_local) or raw_low.startswith(("xe-", "tengig", "10ge")):
         return "10G"
-    elif "fi" in norm_local or "five" in norm_local:
+    if re.match(r"^(?:fi\d|fivegig)", norm_local):
         return "5G"
-    elif "tw" in norm_local or "twopointfive" in norm_local:
+    if re.match(r"^(?:tw\d|twopointfive)", norm_local):
         return "2.5G"
-    elif "gi" in norm_local or "gig" in norm_local:
+    if re.match(r"^(?:ge-|gi|gig|vtnet|ether|eth\d|et\d|port\d|swp)", norm_local):
         return "1G"
-    elif "fa" in norm_local or "fast" in norm_local:
+    if re.match(r"^(?:fe-|fa\d|fast)", norm_local):
         return "100M"
-    elif "et" in norm_local or "eth" in norm_local:
-        return "10M"
 
     return "1G"  # Default to 1G if unknown
 
 
 def get_route_details(route):
     """
-    Extracts subnet, protocol, next_hop, and interface from a route dict,
+    Extracts subnet, protocol, next_hop, interface, and admin_distance from a route dict,
     handling different formats (e.g. parsed vs simulated).
     """
     # Subnet extraction
@@ -182,12 +208,69 @@ def get_route_details(route):
     # Interface extraction
     interface = route.get("interface") or ""
 
-    return {"subnet": subnet, "protocol": protocol, "next_hop": next_hop, "interface": interface}
+    # Administrative distance / preference (None when not reported)
+    admin_distance = route.get("admin_distance")
+    if admin_distance is None or admin_distance == "":
+        admin_distance = route.get("preference")
+    if admin_distance is None or admin_distance == "":
+        admin_distance = route.get("distance")
+
+    return {
+        "subnet": subnet,
+        "protocol": protocol,
+        "next_hop": next_hop,
+        "interface": interface,
+        "admin_distance": admin_distance,
+    }
+
+
+_PLACEHOLDER_SERIALS = frozenset(
+    {
+        "",
+        "unknown",
+        "not specified",
+        "0",
+        "default string",
+        "none",
+        "n/a",
+        "to be filled by o.e.m.",
+        "system serial number",
+        "chassis serial number",
+        "openwrt-virtual",
+        "empty",
+        "virtual",
+    }
+)
+_GENERIC_DEFAULT_HOSTNAMES = frozenset(
+    {
+        "",
+        "unknown",
+        "openwrt",
+        "mikrotik",
+        "opnsense",
+        "pfsense",
+        "localhost",
+        "router",
+        "switch",
+        "firewall",
+        "frr",
+        "debian",
+        "ubuntu",
+        "vyos",
+        "arista",
+        "cisco",
+        "juniper",
+        "fortigate",
+        "procurve",
+        "aruba",
+    }
+)
 
 
 def get_unique_devices(devices):
     """
-    De-duplicates devices based on Serial Number (primary) and Hostname (fallback).
+    De-duplicates devices based on Serial Number (primary) and Hostname (fallback only when
+    no unique valid hardware serial is present and hostname is non-generic).
     If a device was discovered/crawled via multiple SVIs, it only keeps one primary instance.
     """
     if not devices:
@@ -197,10 +280,6 @@ def get_unique_devices(devices):
     seen_serials = set()
     seen_hostnames = set()
 
-    # Sort IPs so that we prioritize:
-    # 1. Successful crawls over failed ones
-    # 2. SSH over Telnet
-    # 3. Alphabetical/numerical ordering of IP for determinism
     def ip_sort_key_internal(ip):
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
             return [int(x) for x in ip.split(".")]
@@ -220,24 +299,31 @@ def get_unique_devices(devices):
 
     for ip in sorted_ips:
         dev = devices[ip]
-        serial = dev.get("serial")
-        hostname = dev.get("hostname")
+        serial = str(dev.get("serial") or "").strip()
+        hostname = str(dev.get("hostname") or "").strip()
 
         is_duplicate = False
         duplicate_reason = ""
 
-        # Check Serial number uniqueness
-        if serial and serial != "Unknown" and serial.strip():
-            serial_clean = serial.strip().upper()
+        # Check Serial number uniqueness (ignoring placeholder VM/SMBIOS serials)
+        has_valid_serial = bool(serial) and serial.lower() not in _PLACEHOLDER_SERIALS
+        if has_valid_serial:
+            serial_clean = serial.upper()
             if serial_clean in seen_serials:
                 is_duplicate = True
                 duplicate_reason = f"duplicate serial {serial_clean}"
             else:
                 seen_serials.add(serial_clean)
 
-        # Check Hostname uniqueness as fallback
-        if not is_duplicate and hostname and hostname != "Unknown" and hostname.strip():
-            host_clean = hostname.strip().lower()
+        # Check Hostname uniqueness ONLY as fallback when serial is absent/placeholder and hostname is non-generic
+        host_clean = hostname.lower()
+        if (
+            not is_duplicate
+            and not has_valid_serial
+            and host_clean
+            and host_clean not in _GENERIC_DEFAULT_HOSTNAMES
+            and not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host_clean)
+        ):
             if host_clean in seen_hostnames:
                 is_duplicate = True
                 duplicate_reason = f"duplicate hostname {host_clean}"
@@ -259,7 +345,6 @@ def get_unique_devices(devices):
             f"  [+] Retained {len(unique_devices)} unique physical devices out of {len(devices)} discovered SVI endpoints.\n"
         )
 
-    # Return unique devices sorted by IP for consistency
     def ip_sort_key(ip):
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
             return [int(x) for x in ip.split(".")]
@@ -276,8 +361,63 @@ def _is_network_infra(dev: dict) -> bool:
     status = str(dev.get("status", "success")).strip().lower()
     if status != "success":
         return False
+    rc = str(dev.get("record_class") or "").strip().lower()
+    if rc and rc != "crawled_infra":
+        return False
     dtype = str(dev.get("device_type") or dev.get("device_persona") or "switch").strip().lower()
     return dtype in _INFRA_DEVICE_TYPES
+
+
+def _device_section_status(dev: dict, section: str, fallback_section: str = "") -> str:
+    """
+    Return the explicit collection_status for `section` on `dev`, or '' for legacy records
+    that predate Schema v2.1 collection_status tracking.
+    """
+    cs = dev.get("collection_status")
+    if not isinstance(cs, dict) or not cs:
+        return ""
+    if section in cs:
+        return str(cs[section]).strip().lower()
+    if fallback_section and fallback_section in cs:
+        return str(cs[fallback_section]).strip().lower()
+    return ""
+
+
+def _section_availability_summary(devices_dict: dict, section: str, fallback_section: str = "") -> dict:
+    """
+    Summarize Schema v2.1 collection_status counts across `devices_dict` for a report section.
+    Never conflates `command_failed`, `parse_failed`, or `not_collected` with `ok`.
+    """
+    failed_hosts: list[str] = []
+    not_collected_hosts: list[str] = []
+    ok_hosts: list[str] = []
+    na_hosts: list[str] = []
+    legacy_hosts: list[str] = []
+
+    for ip, dev in devices_dict.items():
+        host = dev.get("hostname") or ip
+        st = _device_section_status(dev, section, fallback_section=fallback_section)
+        if st in ("command_failed", "parse_failed"):
+            failed_hosts.append(f"{host} ({st})")
+        elif st == "not_collected":
+            not_collected_hosts.append(host)
+        elif st in ("ok", "partial"):
+            ok_hosts.append(host)
+        elif st == "not_applicable":
+            na_hosts.append(host)
+        else:
+            legacy_hosts.append(host)
+
+    return {
+        "total": len(devices_dict),
+        "ok_hosts": ok_hosts,
+        "failed_hosts": failed_hosts,
+        "not_collected_hosts": not_collected_hosts,
+        "na_hosts": na_hosts,
+        "legacy_hosts": legacy_hosts,
+        "has_failures": bool(failed_hosts),
+        "has_gaps": bool(failed_hosts or not_collected_hosts),
+    }
 
 
 def generate_asset_inventory(devices, output_path="asset_inventory.csv", infra_only: bool = False):
@@ -1745,21 +1885,71 @@ def generate_l3_diagram(devices, output_path="L3_network_diagrams.md"):
         ]
     )
 
+    from net_docu_crawler.migration_parsers import extract_vrfs_and_acls
+
     vrf_found = False
     for ip, dev in infra_devices.items():
         hostname = dev.get("hostname") or ip
+        vrf_entries: dict[str, dict] = {}
+        for item in dev.get("vrfs") or []:
+            if isinstance(item, dict):
+                vname = str(item.get("name") or "").strip()
+                if vname:
+                    vrf_entries[vname] = {
+                        "name": vname,
+                        "type": str(item.get("type") or "vrf"),
+                        "rd": str(item.get("rd") or ""),
+                        "interfaces": list(item.get("interfaces") or []),
+                    }
+            elif isinstance(item, str) and item.strip():
+                vname = item.strip()
+                vrf_entries.setdefault(vname, {"name": vname, "type": "vrf", "rd": "", "interfaces": []})
+
         cfg = dev.get("raw_config", "")
-        vrfs = list(set(re.findall(r"(?:ip vrf|vrf definition)\s+(\S+)", cfg)))
-        if vrfs:
+        if cfg:
+            parsed_vrfs, _ = extract_vrfs_and_acls(cfg, vendor=dev.get("vendor", ""))
+            for pv in parsed_vrfs:
+                vname = str(pv.get("name") or "").strip()
+                if not vname:
+                    continue
+                existing = vrf_entries.setdefault(
+                    vname,
+                    {"name": vname, "type": str(pv.get("type") or "vrf"), "rd": "", "interfaces": []},
+                )
+                if not existing["rd"] and pv.get("rd"):
+                    existing["rd"] = str(pv["rd"])
+                for pif in pv.get("interfaces") or []:
+                    if pif not in existing["interfaces"]:
+                        existing["interfaces"].append(pif)
+
+        if vrf_entries:
             vrf_found = True
             lines.append(f"\n### {hostname} VRF Instances:")
-            for vrf in vrfs:
-                lines.append(f"* **VRF Name:** `{vrf}`")
+            for vname in sorted(vrf_entries.keys()):
+                vinfo = vrf_entries[vname]
+                details = []
+                if vinfo.get("type") and vinfo["type"] != "vrf":
+                    details.append(f"Type: `{vinfo['type']}`")
+                if vinfo.get("rd"):
+                    details.append(f"RD: `{vinfo['rd']}`")
+                if vinfo.get("interfaces"):
+                    if_str = ", ".join(f"`{i}`" for i in sorted(vinfo["interfaces"]))
+                    details.append(f"Interfaces: {if_str}")
+                suffix = f" ({'; '.join(details)})" if details else ""
+                lines.append(f"* **VRF Name:** `{vname}`{suffix}")
 
     if not vrf_found:
-        lines.append(
-            "\nNo virtual routing and forwarding (VRF) instances were detected in active device configurations (standard global table only)."
-        )
+        vrf_avail = _section_availability_summary(infra_devices, "vrfs", fallback_section="running_config")
+        if vrf_avail["has_gaps"]:
+            gap_hosts = vrf_avail["failed_hosts"] + vrf_avail["not_collected_hosts"]
+            lines.append(
+                f"\n⚠️ **VRF Data Not Collected / Collection Failed** on {len(gap_hosts)}/{vrf_avail['total']} device(s) "
+                f"({', '.join(gap_hosts[:8])}); cannot verify whether VRFs are configured."
+            )
+        else:
+            lines.append(
+                "\nNo virtual routing and forwarding (VRF) instances were detected in active device configurations (standard global table only)."
+            )
 
     # Complete Routing Tables (summarizing /32 Access-internal / Local / Host routes per (protocol, interface))
     lines.extend(
@@ -1909,23 +2099,31 @@ def _render_l1_l2_cabling_and_errors_section(devices: dict) -> list[str]:
 
 
 def _render_port_utilization_section(devices: dict) -> list[str]:
-    """Render interface port utilization summary table across succeeded devices."""
-    lines = [
-        "\n### Interface Port Utilization Summary",
-        "| Switch Hostname | Connected Ports | Total Ports | Utilization % |",
-        "| --- | --- | --- | --- |",
-    ]
+    """Render interface port utilization summary table across succeeded infrastructure devices."""
+    rows = []
     for ip, dev in devices.items():
-        if dev.get("status", "success") != "success":
+        if not _is_network_infra(dev):
             continue
         ints_detail = dev.get("interfaces_detail", {})
         total = len(ints_detail)
         if total == 0:
             continue
         hostname = dev.get("hostname") or ip
-        connected = sum(1 for stats in ints_detail.values() if stats.get("status") == "up")
+        connected = sum(1 for stats in ints_detail.values() if str((stats or {}).get("status", "")).lower() == "up")
         pct = (connected / total * 100) if total > 0 else 0
-        lines.append(f"| {hostname} | {connected} | {total} | {pct:.1f}% |")
+        rows.append(f"| {hostname} | {connected} | {total} | {pct:.1f}% |")
+
+    lines = ["\n### Interface Port Utilization Summary"]
+    if rows:
+        lines.extend(
+            [
+                "| Switch Hostname | Connected Ports | Total Ports | Utilization % |",
+                "| --- | --- | --- | --- |",
+                *rows,
+            ]
+        )
+    else:
+        lines.append("  * No physical interface telemetry was collected for port utilization calculation.")
     return lines
 
 
@@ -1934,14 +2132,23 @@ def _render_stp_audit_section(devices: dict) -> list[str]:
     lines = ["\n### Loop Risks & Spanning Tree (STP) Audit"]
     stp_issues = []
     stp_blocked_lines = []
+    stp_unverified = []
     audited_switches = 0
 
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
         hostname = dev.get("hostname") or ip
-        stp = dev.get("stp", {})
-        dev_type = dev.get("device_type", "switch").lower()
+        stp = dev.get("stp", {}) or {}
+        dev_type = str(dev.get("device_type") or dev.get("device_persona") or "switch").lower()
+        stp_cs = _device_section_status(dev, "stp")
+
+        if stp_cs in ("command_failed", "parse_failed", "not_collected"):
+            if dev_type == "switch":
+                stp_unverified.append(
+                    f"* **{hostname}**: **STP telemetry unavailable** (`collection_status={stp_cs}`) — verify Spanning Tree state manually."
+                )
+            continue
 
         if not stp.get("enabled"):
             if dev_type == "switch":
@@ -1967,7 +2174,9 @@ def _render_stp_audit_section(devices: dict) -> list[str]:
         lines.extend(stp_blocked_lines)
     if stp_issues:
         lines.extend(stp_issues)
-    if not stp_blocked_lines and not stp_issues:
+    if stp_unverified:
+        lines.extend(stp_unverified)
+    if not stp_blocked_lines and not stp_issues and not stp_unverified:
         lines.append(
             f"  * Spanning Tree is active on all {audited_switches} Layer 2 switch(es) with zero loop-blocked ports "
             "(Layer 3 routers, firewalls, and wireless APs excluded from L2 STP requirement)."
@@ -2007,38 +2216,54 @@ def _render_interface_descriptions_section(devices: dict) -> list[str]:
 
 
 def _render_subnet_overlap_section(devices: dict) -> list[str]:
-    """Render overlapping subnets and duplicate IP address space conflict warnings."""
+    """Render overlapping subnets and duplicate IP address space conflict warnings (VRF- and mask-aware)."""
     lines = ["### Overlapping Subnets & IP Space Conflicts"]
     ip_subnets = []
+    fhrp_vips: set[str] = set()
 
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
+        for f_item in dev.get("fhrp") or []:
+            vip = str(f_item.get("vip") or "").split("/")[0].strip()
+            if vip:
+                fhrp_vips.add(vip)
         hostname = dev.get("hostname") or ip
         raw_config = dev.get("raw_config", "")
         config_ips = parse_interface_ips_from_config(raw_config) if raw_config else {}
+        iface_vrf_map: dict[str, str] = {}
+        for vrec in dev.get("vrfs") or []:
+            if isinstance(vrec, dict):
+                vname = str(vrec.get("name") or "").strip().lower()
+                for vif in vrec.get("interfaces") or []:
+                    iface_vrf_map[normalize_interface_name(vif)] = vname
         for intf in dev.get("l3_interfaces", []):
             intf_name = intf.get("interface")
             intf_ip = intf.get("ip_address")
             if intf_ip and intf_ip not in ["unassigned", "down", "up", "unset"]:
                 norm_name = normalize_interface_name(intf_name)
                 _ip_from_cfg, mask_from_cfg = config_ips.get(norm_name, (None, None))
-                clean_ip, net = parse_interface_network(intf_ip, mask_from_cfg)
-                if net and clean_ip and not clean_ip.startswith(("127.", "128.0.")):
-                    ip_subnets.append((hostname, intf_name, clean_ip, net))
+                clean_ip, net, mask_known = _parse_interface_network_strict(intf_ip, mask_from_cfg)
+                if clean_ip and not clean_ip.startswith(("127.", "128.0.")):
+                    vrf_name = str(intf.get("vrf") or iface_vrf_map.get(norm_name) or "default").strip().lower()
+                    ip_subnets.append((hostname, intf_name, clean_ip, net, mask_known, vrf_name))
 
     ip_conflicts = []
     subnet_overlaps = []
     for i in range(len(ip_subnets)):
         for j in range(i + 1, len(ip_subnets)):
-            h1, int1, ip1, net1 = ip_subnets[i]
-            h2, int2, ip2, net2 = ip_subnets[j]
+            h1, int1, ip1, net1, mk1, vrf1 = ip_subnets[i]
+            h2, int2, ip2, net2, mk2, vrf2 = ip_subnets[j]
+            if vrf1 != vrf2:
+                continue
             if ip1 == ip2 and (h1 != h2 or int1 != int2):
-                ip_conflicts.append((h1, int1, ip1, h2, int2, ip2))
-            elif h1 == h2 and int1 != int2 and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
-                subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
-            elif h1 != h2 and net1.cidr != net2.cidr and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
-                subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
+                if ip1 not in fhrp_vips:
+                    ip_conflicts.append((h1, int1, ip1, h2, int2, ip2))
+            elif mk1 and mk2 and net1 is not None and net2 is not None:
+                if h1 == h2 and int1 != int2 and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
+                    subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
+                elif h1 != h2 and net1.cidr != net2.cidr and (net1.cidr in net2.cidr or net2.cidr in net1.cidr):
+                    subnet_overlaps.append((h1, int1, net1, h2, int2, net2))
 
     overlap_found = False
     if ip_conflicts:
@@ -2146,10 +2371,21 @@ def _render_l4_l7_services_and_gaps_section(devices: dict) -> list[str]:
     gaps = []
     for ip, dev in devices.items():
         hostname = dev.get("hostname") or ip
-        mgmt = dev.get("mgmt_method", "SSH")
-        services = dev.get("services", {})
-        if mgmt == "Telnet":
+        status_l = str(dev.get("status", "success")).strip().lower()
+        mgmt = str(dev.get("mgmt_method", "SSH"))
+        is_infra = _is_network_infra(dev)
+        # Flag unencrypted Telnet on crawled infra and unauthenticated targets (not passive/unsupported servers)
+        if (is_infra or status_l == "unauthenticated") and "telnet" in mgmt.lower():
             gaps.append(f"* **{hostname}** is using unencrypted **Telnet** for management interface (Security risk).")
+        if not is_infra:
+            continue
+        serv_cs = _device_section_status(dev, "services", fallback_section="running_config")
+        if serv_cs in ("command_failed", "parse_failed", "not_collected"):
+            gaps.append(
+                f"* **{hostname}** services configuration was not collected (`{serv_cs}`) — unable to verify NTP/DNS/AAA."
+            )
+            continue
+        services = dev.get("services", {}) or {}
         if not services.get("ntp_servers"):
             gaps.append(f"* **{hostname}** has **no NTP servers** configured (Log timestamps may be out of sync).")
         if not services.get("dns_servers"):
@@ -2171,9 +2407,8 @@ def _render_poe_and_control_plane_section(devices: dict) -> list[str]:
     lines = [
         "\n## 5. Migration Intent, Control-Plane, & Hardware Sizing",
         "\n### PoE Power Budget & Optical Transceiver Summary",
-        "| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+    poe_rows = []
     peer_rows = []
     fhrp_rows = []
     for ip, dev in devices.items():
@@ -2186,7 +2421,7 @@ def _render_poe_and_control_plane_section(devices: dict) -> list[str]:
         poe_ports = len(poe.get("ports", {}) or {})
         optics_cnt = len(dev.get("optics", []) or [])
         if tot_w > 0 or used_w > 0 or poe_ports > 0 or optics_cnt > 0:
-            lines.append(f"| {hostname} | {ip} | {tot_w:.1f} | {used_w:.1f} | {poe_ports} | {optics_cnt} |")
+            poe_rows.append(f"| {hostname} | {ip} | {tot_w:.1f} | {used_w:.1f} | {poe_ports} | {optics_cnt} |")
         for p in dev.get("routing_peers", []) or []:
             peer_rows.append(
                 f"| {hostname} | {p.get('protocol', '').upper()} | {p.get('neighbor_ip', '')} | "
@@ -2197,6 +2432,17 @@ def _render_poe_and_control_plane_section(devices: dict) -> list[str]:
                 f"| {hostname} | {f_item.get('protocol', '').upper()} | {f_item.get('group', '')} | "
                 f"{f_item.get('interface', '')} | {f_item.get('vip', '')} | {f_item.get('priority', '')} |"
             )
+
+    if poe_rows:
+        lines.extend(
+            [
+                "| Device | IP | PoE Budget (W) | PoE Used (W) | PoE Active Ports | Optics Count |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+                *poe_rows,
+            ]
+        )
+    else:
+        lines.append("  * No PoE power budgets or optical transceivers reported on crawled infrastructure.")
 
     if peer_rows:
         lines.append("\n### Dynamic Routing Peers (BGP / OSPF)")
@@ -2895,23 +3141,26 @@ def generate_config_variables(devices, output_path="migration_config_variables.j
     """
     Generates configuration variables JSON sheet for Jinja2/Ansible templates.
     """
+    from net_docu_crawler.migration_parsers import extract_vlans
+
     variables = {}
 
-    # Pre-parse VLAN names for all devices
+    # Pre-parse VLAN names for all devices (preferring structured dev["vlans"] + multi-vendor config fallback)
     device_vlan_maps = {}
     for ip, dev in devices.items():
         if not _is_network_infra(dev):
             continue
         hostname = dev.get("hostname") or ip
+        vlan_names: dict[str, str] = {}
+        for vid, vinfo in (dev.get("vlans") or {}).items():
+            vid_s = str(vid).strip()
+            if vid_s.isdigit() and 1 <= int(vid_s) <= 4094:
+                vname = (vinfo.get("name") if isinstance(vinfo, dict) else str(vinfo)) or f"VLAN_{vid_s}"
+                vlan_names[vid_s] = str(vname).strip().strip('"').strip("'")
         cfg = dev.get("raw_config", "")
-        vlan_names = {}
         if cfg:
-            matches = re.finditer(r"^vlan\s+(\d+)\s*[\r\n]+(?:\s+name\s+(\S+))?", cfg, re.MULTILINE | re.IGNORECASE)
-            for match in matches:
-                vlan_id = match.group(1)
-                name = match.group(2)
-                if name:
-                    vlan_names[vlan_id] = name.strip().strip('"').strip("'")
+            for vid, vinfo in extract_vlans(cfg, vendor=dev.get("vendor", "")).items():
+                vlan_names.setdefault(str(vid), str(vinfo.get("name") or f"VLAN_{vid}"))
         device_vlan_maps[hostname] = vlan_names
 
     for ip, dev in devices.items():
@@ -2923,12 +3172,13 @@ def generate_config_variables(devices, output_path="migration_config_variables.j
         # Build VLAN list
         vlans_list = []
         vlan_names = device_vlan_maps.get(hostname, {})
-        for vid, vname in vlan_names.items():
-            vlans_list.append({"id": vid, "name": vname})
+        for vid in sorted(vlan_names.keys(), key=lambda x: int(x) if x.isdigit() else 99999):
+            vlans_list.append({"id": vid, "name": vlan_names[vid]})
 
         # Build SVI list
         l3_ints = dev.get("l3_interfaces", [])
         ints_detail = dev.get("interfaces_detail", {})
+        config_ips = parse_interface_ips_from_config(dev.get("raw_config", "")) if dev.get("raw_config") else {}
         svis_list = []
         for intf in l3_ints:
             intf_name = intf.get("interface")
@@ -2942,7 +3192,9 @@ def generate_config_variables(devices, output_path="migration_config_variables.j
                     desc = stats.get("description", "")
                     break
 
-            subnet_range = ".".join(ip_addr.split(".")[:3]) + ".0/24" if (ip_addr and "." in ip_addr) else "N/A"
+            _ip_cfg, mask_cfg = config_ips.get(norm_name, (None, None))
+            _clean_ip, net, mask_known = _parse_interface_network_strict(ip_addr, mask_hint=mask_cfg)
+            subnet_range = str(net.cidr) if (mask_known and net is not None) else "Unknown"
             svis_list.append(
                 {
                     "interface": intf_name,
@@ -3286,12 +3538,14 @@ def _collect_discovery_readiness_metrics(
 ) -> dict:
     """Compute discovery confidence, L2 link accuracy, and SPOF/blocker flags from crawled devices."""
     lldp_enabled = 0
+    lldp_unknown = 0
     lldp_missing: list[tuple[str, str, str]] = []
     cdp_enabled = 0
     total_nbrs = 0
     direct_nbrs = 0
     mac_inferred_nbrs = 0
     passthrough_nbrs = 0
+    l3_wan_inferred_nbrs = 0
     passthrough_notes: list[str] = []
     high_poe: list[str] = []
     gw_devs: list[str] = []
@@ -3303,8 +3557,8 @@ def _collect_discovery_readiness_metrics(
         hostname = dev.get("hostname") or ip
         persona = (dev.get("device_persona") or dev.get("device_type") or "").lower()
         dp = dev.get("discovery_protocols") or {}
-        lldp_st = dp.get("lldp", "unknown")
-        cdp_st = dp.get("cdp", "unsupported")
+        lldp_st = str(dp.get("lldp", "unknown") or "unknown").strip().lower()
+        cdp_st = str(dp.get("cdp", "unsupported") or "unsupported").strip().lower()
         nbrs = dev.get("neighbors") or []
         if lldp_st == "enabled":
             lldp_enabled += 1
@@ -3313,12 +3567,15 @@ def _collect_discovery_readiness_metrics(
                 "No LLDP/CDP neighbors learned and protocol status unknown" if lldp_st == "unknown" else ""
             )
             lldp_missing.append((hostname, lldp_st, reason))
+        else:
+            # lldp_st == "unknown" with neighbors present or CDP-only — never silently treat as confirmed LLDP-enabled
+            lldp_unknown += 1
         if cdp_st == "enabled":
             cdp_enabled += 1
 
         total_nbrs += len(nbrs)
         for n in nbrs:
-            acc = n.get("l2_accuracy", "")
+            acc = str(n.get("l2_accuracy") or "").strip().lower()
             if acc == "mac_inferred":
                 mac_inferred_nbrs += 1
             elif acc in ("virtual_passthrough", "multi_neighbor_port"):
@@ -3326,6 +3583,8 @@ def _collect_discovery_readiness_metrics(
                 note = f"**{hostname}** (`{n.get('local_port', '')}` ↔ **{n.get('remote_device', '')}**): {n.get('l2_accuracy_note', acc)}"
                 if note not in passthrough_notes:
                     passthrough_notes.append(note)
+            elif acc in ("wan_carrier_arp_route", "l3_next_hop_egress"):
+                l3_wan_inferred_nbrs += 1
             else:
                 direct_nbrs += 1
 
@@ -3346,7 +3605,7 @@ def _collect_discovery_readiness_metrics(
     single_gw_spof = len(gw_devs) == 1 and fhrp_total == 0
     if failed_hosts_count > 0:
         gate = "BLOCKED"
-    elif lldp_missing or mac_inferred_nbrs or passthrough_nbrs or high_poe or single_gw_spof:
+    elif lldp_missing or lldp_unknown or mac_inferred_nbrs or passthrough_nbrs or high_poe or single_gw_spof:
         gate = "READY WITH CAVEATS"
     else:
         gate = "READY"
@@ -3356,12 +3615,14 @@ def _collect_discovery_readiness_metrics(
         "failed_hosts_count": failed_hosts_count,
         "non_infra_failed_count": non_infra_failed_count,
         "lldp_enabled": lldp_enabled,
+        "lldp_unknown": lldp_unknown,
         "lldp_missing": lldp_missing,
         "cdp_enabled": cdp_enabled,
         "total_nbrs": total_nbrs,
         "direct_nbrs": direct_nbrs,
         "mac_inferred_nbrs": mac_inferred_nbrs,
         "passthrough_nbrs": passthrough_nbrs,
+        "l3_wan_inferred_nbrs": l3_wan_inferred_nbrs,
         "passthrough_notes": passthrough_notes,
         "high_poe": high_poe,
         "gw_devs": gw_devs,
@@ -3389,11 +3650,27 @@ def _render_blueprint_executive_summary_section(
         else (f"⚠️ **{metrics['gate']}**" if metrics["gate"] == "READY WITH CAVEATS" else "✅ **READY**")
     )
 
-    lldp_assess = (
-        "✓ Full protocol coverage"
-        if not metrics["lldp_missing"]
-        else f"⚠ {len(metrics['lldp_missing'])} device(s) lack LLDP"
-    )
+    if total_nodes > 0 and metrics["lldp_enabled"] == total_nodes and not metrics["lldp_missing"]:
+        lldp_assess = "✓ Full protocol coverage"
+    elif metrics["lldp_missing"] and metrics["lldp_unknown"]:
+        lldp_assess = (
+            f"⚠ {len(metrics['lldp_missing'])} device(s) lack LLDP; "
+            f"{metrics['lldp_unknown']} device(s) LLDP status unknown"
+        )
+    elif metrics["lldp_missing"]:
+        lldp_assess = f"⚠ {len(metrics['lldp_missing'])} device(s) lack LLDP"
+    elif metrics["lldp_unknown"]:
+        lldp_assess = f"⚠ {metrics['lldp_unknown']} device(s) LLDP status unknown (neighbors inferred or CDP-only)"
+    else:
+        lldp_assess = "⚠ No crawled devices to evaluate"
+
+    wan_l3_frag = f" / `{metrics['l3_wan_inferred_nbrs']}` WAN/L3-egress" if metrics["l3_wan_inferred_nbrs"] else ""
+    if metrics["mac_inferred_nbrs"] or metrics["passthrough_nbrs"] or metrics["l3_wan_inferred_nbrs"]:
+        adj_assess = "⚠ Verify dashed/inferred links in L2 diagram"
+    elif metrics["direct_nbrs"] > 0:
+        adj_assess = "✓ Direct cabling verified"
+    else:
+        adj_assess = "⚠ No L2 neighbor adjacencies observed"
     non_infra_note = (
         f" (`{non_infra_failed_count}` passive/unsupported non-infra hosts)" if non_infra_failed_count > 0 else ""
     )
@@ -3419,8 +3696,7 @@ def _render_blueprint_executive_summary_section(
         f"| **Cutover Readiness Gate** | {gate_badge} | Based on crawl coverage, L2 visibility & SPOF checks |",
         f"| **Crawled Infrastructure Nodes** | `{total_nodes}` succeeded / `{metrics['failed_hosts_count']}` infra failed{non_infra_note} | {scope_assess} |",
         f"| **L2 Protocol Visibility (LLDP / CDP)** | `{metrics['lldp_enabled']}/{total_nodes}` LLDP enabled (`{metrics['cdp_enabled']}` CDP) | {lldp_assess} |",
-        f"| **L2 Adjacency Confidence** | `{metrics['direct_nbrs']}` direct / `{metrics['mac_inferred_nbrs']}` MAC-inferred / `{metrics['passthrough_nbrs']}` passthrough | "
-        f"{'✓ Direct cabling verified' if not (metrics['mac_inferred_nbrs'] or metrics['passthrough_nbrs']) else '⚠ Verify dashed links in L2 diagram'} |",
+        f"| **L2 Adjacency Confidence** | `{metrics['direct_nbrs']}` direct / `{metrics['mac_inferred_nbrs']}` MAC-inferred / `{metrics['passthrough_nbrs']}` passthrough{wan_l3_frag} | {adj_assess} |",
         f"| **Total Interface Footprint** | `{metrics['up_ports']}` up / `{metrics['total_ports']}` total interfaces | See `migration_cabling_matrix.csv` |",
         "",
         "### 1.2 Deliverables & Breakout Reports Index",
@@ -3501,10 +3777,11 @@ def _render_blueprint_executive_summary_section(
     return lines
 
 
-def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], list[tuple]]:
-    """Collect cabling matrix rows and detect cross-device MTU mismatches."""
+def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], list[tuple], int]:
+    """Collect cabling matrix rows and detect cross-device MTU mismatches without fabricating defaults."""
     mtu_mismatches = []
     cabling_rows = []
+    verified_mtu_pairs = 0
 
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
@@ -3526,9 +3803,10 @@ def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], li
             norm_port = normalize_interface_name(port_name)
             cport = (dev.get("ports") or {}).get(port_name) or {}
             status = stats.get("status", "down")
-            speed = stats.get("speed") or "1Gb/s"
-            duplex = stats.get("duplex") or "Full"
-            mtu = stats.get("mtu") or (9000 if "jumbo" in stats.get("description", "").lower() else 1500)
+            speed = stats.get("speed") or "Unknown"
+            duplex = stats.get("duplex") or "Unknown"
+            raw_mtu = stats.get("mtu") if stats.get("mtu") is not None else cport.get("mtu")
+            mtu = int(raw_mtu) if str(raw_mtu or "").isdigit() else None
 
             if cport.get("optic_part_number"):
                 media = f"{cport.get('media') or 'SFP'} ({cport['optic_part_number']})"
@@ -3553,24 +3831,25 @@ def _collect_blueprint_cabling_and_mtu(unique_devs: dict) -> tuple[list[str], li
                 f"| **{hostname}** | `{norm_port}` | {media} | {speed} / {duplex} | `{status}` | **{nbr_host}** | `{nbr_port}` | `{lag_group}` |"
             )
 
-            if nbr and nbr_host != "Unconnected":
+            if nbr and nbr_host != "Unconnected" and mtu is not None:
                 for _rip, rdev in unique_devs.items():
                     if (rdev.get("hostname") or "").lower().split(".")[0] == nbr_host.lower().split(".")[0]:
                         r_ints = rdev.get("interfaces_detail", {})
                         r_stats = r_ints.get(nbr_port) or r_ints.get(nbr.get("remote_port", ""))
                         if r_stats:
-                            r_mtu = r_stats.get("mtu") or (
-                                9000 if "jumbo" in r_stats.get("description", "").lower() else 1500
-                            )
-                            if mtu != r_mtu:
-                                mtu_mismatches.append((hostname, norm_port, mtu, nbr_host, nbr_port, r_mtu))
+                            r_raw_mtu = r_stats.get("mtu")
+                            r_mtu = int(r_raw_mtu) if str(r_raw_mtu or "").isdigit() else None
+                            if r_mtu is not None:
+                                verified_mtu_pairs += 1
+                                if mtu != r_mtu:
+                                    mtu_mismatches.append((hostname, norm_port, mtu, nbr_host, nbr_port, r_mtu))
 
-    return cabling_rows, mtu_mismatches
+    return cabling_rows, mtu_mismatches, verified_mtu_pairs
 
 
 def _render_blueprint_cabling_and_mtu_section(unique_devs: dict) -> list[str]:
     """Render Sections 2.1 (Neighbor/Uplink Cabling Summary) and 2.2 (MTU Discrepancy Guard)."""
-    cabling_rows, mtu_mismatches = _collect_blueprint_cabling_and_mtu(unique_devs)
+    cabling_rows, mtu_mismatches, verified_mtu_pairs = _collect_blueprint_cabling_and_mtu(unique_devs)
     connected_rows = [r for r in cabling_rows if "**Unconnected**" not in r]
     up_rows = [r for r in cabling_rows if "| `up` |" in r]
     display_rows = connected_rows if connected_rows else up_rows[:15]
@@ -3606,9 +3885,13 @@ def _render_blueprint_cabling_and_mtu_section(unique_devs: dict) -> list[str]:
             lines.append(
                 f"> * **{h1}** (`{p1}`, MTU {m1}) <==> **{h2}** (`{p2}`, MTU {m2}). Mismatched MTUs will cause silent OSPF packet drops or jumbo-frame truncation!"
             )
+    elif verified_mtu_pairs > 0:
+        lines.append(
+            f"✓ **No MTU Mismatches Detected**: Verified consistent MTU across **{verified_mtu_pairs}** inter-device uplink pair(s)."
+        )
     else:
         lines.append(
-            "✓ **No MTU Mismatches Detected**: All discovered switch-to-switch uplinks share consistent standard MTU boundaries (1500 bytes)."
+            "⚠️ **MTU Parity Unverified**: No inter-device uplink pair reported explicit MTU telemetry on both ends — verify MTU parity before cutover."
         )
     return lines
 
@@ -3620,14 +3903,11 @@ def _render_blueprint_optics_section(unique_devs: dict) -> list[str]:
         "### 2.3 Optical Transceiver & Digital Optical Monitoring (DOM) Telemetry",
         "Detailed physical telemetry for pluggable fiber/copper SFP, SFP+, and QSFP transceivers:",
         "",
-        "| Switch Hostname | Port | Transceiver Model / Part | Serial Number | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
-    optics_found = 0
+    optics_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         for opt in dev.get("optics", []):
-            optics_found += 1
             port = opt.get("port", "")
             part = opt.get("part_number", "SFP-DOM")
             serial = opt.get("serial", "Unknown")
@@ -3648,14 +3928,30 @@ def _render_blueprint_optics_section(unique_devs: dict) -> list[str]:
             else:
                 health = "DOM Unavailable / Unmonitored"
 
-            lines.append(
+            optics_rows.append(
                 f"| **{hostname}** | `{port}` | `{part}` | `{serial}` | `{form}` | {tx} | {rx} | {temp} | {volt} | {health} |"
             )
 
-    if optics_found == 0:
-        lines.append(
-            "| *All Switches* | *N/A* | *No pluggable SFP/DOM optics detected (All RJ-45 copper access)* | *N/A* | `1000BASE-T` | N/A | N/A | N/A | N/A | ✓ Healthy (Copper PHY) |"
+    if optics_rows:
+        lines.extend(
+            [
+                "| Switch Hostname | Port | Transceiver Model / Part | Serial Number | Form Factor | TX Power (dBm) | RX Power (dBm) | Temperature (°C) | Voltage (V) | Optical Health Status |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                *optics_rows,
+            ]
         )
+    else:
+        opt_avail = _section_availability_summary(unique_devs, "optics")
+        if opt_avail["has_gaps"]:
+            gap_hosts = opt_avail["failed_hosts"] + opt_avail["not_collected_hosts"]
+            lines.append(
+                f"> ⚠️ **Optics / DOM Telemetry Not Collected or Failed** on {len(gap_hosts)}/{opt_avail['total']} device(s) "
+                f"({', '.join(gap_hosts[:8])}); cannot verify pluggable SFP/QSFP inventory."
+            )
+        else:
+            lines.append(
+                "> No pluggable SFP/SFP+/QSFP optical transceivers or DOM readings were reported on crawled devices (verify copper/fixed PHY manually if uplinks are fiber)."
+            )
     return lines
 
 
@@ -3713,42 +4009,89 @@ def _render_blueprint_poe_section(unique_devs: dict) -> list[str]:
         "",
         "When replacing access switches, new power supplies must support the concurrent wattage demanded by APs, IP phones, and cameras:",
         "",
-        "| Switch Hostname | Total PoE Capacity (W) | Consumed PoE Wattage (W) | Remaining Budget (W) | PoE Utilization | PSU Sizing Recommendation |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+    poe_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
-        poe = dev.get("poe", {})
-        tot = poe.get("total_power_watts", 0.0)
-        used = poe.get("used_power_watts", 0.0)
-        rem = poe.get("available_power_watts", 0.0)
-        persona = dev.get("device_persona", "")
+        poe = dev.get("poe", {}) or {}
+        tot = float(poe.get("total_power_watts", 0.0) or 0.0)
+        used = float(poe.get("used_power_watts", 0.0) or 0.0)
+        rem = float(poe.get("available_power_watts", 0.0) or 0.0)
+        persona = str(dev.get("device_persona") or dev.get("device_type") or "").lower()
+        poe_cs = _device_section_status(dev, "poe")
 
         if not (persona == "switch" or tot > 0 or used > 0):
             continue
-        if poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
-            lines.append(f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |")
+        if poe_cs in ("command_failed", "parse_failed", "not_collected") and tot == 0.0 and used == 0.0:
+            poe_rows.append(
+                f"| **{hostname}** | Collection Failed (`{poe_cs}`) | Unknown | Unknown | N/A | ⚠️ Verify PoE Telemetry Manually |"
+            )
+        elif poe.get("poe_supported") is False and tot == 0.0 and used == 0.0:
+            poe_rows.append(f"| **{hostname}** | Non-PoE Switch | 0.0W | N/A | N/A | Non-PoE Core / Fiber SKU |")
         elif poe.get("budget_unreported") and used > 0.0:
             deliv_cnt = poe.get("poe_delivering_ports", 0)
-            lines.append(
+            poe_rows.append(
                 f"| **{hostname}** | Unreported by CLI | {used:.1f}W ({deliv_cnt} active) | Unknown | N/A | Verify Chassis PSU Budget (Draw: {used:.1f}W) |"
             )
         elif tot == 0.0 and used == 0.0:
-            lines.append(f"| **{hostname}** | Unknown | Unknown | Unknown | N/A | Unknown (Verify PSU / PoE Budget) |")
+            poe_rows.append(
+                f"| **{hostname}** | Unknown | Unknown | Unknown | N/A | Unknown (Verify PSU / PoE Budget) |"
+            )
         elif tot == 0.0 and used > 0.0:
-            lines.append(
+            poe_rows.append(
                 f"| **{hostname}** | 0.0W | {used:.1f}W | N/A | N/A | ⚠️ Conflict: 0W budget with active draw |"
             )
         else:
             pct = (used / tot * 100.0) if tot > 0 else 0.0
             req_w = max(tot, used * 1.25)
             psu_rec = f"{rem:.1f}W headroom ({100.0 - pct:.1f}% free); size replacement PSU >= {int(req_w)}W"
-            lines.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
+            poe_rows.append(f"| **{hostname}** | {tot:.1f}W | {used:.1f}W | {rem:.1f}W | {pct:.1f}% | {psu_rec} |")
+
+    if poe_rows:
+        lines.extend(
+            [
+                "| Switch Hostname | Total PoE Capacity (W) | Consumed PoE Wattage (W) | Remaining Budget (W) | PoE Utilization | PSU Sizing Recommendation |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
+                *poe_rows,
+            ]
+        )
+    else:
+        lines.append(
+            "> No Layer 2 PoE-capable switches or active PoE draw were discovered in the crawled dataset (not applicable to Layer 3-only nodes)."
+        )
     return lines
 
 
+def _extract_valid_vlan_id_from_iface(iface_name: str, dev_vlans: dict) -> tuple[str, str]:
+    """Resolve a valid 802.1Q VLAN ID (1..4094) and name from an interface name or dev['vlans']."""
+    if_clean = str(iface_name or "").strip()
+    if_low = if_clean.lower()
+    # 1. Explicit match in dev["vlans"] by svi_interface or VLAN name
+    for vid_k, vinfo in (dev_vlans or {}).items():
+        vid_s = str(vid_k).strip()
+        if not (vid_s.isdigit() and 1 <= int(vid_s) <= 4094):
+            continue
+        if isinstance(vinfo, dict):
+            svi = str(vinfo.get("svi_interface") or "").strip().lower()
+            vname = str(vinfo.get("name") or "").strip()
+            if (svi and svi == if_low) or (vname and vname.lower() == if_low):
+                return vid_s, vname
+    # 2. Interface syntax patterns (Vlan10, vlan.10, vtnet0_vlan10, eth0.10, Gi0/0.10, bvi10, irb.10)
+    m_v = re.search(r"(?:^|[_.\-])(?:vlan|vl|irb|bvi)[_.\-\s]*0*(\d+)$", if_low)
+    if not m_v:
+        m_v = re.search(r"\.0*(\d+)$", if_low)
+    if m_v:
+        cand = int(m_v.group(1))
+        if 1 <= cand <= 4094:
+            vid_s = str(cand)
+            vinfo = (dev_vlans or {}).get(vid_s)
+            vname = str(vinfo.get("name") or "") if isinstance(vinfo, dict) else ""
+            return vid_s, vname
+    return "", ""
+
+
 def _render_blueprint_vlan_and_trunk_section(unique_devs: dict) -> list[str]:
-    """Render Section 4: Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map."""
+    """Render Section 4: Layer 2 VLANs, 802.1Q Trunks & Native VLAN Map (both L3 SVIs & L2-only VLANs)."""
     from net_docu_crawler.correlator import build_l3_svi_table
 
     lines = [
@@ -3762,19 +4105,78 @@ def _render_blueprint_vlan_and_trunk_section(unique_devs: dict) -> list[str]:
         "| Site | Source Device | VLAN ID | VLAN Name | SVI / IRB | Gateway IP | Subnet / CIDR Prefix | DHCP Relays |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+    dev_by_host = {(d.get("hostname") or ip): d for ip, d in unique_devs.items()}
     svi_rows = build_l3_svi_table(list(unique_devs.values()))
     vlan_rows = []
+    seen_dev_vlans: set[tuple[str, str]] = set()
+
     for sr in svi_rows:
-        site_lbl = sr["site_code"] or "-"
-        vid_lbl = f"**{sr['vlan_id']}**" if sr["vlan_id"] else "-"
-        vname_lbl = f"`{sr['vlan_name']}`" if sr["vlan_name"] else "-"
-        rel_lbl = ", ".join(f"`{r}`" for r in sr["dhcp_relays"]) if sr["dhcp_relays"] else "None"
+        src_host = sr.get("source_device") or ""
+        primary_ip = str(sr.get("primary_ip") or "").strip()
+        if primary_ip.startswith(("127.", "128.0.")):
+            continue
+        dev = dev_by_host.get(src_host) or {}
+        dev_vlans = dev.get("vlans") or {}
+        svi_if = str(sr.get("svi_interface") or "")
+
+        vid = str(sr.get("vlan_id") or "").strip()
+        vname = str(sr.get("vlan_name") or "").strip()
+        if not vid or vid == "0" or (vid.isdigit() and not (1 <= int(vid) <= 4094)):
+            vid, resolved_name = _extract_valid_vlan_id_from_iface(svi_if, dev_vlans)
+            if not vname and resolved_name:
+                vname = resolved_name
+        elif not vname and vid in dev_vlans and isinstance(dev_vlans[vid], dict):
+            vname = str(dev_vlans[vid].get("name") or "")
+
+        prefix_cidr = str(sr.get("prefix_cidr") or "").strip()
+        # Prevent bare management IPs (e.g. Aruba AP br0 without mask) from displaying fabricated /32
+        if prefix_cidr.endswith("/32"):
+            for l3i in dev.get("l3_interfaces") or []:
+                if str(l3i.get("interface") or "") == svi_if:
+                    raw_ip_s = str(l3i.get("ip_address") or "").strip()
+                    if "/" not in raw_ip_s and " " not in raw_ip_s:
+                        prefix_cidr = "Unknown"
+                    break
+
+        if vid:
+            seen_dev_vlans.add((src_host, vid))
+
+        site_lbl = sr.get("site_code") or dev.get("site_code") or "-"
+        vid_lbl = f"**{vid}**" if vid else "-"
+        vname_lbl = f"`{vname}`" if vname else "-"
+        rel_lbl = ", ".join(f"`{r}`" for r in (sr.get("dhcp_relays") or [])) or "None"
         vlan_rows.append(
-            f"| {site_lbl} | **{sr['source_device']}** | {vid_lbl} | {vname_lbl} | `{sr['svi_interface']}` | "
-            f"`{sr['primary_ip']}` | `{sr['prefix_cidr'] or 'N/A'}` | {rel_lbl} |"
+            f"| {site_lbl} | **{src_host}** | {vid_lbl} | {vname_lbl} | `{svi_if}` | "
+            f"`{primary_ip}` | `{prefix_cidr or 'Unknown'}` | {rel_lbl} |"
         )
+
+    # Append L2-only VLANs from dev["vlans"] not already represented in an L3 SVI row
+    for ip, dev in unique_devs.items():
+        host = dev.get("hostname") or ip
+        site_lbl = dev.get("site_code") or "-"
+        for vid_k in sorted((dev.get("vlans") or {}).keys(), key=lambda x: int(x) if str(x).isdigit() else 99999):
+            vid_s = str(vid_k).strip()
+            if not (vid_s.isdigit() and 1 <= int(vid_s) <= 4094):
+                continue
+            if (host, vid_s) in seen_dev_vlans:
+                continue
+            vinfo = dev["vlans"][vid_k]
+            vname = str(vinfo.get("name") if isinstance(vinfo, dict) else vinfo or "").strip()
+            vname_lbl = f"`{vname}`" if vname else "-"
+            vlan_rows.append(
+                f"| {site_lbl} | **{host}** | **{vid_s}** | {vname_lbl} | *(L2 Only)* | `-` | `-` | None |"
+            )
+            seen_dev_vlans.add((host, vid_s))
+
     if not vlan_rows:
-        vlan_rows.append("| - | *None* | - | *No L3 VLAN/SVI mappings parsed* | - | `N/A` | `N/A` | - |")
+        v_avail = _section_availability_summary(unique_devs, "vlans", fallback_section="interfaces")
+        if v_avail["has_gaps"]:
+            gap_hosts = v_avail["failed_hosts"] + v_avail["not_collected_hosts"]
+            vlan_rows.append(
+                f"| - | *Collection Failed* | - | *⚠️ VLAN/SVI data not collected or failed on {len(gap_hosts)}/{v_avail['total']} device(s)* | - | `N/A` | `N/A` | - |"
+            )
+        else:
+            vlan_rows.append("| - | *None* | - | *No L2 VLAN or L3 SVI mappings parsed* | - | `N/A` | `N/A` | - |")
 
     lines.extend(vlan_rows)
     lines.extend(
@@ -3799,9 +4201,16 @@ def _render_blueprint_dhcp_relay_section(unique_devs: dict) -> list[str]:
         "| :--- | :--- | :--- | :--- | :--- |",
     ]
     has_relays = False
+    local_pool_hosts: list[str] = []
+    total_local_pools = 0
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
-        relays = (dev.get("dhcp") or {}).get("relays", []) or []
+        dhcp_d = dev.get("dhcp") or {}
+        pools = dhcp_d.get("pools", []) or []
+        if pools:
+            total_local_pools += len(pools)
+            local_pool_hosts.append(f"{hostname} ({len(pools)})")
+        relays = dhcp_d.get("relays", []) or []
         if relays:
             has_relays = True
             for rel in relays:
@@ -3816,9 +4225,28 @@ def _render_blueprint_dhcp_relay_section(unique_devs: dict) -> list[str]:
                     f"| **{hostname}** | `Unknown (Config Services)` | `{r_ip}` | Discovered DHCP Relay | ✓ Provisioned |"
                 )
 
+    dhcp_avail = _section_availability_summary(unique_devs, "dhcp", fallback_section="running_config")
     if not has_relays:
+        if dhcp_avail["has_gaps"]:
+            gap_hosts = dhcp_avail["failed_hosts"] + dhcp_avail["not_collected_hosts"]
+            lines.append(
+                f"| *Incomplete* | *DHCP data not collected / failed on {len(gap_hosts)}/{dhcp_avail['total']} device(s)* | "
+                f"`N/A` | `{', '.join(gap_hosts[:5])}` | ⚠️ Data Not Collected / Collection Failed |"
+            )
+        elif total_local_pools > 0:
+            lines.append(
+                f"| *Local DHCP* | *0 relays; {total_local_pools} local DHCP pool(s) discovered* | "
+                f"`N/A` | {', '.join(local_pool_hosts[:5])} | ℹ️ Local DHCP Server Active |"
+            )
+        else:
+            lines.append(
+                "| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | None Configured |"
+            )
+    elif dhcp_avail["has_gaps"]:
+        gap_hosts = dhcp_avail["failed_hosts"] + dhcp_avail["not_collected_hosts"]
         lines.append(
-            "| *None* | *No DHCP relay / ip helper-address entries discovered* | `N/A` | `N/A` | Unconfigured or Local DHCP |"
+            f"| *Partial* | *DHCP config missing on {len(gap_hosts)}/{dhcp_avail['total']} device(s)* | "
+            f"`N/A` | `{', '.join(gap_hosts[:5])}` | ⚠️ Verify Uncollected Devices |"
         )
     return lines
 
@@ -3831,20 +4259,22 @@ def _render_blueprint_stp_section(unique_devs: dict) -> list[str]:
         "",
         "## 6. Spanning Tree (STP) & Loop Prevention Plan",
         "",
-        "| Switch Hostname | STP Protocol Detected | Root Bridge Status | Bridge Priority | PortFast / Edge Ports | BPDU Guard Status | Migration Target Standard |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
+    stp_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         stp = dev.get("stp", {}) or {}
         is_root = bool(stp.get("is_root", False))
-        persona = dev.get("device_persona", "")
+        persona = str(dev.get("device_persona") or dev.get("device_type") or "").lower()
         if not (persona == "switch" or stp.get("enabled")):
             continue
 
+        stp_cs = _device_section_status(dev, "stp")
         proto = stp.get("protocol") or "Unknown"
         prio = stp.get("bridge_priority") or "Unknown"
-        if not stp.get("enabled"):
+        if stp_cs in ("command_failed", "parse_failed", "not_collected") and not stp.get("enabled"):
+            root_label = f"⚠️ Collection Failed / Not Collected (`{stp_cs}`)"
+        elif not stp.get("enabled"):
             root_label = "Disabled (STP Off)"
         elif stp.get("is_verified_campus_root"):
             root_label = f"👑 **VERIFIED CAMPUS ROOT** ({stp.get('root_bridge', '')})"
@@ -3859,14 +4289,44 @@ def _render_blueprint_stp_section(unique_devs: dict) -> list[str]:
             rp = stp.get("root_port") or "N/A"
             root_label = f"Non-Root (Root: {rb}, Port: {rp})"
 
-        pp = dev.get("port_profiles", {}) or {}
-        edge_cnt = sum(1 for v in pp.values() if v.get("stp_edge") is True)
-        bpdu_cnt = sum(1 for v in pp.values() if v.get("bpdu_guard") is True)
-        edge_label = f"{edge_cnt} edge ports" if edge_cnt > 0 else "Unknown"
-        bpdu_label = f"{bpdu_cnt} protected ports" if bpdu_cnt > 0 else "Unknown"
+        # Merge edge & BPDU guard counts across both port_profiles (bool) and correlated ports ("enabled")
+        edge_ports: set[str] = set()
+        bpdu_ports: set[str] = set()
+        for pname, v in (dev.get("port_profiles") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            np = normalize_interface_name(pname)
+            if v.get("stp_edge") is True or str(v.get("stp_edge") or "").lower() == "enabled":
+                edge_ports.add(np)
+            if v.get("bpdu_guard") is True or str(v.get("bpdu_guard") or "").lower() == "enabled":
+                bpdu_ports.add(np)
+        for pname, v in (dev.get("ports") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            np = normalize_interface_name(pname)
+            if v.get("stp_edge") is True or str(v.get("stp_edge") or "").lower() == "enabled":
+                edge_ports.add(np)
+            if v.get("bpdu_guard") is True or str(v.get("bpdu_guard") or "").lower() == "enabled":
+                bpdu_ports.add(np)
 
-        lines.append(
+        edge_label = f"{len(edge_ports)} edge ports" if edge_ports else "Unknown"
+        bpdu_label = f"{len(bpdu_ports)} protected ports" if bpdu_ports else "Unknown"
+
+        stp_rows.append(
             f"| **{hostname}** | `{proto}` | {root_label} | `{prio}` | {edge_label} | {bpdu_label} | Standard IEEE 802.1w / 802.1s |"
+        )
+
+    if stp_rows:
+        lines.extend(
+            [
+                "| Switch Hostname | STP Protocol Detected | Root Bridge Status | Bridge Priority | PortFast / Edge Ports | BPDU Guard Status | Migration Target Standard |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                *stp_rows,
+            ]
+        )
+    else:
+        lines.append(
+            "> No Layer 2 switches or active Spanning Tree instances were discovered in the crawled dataset (not applicable to Layer 3-only routers/firewalls)."
         )
     lines.extend(
         [
@@ -3895,14 +4355,66 @@ def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
         "## 7. First-Hop Redundancy Protocols (FHRP) & Gateway Migration",
         "",
     ]
-    fhrp_migration_rows = [
-        f"| **{dev.get('hostname') or ip} ({f_item.get('interface', 'N/A')})** | `{f_item.get('protocol', 'Unknown').upper()}` | "
-        f"`{f_item.get('vip', 'Unknown')}` | `{dev.get('hostname') or ip}` | {f_item.get('state', 'Unknown')} | "
-        f"{f_item.get('preempt', 'Unknown')} | Standard VRRPv3 (RFC 5798) |"
-        for ip, dev in unique_devs.items()
-        for f_item in (dev.get("fhrp", []) or [])
-    ]
+    # Group FHRP entries across fleet by (protocol, group, vip) so Active Primary and Standby Secondary map cleanly
+    fhrp_groups: dict[tuple[str, str, str], list[tuple[str, dict]]] = {}
+    for ip, dev in unique_devs.items():
+        host = dev.get("hostname") or ip
+        for f_item in dev.get("fhrp", []) or []:
+            proto = str(f_item.get("protocol") or "Unknown").upper()
+            grp = str(f_item.get("group") or "")
+            vip = str(f_item.get("vip") or "Unknown")
+            fhrp_groups.setdefault((proto, grp, vip), []).append((host, f_item))
 
+    fhrp_migration_rows = []
+    for (proto, grp, vip), members in fhrp_groups.items():
+        primaries: list[str] = []
+        standbys: list[str] = []
+        others: list[tuple[int, str]] = []
+        preempt_vals: list[bool] = []
+        group_intf = members[0][1].get("interface", "N/A")
+
+        for host, f_item in members:
+            st_raw = str(f_item.get("state") or "Unknown").strip()
+            st_l = st_raw.lower()
+            pri = int(f_item.get("priority") or 0)
+            intf = f_item.get("interface") or "N/A"
+            label = f"`{host}` ({intf}, pri {pri})"
+            if st_l in ("active", "master", "primary", "active-active"):
+                primaries.append(label)
+            elif st_l in ("standby", "backup", "secondary", "listen", "speak"):
+                standbys.append(label)
+            else:
+                others.append((pri, f"`{host}` ({intf}, {st_raw}, pri {pri})"))
+            pval = f_item.get("preempt")
+            if isinstance(pval, bool):
+                preempt_vals.append(pval)
+            elif isinstance(pval, str) and pval.strip().lower() in ("true", "enabled", "yes"):
+                preempt_vals.append(True)
+            elif isinstance(pval, str) and pval.strip().lower() in ("false", "disabled", "no"):
+                preempt_vals.append(False)
+
+        if not primaries and others:
+            others.sort(key=lambda x: x[0], reverse=True)
+            primaries.append(others[0][1])
+            standbys.extend(item[1] for item in others[1:])
+        elif others:
+            standbys.extend(item[1] for item in others)
+
+        primary_col = ", ".join(primaries) if primaries else "Unknown"
+        standby_col = ", ".join(standbys) if standbys else "Single Node Observed (No Peer Discovered)"
+        if any(preempt_vals):
+            preempt_col = "Enabled"
+        elif preempt_vals:
+            preempt_col = "Disabled"
+        else:
+            preempt_col = "Unknown"
+        grp_lbl = f"Group `{grp}` ({group_intf})" if grp else f"({group_intf})"
+
+        fhrp_migration_rows.append(
+            f"| **{grp_lbl}** | `{proto}` | `{vip}` | {primary_col} | {standby_col} | {preempt_col} | Standard VRRPv3 (RFC 5798) |"
+        )
+
+    fhrp_avail = _section_availability_summary(unique_devs, "fhrp", fallback_section="running_config")
     if fhrp_migration_rows:
         lines.extend(
             [
@@ -3911,8 +4423,20 @@ def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
                 *fhrp_migration_rows,
             ]
         )
+        if fhrp_avail["has_gaps"]:
+            gap_hosts = fhrp_avail["failed_hosts"] + fhrp_avail["not_collected_hosts"]
+            lines.append(
+                f"\n> ⚠️ **Partial FHRP Visibility**: Data not collected / failed on {len(gap_hosts)}/{fhrp_avail['total']} device(s) ({', '.join(gap_hosts[:8])})."
+            )
     else:
-        lines.append("> No FHRP (HSRP / VRRP / CARP) groups were discovered in the crawled dataset.")
+        if fhrp_avail["has_gaps"]:
+            gap_hosts = fhrp_avail["failed_hosts"] + fhrp_avail["not_collected_hosts"]
+            lines.append(
+                f"> ⚠️ **FHRP Data Not Collected / Collection Failed** on {len(gap_hosts)}/{fhrp_avail['total']} device(s) "
+                f"({', '.join(gap_hosts[:8])}); cannot confirm absence of HSRP/VRRP/CARP groups."
+            )
+        else:
+            lines.append("> No FHRP (HSRP / VRRP / CARP) groups were discovered in the crawled dataset.")
 
     lines.extend(
         [
@@ -3922,18 +4446,43 @@ def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
             "## 8. Layer 3 Subnets, Routing Boundaries & WAN Egress",
             "",
             "### 8.1 Discovered Default Routes & Gateways of Last Resort",
-            "| Device Hostname | Default Route (`0.0.0.0/0`) Next-Hop | Exit Interface | Protocol Type | Administrative Distance |",
-            "| :--- | :--- | :--- | :--- | :--- |",
         ]
     )
+    def_route_rows = []
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
         for r in dev.get("routes", []):
             rd = get_route_details(r)
-            if rd.get("subnet") in ("0.0.0.0/0", "default"):
-                lines.append(
-                    f"| **{hostname}** | `{rd.get('next_hop')}` | `{rd.get('interface')}` | `{rd.get('protocol')}` | 1 (Static) |"
+            sub_norm = str(rd.get("subnet") or "").strip().lower()
+            if sub_norm in ("0.0.0.0/0", "0.0.0.0/0.0.0.0", "default", "::/0"):
+                ad_val = rd.get("admin_distance")
+                ad_str = (
+                    f"{ad_val} ({rd.get('protocol')})"
+                    if ad_val is not None and str(ad_val).strip() != ""
+                    else "Unknown (Not Reported)"
                 )
+                nh_lbl = f"`{rd.get('next_hop')}`" + (f" (`{rd.get('subnet')}`)" if sub_norm == "::/0" else "")
+                def_route_rows.append(
+                    f"| **{hostname}** | {nh_lbl} | `{rd.get('interface') or 'N/A'}` | `{rd.get('protocol')}` | {ad_str} |"
+                )
+
+    if def_route_rows:
+        lines.extend(
+            [
+                "| Device Hostname | Default Route (`0.0.0.0/0` / `::/0`) Next-Hop | Exit Interface | Protocol Type | Administrative Distance |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+                *def_route_rows,
+            ]
+        )
+    else:
+        rt_avail = _section_availability_summary(unique_devs, "routes")
+        if rt_avail["has_gaps"]:
+            gap_hosts = rt_avail["failed_hosts"] + rt_avail["not_collected_hosts"]
+            lines.append(
+                f"> ⚠️ **Route Data Not Collected / Collection Failed** on {len(gap_hosts)}/{rt_avail['total']} device(s) ({', '.join(gap_hosts[:8])})."
+            )
+        else:
+            lines.append("> No default routes (`0.0.0.0/0` or `::/0`) were discovered in crawled routing tables.")
 
     from net_docu_crawler.topology_renderer import build_topology_graph_model
 
@@ -3999,7 +4548,7 @@ def _render_blueprint_fhrp_and_routing_section(unique_devs: dict) -> list[str]:
 
 
 def _render_blueprint_security_and_services_section(unique_devs: dict) -> list[str]:
-    """Render Sections 9 (Security/ACLs/NAT) and 10 (Infrastructure Services)."""
+    """Render Sections 9 (Security/ACLs/NAT) and 10 (Infrastructure Services) with truthful audits."""
     lines = [
         "",
         "---",
@@ -4011,21 +4560,66 @@ def _render_blueprint_security_and_services_section(unique_devs: dict) -> list[s
     ]
     for ip, dev in unique_devs.items():
         hostname = dev.get("hostname") or ip
-        persona = dev.get("device_persona", "")
+        persona = str(dev.get("device_persona") or dev.get("device_type") or "").lower()
         mgmt = str(dev.get("mgmt_method") or "Unknown")
+        cfg = str(dev.get("raw_config") or "")
         sec_pol = dev.get("security_policy") or {}
         fw_cnt = len(sec_pol.get("firewall_rules") or [])
         nat_cnt = len(sec_pol.get("nat_rules") or [])
-        insecure_col = (
-            "Telnet Active" if "telnet" in mgmt.lower() else ("Unknown" if mgmt == "Unknown" else "SSH/API Only")
-        )
+        sec_cs = _device_section_status(dev, "security_policy", fallback_section="running_config")
+
+        # Count port-level ACL bindings from both correlated `ports` and `port_profiles`
+        port_acls: set[str] = set()
+        for src_map in (dev.get("ports") or {}, dev.get("port_profiles") or {}):
+            for p_entry in src_map.values():
+                if not isinstance(p_entry, dict):
+                    continue
+                for akey in ("acl_in", "acl_out"):
+                    aval = str(p_entry.get(akey) or "").strip()
+                    if aval:
+                        port_acls.add(aval)
+
+        # Detect insecure management exposure from both mgmt_method and running-config
+        insecure_flags: list[str] = []
+        if "telnet" in mgmt.lower() or re.search(
+            r"(?im)^\s*(?:transport\s+input\b[^\r\n]*\btelnet\b|telnet-server\b|set\s+system\s+services\s+telnet\b)",
+            cfg,
+        ):
+            insecure_flags.append("Telnet")
+        if re.search(r"(?im)^\s*ip\s+http\s+server\b", cfg) and not re.search(
+            r"(?im)^\s*no\s+ip\s+http\s+server\b", cfg
+        ):
+            insecure_flags.append("HTTP")
+
+        if insecure_flags:
+            insecure_col = f"⚠️ {' + '.join(insecure_flags)} Enabled"
+        elif mgmt == "Unknown" and not cfg:
+            insecure_col = "Unknown"
+        else:
+            insecure_col = "None Detected (SSH/API)"
+
         secure_col = mgmt if mgmt != "Unknown" else "Unknown"
-        acl_col = f"{fw_cnt} parsed rules" if fw_cnt > 0 else "Unknown (Not Queried)"
-        nat_status = (
-            f"Enabled ({nat_cnt} rules)"
-            if nat_cnt > 0
-            else ("Disabled (Pure L2/L3)" if persona in ("switch", "router") else "Unknown")
-        )
+
+        if fw_cnt > 0 and port_acls:
+            acl_col = f"{fw_cnt} policy rules + {len(port_acls)} port ACL(s) ({', '.join(sorted(port_acls)[:3])})"
+        elif fw_cnt > 0:
+            acl_col = f"{fw_cnt} parsed rules"
+        elif port_acls:
+            acl_col = f"{len(port_acls)} port ACL(s): {', '.join(sorted(port_acls)[:4])}"
+        elif sec_cs in ("command_failed", "parse_failed", "not_collected"):
+            acl_col = f"⚠️ Data Not Collected (`{sec_cs}`)"
+        else:
+            acl_col = "None Parsed (Verify Manually)"
+
+        if nat_cnt > 0:
+            nat_status = f"Enabled ({nat_cnt} rules)"
+        elif sec_cs in ("command_failed", "parse_failed", "not_collected"):
+            nat_status = f"⚠️ Data Not Collected (`{sec_cs}`)"
+        elif persona == "switch":
+            nat_status = "N/A (L2/L3 Switch)"
+        else:
+            nat_status = "None Detected (Verify NAT Policy)"
+
         lines.append(f"| **{hostname}** | {insecure_col} | {secure_col} | {acl_col} | {nat_status} |")
 
     lines.extend(
@@ -4040,25 +4634,83 @@ def _render_blueprint_security_and_services_section(unique_devs: dict) -> list[s
         ]
     )
 
-    dns_all, ntp_all, rad_all, sys_all = set(), set(), set(), set()
-    for dev in unique_devs.values():
-        serv = dev.get("services", {})
-        dns_all.update(serv.get("dns_servers", []))
-        ntp_all.update(serv.get("ntp_servers", []))
-        rad_all.update(serv.get("radius_servers", []))
-        sys_all.update(serv.get("syslog_servers", []))
+    total_devs = len(unique_devs)
+    serv_avail = _section_availability_summary(unique_devs, "services", fallback_section="running_config")
 
-    dns_str = ", ".join(f"`{s}`" for s in sorted(dns_all)) or "Unknown (Not Discovered)"
-    ntp_str = ", ".join(f"`{s}`" for s in sorted(ntp_all)) or "Unknown (Not Discovered)"
-    sys_str = ", ".join(f"`{s}`" for s in sorted(sys_all)) or "Unknown (Not Discovered)"
-    rad_str = ", ".join(f"`{s}`" for s in sorted(rad_all)) or "Unknown / Local RBAC"
+    def _audit_fleet_service(
+        key_names: tuple[str, ...],
+        *,
+        empty_label: str,
+        ok_consistent_label: str,
+        label_prefix_map: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
+        all_endpoints: set[str] = set()
+        per_dev_sets: list[frozenset[str]] = []
+        covered = 0
+        for dev in unique_devs.values():
+            serv = dev.get("services") or {}
+            dev_eps: set[str] = set()
+            for k in key_names:
+                pfx = (label_prefix_map or {}).get(k, "")
+                for item in serv.get(k) or []:
+                    s_val = str(item).strip()
+                    if s_val:
+                        formatted = f"{pfx}{s_val}" if pfx else s_val
+                        dev_eps.add(formatted)
+                        all_endpoints.add(formatted)
+            if dev_eps:
+                covered += 1
+                per_dev_sets.append(frozenset(dev_eps))
 
-    lines.append(f"| **DNS Resolvers** | {dns_str} | DNS UDP/TCP 53 | ✓ Consistent Across Fleet |")
-    lines.append(f"| **NTP Strata** | {ntp_str} | NTP UDP 123 | ✓ Clock Synchronized |")
-    lines.append(f"| **Syslog Logging** | {sys_str} | Syslog UDP 514 | ✓ Audit Trail Maintained |")
-    lines.append(
-        f"| **AAA Authentication** | {rad_str} | RADIUS UDP 1812 / TACACS+ | ✓ Encrypted Identity Management |"
+        ep_str = ", ".join(f"`{s}`" for s in sorted(all_endpoints)) or empty_label
+
+        if serv_avail["has_gaps"]:
+            gap_cnt = len(serv_avail["failed_hosts"]) + len(serv_avail["not_collected_hosts"])
+            if not all_endpoints:
+                audit_str = f"⚠️ Data Not Collected / Collection Failed ({gap_cnt}/{total_devs} device(s))"
+            else:
+                audit_str = f"⚠️ Incomplete ({covered}/{total_devs} configured; {gap_cnt} device(s) collection failed/not collected)"
+        elif not all_endpoints or total_devs == 0:
+            audit_str = "⚠️ Not Discovered (Verify Configuration)"
+        elif covered == total_devs and len(set(per_dev_sets)) == 1:
+            audit_str = f"{ok_consistent_label} ({covered}/{total_devs} devices)"
+        else:
+            distinct_cnt = len(set(per_dev_sets))
+            audit_str = f"⚠️ Partial / Divergent ({covered}/{total_devs} devices; {distinct_cnt} distinct config set(s))"
+        return ep_str, audit_str
+
+    dns_str, dns_audit = _audit_fleet_service(
+        ("dns_servers",),
+        empty_label="Unknown (Not Discovered)",
+        ok_consistent_label="✓ Consistent Across Fleet",
     )
+    ntp_str, ntp_audit = _audit_fleet_service(
+        ("ntp_servers",),
+        empty_label="Unknown (Not Discovered)",
+        ok_consistent_label="✓ Clock Synchronized",
+    )
+    sys_str, sys_audit = _audit_fleet_service(
+        ("syslog_servers",),
+        empty_label="Unknown (Not Discovered)",
+        ok_consistent_label="✓ Audit Trail Maintained",
+    )
+    snmp_str, snmp_audit = _audit_fleet_service(
+        ("snmp_servers",),
+        empty_label="Unknown (Not Discovered)",
+        ok_consistent_label="✓ SNMP Monitoring Configured",
+    )
+    aaa_str, aaa_audit = _audit_fleet_service(
+        ("radius_servers", "tacacs_servers"),
+        empty_label="Unknown / Local RBAC",
+        ok_consistent_label="✓ Central AAA Consistent",
+        label_prefix_map={"radius_servers": "RADIUS:", "tacacs_servers": "TACACS+:"},
+    )
+
+    lines.append(f"| **DNS Resolvers** | {dns_str} | DNS UDP/TCP 53 | {dns_audit} |")
+    lines.append(f"| **NTP Strata** | {ntp_str} | NTP UDP 123 | {ntp_audit} |")
+    lines.append(f"| **Syslog Logging** | {sys_str} | Syslog UDP 514 | {sys_audit} |")
+    lines.append(f"| **SNMP Monitoring** | {snmp_str} | SNMP UDP 161/162 | {snmp_audit} |")
+    lines.append(f"| **AAA Authentication** | {aaa_str} | RADIUS UDP 1812 / TACACS+ TCP 49 | {aaa_audit} |")
     return lines
 
 
@@ -5745,9 +6397,14 @@ def _build_trunk_audit_markdown_section(
                 f"| *... and {len(rows) - 50} additional trunk findings recorded in `trunk_vlan_audit.md` and `03_correlated/trunk_mismatches.csv`* | | | | | | | | | | |"
             )
     else:
-        sec_lines.append(
-            "| *All Evaluated Trunks* | *Symmetric* | `-` | *Symmetric* | `-` | `-` | `PASS` | **PASS** | `-` | `-` | ✓ Zero 802.1Q trunk VLAN, native PVID, or mode mismatches detected. |"
-        )
+        if edges_eval == 0:
+            sec_lines.append(
+                "| *No Trunks Evaluated* | `-` | `-` | `-` | `-` | `-` | `NOT_EVALUATED` | **NOT_EVALUATED** | `-` | `-` | No inter-switch 802.1Q trunk links were evaluated in this crawl scope. |"
+            )
+        else:
+            sec_lines.append(
+                "| *All Evaluated Trunks* | *Symmetric* | `-` | *Symmetric* | `-` | `-` | `PASS` | **PASS** | `-` | `-` | ✓ Zero 802.1Q trunk VLAN, native PVID, or mode mismatches detected. |"
+            )
     return sec_lines
 
 
@@ -5794,12 +6451,12 @@ def generate_trunk_audit_report(
         "",
         "| Metric | Count | Status |",
         "| :--- | :--- | :--- |",
-        f"| **Evaluated Trunk / Uplink Edges** | `{edges_eval}` | Audited |",
-        f"| **Total Discrepancy Findings** | `{total_cnt}` | {'WARN' if (crit_cnt + high_cnt) > 0 else 'PASS'} |",
-        f"| **CRITICAL Findings (`TRK-001`, `TRK-002`)** | `{crit_cnt}` | {'⚠️ Action Required' if crit_cnt > 0 else '✓ Clean'} |",
-        f"| **HIGH Findings (`TRK-003`, `TRK-004`)** | `{high_cnt}` | {'⚠️ Action Required' if high_cnt > 0 else '✓ Clean'} |",
-        f"| **MEDIUM Findings (`TRK-005`, `TRK-006`, Boundary)** | `{med_cnt}` | {'Review Recommended' if med_cnt > 0 else '✓ Clean'} |",
-        f"| **LOW Findings (`TRK-007`)** | `{low_cnt}` | {'Hardening Opportunity' if low_cnt > 0 else '✓ Clean'} |",
+        f"| **Evaluated Trunk / Uplink Edges** | `{edges_eval}` | {'Audited' if edges_eval > 0 else 'Not Evaluated'} |",
+        f"| **Total Discrepancy Findings** | `{total_cnt}` | {'WARN' if (crit_cnt + high_cnt) > 0 else ('PASS' if edges_eval > 0 else 'NOT_EVALUATED')} |",
+        f"| **CRITICAL Findings (`TRK-001`, `TRK-002`)** | `{crit_cnt}` | {'⚠️ Action Required' if crit_cnt > 0 else ('✓ Clean' if edges_eval > 0 else 'Not Evaluated')} |",
+        f"| **HIGH Findings (`TRK-003`, `TRK-004`)** | `{high_cnt}` | {'⚠️ Action Required' if high_cnt > 0 else ('✓ Clean' if edges_eval > 0 else 'Not Evaluated')} |",
+        f"| **MEDIUM Findings (`TRK-005`, `TRK-006`, Boundary)** | `{med_cnt}` | {'Review Recommended' if med_cnt > 0 else ('✓ Clean' if edges_eval > 0 else 'Not Evaluated')} |",
+        f"| **LOW Findings (`TRK-007`)** | `{low_cnt}` | {'Hardening Opportunity' if low_cnt > 0 else ('✓ Clean' if edges_eval > 0 else 'Not Evaluated')} |",
         f"| **INFO Findings (`INFO_QINQ_BOUNDARY`)** | `{info_cnt}` | Informational |",
     ]
 
